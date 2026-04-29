@@ -327,6 +327,7 @@ export class AgentSession {
     [];
   private disposed = false;
   private turnPhase: TurnPhase = TurnPhase.IDLE;
+  private activePreparedTurnAbortController: AbortController | null = null;
   // When true, stream-end skips auto-flushing queued messages so an edit can truncate first.
   private deferQueuedFlushUntilAfterEdit = false;
   /** Guardrail against synthetic switch_agent ping-pong loops. */
@@ -523,6 +524,9 @@ export class AgentSession {
       return;
     }
     this.disposed = true;
+
+    this.activePreparedTurnAbortController?.abort();
+    this.activePreparedTurnAbortController = null;
 
     // Ensure any callers blocked on waitForIdle() can continue during teardown.
     this.setTurnPhase(TurnPhase.IDLE);
@@ -2083,6 +2087,8 @@ export class AgentSession {
     if (editMessageId) {
       // Ensure no in-flight completion code can append after we truncate.
       if (this.isBusy()) {
+        let preemptedPreparing = false;
+
         // If a turn is still PREPARING/STREAMING, interrupt aggressively — history is about to be
         // truncated.
         //
@@ -2103,10 +2109,22 @@ export class AgentSession {
           }
         }
 
+        if (this.turnPhase === TurnPhase.PREPARING && this.activePreparedTurnAbortController) {
+          // Last-message edits can arrive while the previous turn is still in startup.
+          // Abort it and mark idle so the edit can truncate immediately.
+          const abortController = this.activePreparedTurnAbortController;
+          this.activePreparedTurnAbortController = null;
+          abortController.abort();
+          this.setTurnPhase(TurnPhase.IDLE);
+          preemptedPreparing = true;
+        }
+
         // Tell stream-end to skip sendQueuedMessages() so the edit truncates first.
         this.deferQueuedFlushUntilAfterEdit = true;
         try {
-          await this.waitForIdle();
+          if (!preemptedPreparing) {
+            await this.waitForIdle();
+          }
 
           // Workspace teardown does not await in-flight async work; bail out if the session was
           // disposed while waiting for completion cleanup.
@@ -2499,10 +2517,15 @@ export class AgentSession {
     // Same-session retry should resume the exact accepted request we just finalized
     // in history, even if runtime warmup fails before streamWithHistory() starts.
     this.setAutoRetryResumeState(optionsForStream, agentInitiated);
+    const preparedTurnAbortController = new AbortController();
+    this.activePreparedTurnAbortController = preparedTurnAbortController;
     this.setTurnPhase(TurnPhase.PREPARING);
 
     const startPreparedStream = async (): Promise<Result<void, SendMessageError>> => {
       try {
+        if (preparedTurnAbortController.signal.aborted) {
+          return Ok(undefined);
+        }
         // If this is a compaction request, terminate background processes first.
         // They won't be included in the summary, so continuing with orphaned processes would be confusing.
         const isCompactionStreamRequest = isCompactionRequest || autoCompactionMessage !== null;
@@ -2518,7 +2541,7 @@ export class AgentSession {
         // and dispatched via dispatchPendingFollowUp() after compaction completes.
         // This provides crash safety - the follow-up survives app restarts.
 
-        if (this.disposed) {
+        if (this.disposed || preparedTurnAbortController.signal.aborted) {
           return Ok(undefined);
         }
 
@@ -2528,13 +2551,18 @@ export class AgentSession {
           optionsForStream,
           undefined,
           undefined,
-          agentInitiated
+          agentInitiated,
+          preparedTurnAbortController.signal
         );
       } finally {
         // Success should advance via stream events; if startup never emitted any, don't leave the
-        // session stuck in PREPARING.
-        if (this.turnPhase === TurnPhase.PREPARING) {
-          this.setTurnPhase(TurnPhase.IDLE);
+        // session stuck in PREPARING. Guard by controller identity so an aborted startup cannot
+        // mark the replacement edit's new PREPARING turn idle when it unwinds later.
+        if (this.activePreparedTurnAbortController === preparedTurnAbortController) {
+          this.activePreparedTurnAbortController = null;
+          if (this.turnPhase === TurnPhase.PREPARING) {
+            this.setTurnPhase(TurnPhase.IDLE);
+          }
         }
       }
     };
@@ -3018,9 +3046,12 @@ export class AgentSession {
     options?: SendMessageOptions,
     openaiTruncationModeOverride?: "auto" | "disabled",
     disablePostCompactionAttachments?: boolean,
-    agentInitiated?: boolean
+    agentInitiated?: boolean,
+    abortSignal?: AbortSignal
   ): Promise<Result<void, SendMessageError>> {
-    if (this.disposed) {
+    const isStartupAbortRequested = (): boolean => abortSignal?.aborted === true;
+
+    if (this.disposed || isStartupAbortRequested()) {
       return Ok(undefined);
     }
 
@@ -3047,7 +3078,15 @@ export class AgentSession {
       return Err(createUnknownSendMessageError(commitResult.error));
     }
 
+    if (isStartupAbortRequested()) {
+      return Ok(undefined);
+    }
+
     let historyResult = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
+    if (isStartupAbortRequested()) {
+      return Ok(undefined);
+    }
+
     if (!historyResult.success) {
       return Err(createUnknownSendMessageError(historyResult.error));
     }
@@ -3092,14 +3131,26 @@ export class AgentSession {
       options
     );
 
+    if (isStartupAbortRequested()) {
+      return Ok(undefined);
+    }
+
     // Check for external file edits (timestamp-based polling)
     const changedFileAttachments = await this.fileChangeTracker.getChangedAttachments();
+
+    if (isStartupAbortRequested()) {
+      return Ok(undefined);
+    }
 
     // Check if post-compaction attachments should be injected.
     const postCompactionAttachments =
       disablePostCompactionAttachments === true
         ? null
         : await this.getPostCompactionAttachmentsIfNeeded();
+    if (isStartupAbortRequested()) {
+      return Ok(undefined);
+    }
+
     this.activeStreamHadPostCompactionInjection =
       postCompactionAttachments !== null && postCompactionAttachments.length > 0;
 
@@ -3122,6 +3173,7 @@ export class AgentSession {
       messages: historyResult.data,
       workspaceId: this.workspaceId,
       modelString,
+      abortSignal,
       thinkingLevel: effectiveThinkingLevel,
       toolPolicy: options?.toolPolicy,
       additionalSystemInstructions: options?.additionalSystemInstructions,

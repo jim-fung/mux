@@ -5,12 +5,19 @@ import type { InitStateManager } from "@/node/services/initStateManager";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { Config } from "@/node/config";
 import { createMuxMessage } from "@/common/types/message";
-import type { MuxMessage } from "@/common/types/message";
 import type { SendMessageError } from "@/common/types/errors";
 import type { Result } from "@/common/types/result";
 import { Ok } from "@/common/types/result";
 import { AgentSession } from "./agentSession";
 import { createTestHistoryService } from "./testHistoryService";
+
+type StreamMessageHandler = AIService["streamMessage"];
+
+const TEST_MODEL = "anthropic:claude-3-5-sonnet-latest";
+const config = {
+  srcDir: "/tmp",
+  getSessionDir: (_workspaceId: string) => "/tmp",
+} as unknown as Config;
 
 async function waitForCondition(condition: () => boolean, timeoutMs = 1000): Promise<boolean> {
   if (condition()) {
@@ -25,56 +32,66 @@ async function waitForCondition(condition: () => boolean, timeoutMs = 1000): Pro
 
 describe("AgentSession.sendMessage (editMessageId)", () => {
   let historyCleanup: (() => Promise<void>) | undefined;
+
+  async function createSessionHarness(
+    workspaceId: string,
+    streamHandler: StreamMessageHandler = () => Promise.resolve(Ok(undefined))
+  ) {
+    const { historyService, cleanup } = await createTestHistoryService();
+    historyCleanup = cleanup;
+
+    const streamMessage = mock(streamHandler);
+    const aiService = Object.assign(new EventEmitter(), {
+      isStreaming: mock((_workspaceId: string) => false),
+      stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
+      streamMessage: streamMessage as unknown as AIService["streamMessage"],
+    }) as unknown as AIService;
+
+    return {
+      historyService,
+      streamMessage,
+      session: new AgentSession({
+        workspaceId,
+        config,
+        historyService,
+        aiService,
+        initStateManager: new EventEmitter() as unknown as InitStateManager,
+        backgroundProcessManager: {
+          cleanup: mock((_workspaceId: string) => Promise.resolve()),
+          setMessageQueued: mock((_workspaceId: string, _queued: boolean) => {
+            void _queued;
+          }),
+        } as unknown as BackgroundProcessManager,
+      }),
+    };
+  }
+
+  async function seedImageMessage(
+    workspaceId: string,
+    historyService: Awaited<ReturnType<typeof createTestHistoryService>>["historyService"],
+    messageId = "user-message-with-image"
+  ): Promise<string> {
+    const originalImageUrl = "data:image/png;base64,AAAA";
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage(messageId, "user", "original", { historySequence: 0 }, [
+        { type: "file", mediaType: "image/png", url: originalImageUrl },
+      ])
+    );
+    return originalImageUrl;
+  }
+
   afterEach(async () => {
     await historyCleanup?.();
   });
 
   it("treats missing edit target as no-op (allows recovery after compaction)", async () => {
-    const workspaceId = "ws-test";
-
-    const config = {
-      srcDir: "/tmp",
-      getSessionDir: (_workspaceId: string) => "/tmp",
-    } as unknown as Config;
-
-    const { historyService, cleanup } = await createTestHistoryService();
-    historyCleanup = cleanup;
-
+    const { session, historyService, streamMessage } = await createSessionHarness("ws-test");
     const truncateAfterMessage = spyOn(historyService, "truncateAfterMessage");
     const appendToHistory = spyOn(historyService, "appendToHistory");
 
-    const aiEmitter = new EventEmitter();
-    const streamMessage = mock((_messages: MuxMessage[]) => {
-      return Promise.resolve(Ok(undefined));
-    });
-    const aiService = Object.assign(aiEmitter, {
-      isStreaming: mock((_workspaceId: string) => false),
-      stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
-      streamMessage: streamMessage as unknown as (
-        ...args: Parameters<AIService["streamMessage"]>
-      ) => Promise<Result<void, SendMessageError>>,
-    }) as unknown as AIService;
-
-    const initStateManager = new EventEmitter() as unknown as InitStateManager;
-
-    const backgroundProcessManager = {
-      cleanup: mock((_workspaceId: string) => Promise.resolve()),
-      setMessageQueued: mock((_workspaceId: string, _queued: boolean) => {
-        void _queued;
-      }),
-    } as unknown as BackgroundProcessManager;
-
-    const session = new AgentSession({
-      workspaceId,
-      config,
-      historyService,
-      aiService,
-      initStateManager,
-      backgroundProcessManager,
-    });
-
     const result = await session.sendMessage("hello", {
-      model: "anthropic:claude-3-5-sonnet-latest",
+      model: TEST_MODEL,
       agentId: "exec",
       editMessageId: "missing-user-message-id",
     });
@@ -89,61 +106,14 @@ describe("AgentSession.sendMessage (editMessageId)", () => {
 
   it("clears image parts when editing with explicit empty fileParts", async () => {
     const workspaceId = "ws-test";
-
-    const config = {
-      srcDir: "/tmp",
-      getSessionDir: (_workspaceId: string) => "/tmp",
-    } as unknown as Config;
-
+    const { session, historyService } = await createSessionHarness(workspaceId);
     const originalMessageId = "user-message-with-image";
-    const originalImageUrl = "data:image/png;base64,AAAA";
-
-    const { historyService, cleanup } = await createTestHistoryService();
-    historyCleanup = cleanup;
-
-    // Seed original message before setting up spies
-    await historyService.appendToHistory(
-      workspaceId,
-      createMuxMessage(originalMessageId, "user", "original", { historySequence: 0 }, [
-        { type: "file" as const, mediaType: "image/png", url: originalImageUrl },
-      ])
-    );
-
+    await seedImageMessage(workspaceId, historyService, originalMessageId);
     const truncateAfterMessage = spyOn(historyService, "truncateAfterMessage");
     const appendToHistory = spyOn(historyService, "appendToHistory");
 
-    const aiEmitter = new EventEmitter();
-    const streamMessage = mock((_messages: MuxMessage[]) => {
-      return Promise.resolve(Ok(undefined));
-    });
-    const aiService = Object.assign(aiEmitter, {
-      isStreaming: mock((_workspaceId: string) => false),
-      stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
-      streamMessage: streamMessage as unknown as (
-        ...args: Parameters<AIService["streamMessage"]>
-      ) => Promise<Result<void, SendMessageError>>,
-    }) as unknown as AIService;
-
-    const initStateManager = new EventEmitter() as unknown as InitStateManager;
-
-    const backgroundProcessManager = {
-      cleanup: mock((_workspaceId: string) => Promise.resolve()),
-      setMessageQueued: mock((_workspaceId: string, _queued: boolean) => {
-        void _queued;
-      }),
-    } as unknown as BackgroundProcessManager;
-
-    const session = new AgentSession({
-      workspaceId,
-      config,
-      historyService,
-      aiService,
-      initStateManager,
-      backgroundProcessManager,
-    });
-
     const result = await session.sendMessage("edited", {
-      model: "anthropic:claude-3-5-sonnet-latest",
+      model: TEST_MODEL,
       agentId: "exec",
       editMessageId: originalMessageId,
       fileParts: [],
@@ -160,70 +130,21 @@ describe("AgentSession.sendMessage (editMessageId)", () => {
 
     expect(appendedFileParts).toHaveLength(0);
   });
+
   it("preserves image parts when editing and fileParts are omitted", async () => {
     const workspaceId = "ws-test";
-
-    const config = {
-      srcDir: "/tmp",
-      getSessionDir: (_workspaceId: string) => "/tmp",
-    } as unknown as Config;
-
+    const { session, historyService } = await createSessionHarness(workspaceId);
     const originalMessageId = "user-message-with-image";
-    const originalImageUrl = "data:image/png;base64,AAAA";
-
-    const { historyService, cleanup } = await createTestHistoryService();
-    historyCleanup = cleanup;
-
-    // Seed original message before setting up spies
-    await historyService.appendToHistory(
-      workspaceId,
-      createMuxMessage(originalMessageId, "user", "original", { historySequence: 0 }, [
-        { type: "file" as const, mediaType: "image/png", url: originalImageUrl },
-      ])
-    );
-
+    const originalImageUrl = await seedImageMessage(workspaceId, historyService, originalMessageId);
     const truncateAfterMessage = spyOn(historyService, "truncateAfterMessage");
     const appendToHistory = spyOn(historyService, "appendToHistory");
-    const getHistoryFromLatestBoundary = spyOn(historyService, "getHistoryFromLatestBoundary");
-
-    const aiEmitter = new EventEmitter();
-    const streamMessage = mock((_messages: MuxMessage[]) => {
-      return Promise.resolve(Ok(undefined));
-    });
-    const aiService = Object.assign(aiEmitter, {
-      isStreaming: mock((_workspaceId: string) => false),
-      stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
-      streamMessage: streamMessage as unknown as (
-        ...args: Parameters<AIService["streamMessage"]>
-      ) => Promise<Result<void, SendMessageError>>,
-    }) as unknown as AIService;
-
-    const initStateManager = new EventEmitter() as unknown as InitStateManager;
-
-    const backgroundProcessManager = {
-      cleanup: mock((_workspaceId: string) => Promise.resolve()),
-      setMessageQueued: mock((_workspaceId: string, _queued: boolean) => {
-        void _queued;
-      }),
-    } as unknown as BackgroundProcessManager;
-
-    const session = new AgentSession({
-      workspaceId,
-      config,
-      historyService,
-      aiService,
-      initStateManager,
-      backgroundProcessManager,
-    });
-
     const result = await session.sendMessage("edited", {
-      model: "anthropic:claude-3-5-sonnet-latest",
+      model: TEST_MODEL,
       agentId: "exec",
       editMessageId: originalMessageId,
     });
 
     expect(result.success).toBe(true);
-    expect(getHistoryFromLatestBoundary.mock.calls.length).toBeGreaterThan(0);
     expect(truncateAfterMessage.mock.calls).toHaveLength(1);
     expect(appendToHistory.mock.calls).toHaveLength(1);
 
@@ -237,69 +158,83 @@ describe("AgentSession.sendMessage (editMessageId)", () => {
     expect(appendedFileParts[0].mediaType).toBe("image/png");
   });
 
-  it("acknowledges accepted edits before replacement stream startup settles", async () => {
-    const workspaceId = "ws-edit-ack";
-
-    const config = {
-      srcDir: "/tmp",
-      getSessionDir: (_workspaceId: string) => "/tmp",
-    } as unknown as Config;
-
-    const originalMessageId = "user-message-to-edit";
-    const { historyService, cleanup } = await createTestHistoryService();
-    historyCleanup = cleanup;
-
-    await historyService.appendToHistory(
-      workspaceId,
-      createMuxMessage(originalMessageId, "user", "original", { historySequence: 0 })
-    );
-
-    let resolveStreamMessage: ((result: Result<void, SendMessageError>) => void) | undefined;
-    const aiEmitter = new EventEmitter();
-    const streamMessage = mock((_messages: MuxMessage[]) => {
+  it("preempts a still-preparing turn when editing its last user message", async () => {
+    const workspaceId = "ws-edit-preparing";
+    const streamResolves: Array<() => void> = [];
+    const streamHandler: StreamMessageHandler = (opts) => {
       return new Promise<Result<void, SendMessageError>>((resolve) => {
-        resolveStreamMessage = resolve;
+        const resolveOk = () => resolve(Ok(undefined));
+        if (opts.abortSignal?.aborted === true) {
+          resolveOk();
+          return;
+        }
+        opts.abortSignal?.addEventListener("abort", resolveOk, { once: true });
+        streamResolves.push(resolveOk);
       });
-    });
-    const aiService = Object.assign(aiEmitter, {
-      isStreaming: mock((_workspaceId: string) => false),
-      stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
-      streamMessage: streamMessage as unknown as (
-        ...args: Parameters<AIService["streamMessage"]>
-      ) => Promise<Result<void, SendMessageError>>,
-    }) as unknown as AIService;
-
-    const initStateManager = new EventEmitter() as unknown as InitStateManager;
-    const backgroundProcessManager = {
-      cleanup: mock((_workspaceId: string) => Promise.resolve()),
-      setMessageQueued: mock((_workspaceId: string, _queued: boolean) => {
-        void _queued;
-      }),
-    } as unknown as BackgroundProcessManager;
-
-    const session = new AgentSession({
+    };
+    const { session, historyService, streamMessage } = await createSessionHarness(
       workspaceId,
-      config,
-      historyService,
-      aiService,
-      initStateManager,
-      backgroundProcessManager,
-    });
+      streamHandler
+    );
+    const appendToHistory = spyOn(historyService, "appendToHistory");
 
-    const result = await session.sendMessage("edited", {
-      model: "anthropic:claude-3-5-sonnet-latest",
-      agentId: "exec",
-      editMessageId: originalMessageId,
-    });
+    try {
+      const firstSendPromise = session.sendMessage("original", {
+        model: TEST_MODEL,
+        agentId: "exec",
+      });
 
-    expect(result.success).toBe(true);
-    const sawStreamStartup = await waitForCondition(() => {
-      return streamMessage.mock.calls.length === 1 && resolveStreamMessage !== undefined;
-    });
-    expect(sawStreamStartup).toBe(true);
-    expect(session.isPreparingTurn()).toBe(true);
+      const sawPreparingTurn = await waitForCondition(
+        () => streamMessage.mock.calls.length === 1 && session.isPreparingTurn()
+      );
+      expect(sawPreparingTurn).toBe(true);
 
-    resolveStreamMessage?.(Ok(undefined));
-    await session.waitForIdle();
+      const originalMessage = appendToHistory.mock.calls
+        .map((call) => call[1])
+        .find((message) => message.role === "user" && message.parts[0]?.type === "text");
+      const originalMessageId = originalMessage?.id;
+      expect(typeof originalMessageId).toBe("string");
+
+      const editResult = await Promise.race([
+        session.sendMessage("edited", {
+          model: TEST_MODEL,
+          agentId: "exec",
+          editMessageId: originalMessageId,
+        }),
+        new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 250)),
+      ]);
+
+      expect(editResult).not.toBe("timeout");
+      expect(editResult).toEqual(Ok(undefined));
+
+      const sawReplacementStartup = await waitForCondition(
+        () => streamMessage.mock.calls.length === 2 && session.isPreparingTurn()
+      );
+      expect(sawReplacementStartup).toBe(true);
+
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success).toBe(true);
+      if (history.success) {
+        const userTexts = history.data
+          .filter((message) => message.role === "user")
+          .map((message) =>
+            message.parts
+              .filter((part) => part.type === "text")
+              .map((part) => part.text)
+              .join("")
+          );
+        expect(userTexts).toEqual(["edited"]);
+      }
+
+      for (const resolve of streamResolves) {
+        resolve();
+      }
+      await firstSendPromise;
+    } finally {
+      session.dispose();
+      for (const resolve of streamResolves) {
+        resolve();
+      }
+    }
   });
 });
