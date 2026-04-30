@@ -1,212 +1,303 @@
-import { useRef, useState, useCallback } from "react";
+import type { KeyboardEvent, MouseEvent, UIEvent } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+
+const BOTTOM_LOCK_EPSILON_PX = 1;
+const USER_BOTTOM_RELOCK_THRESHOLD_PX = 8;
+const USER_SCROLL_INTENT_WINDOW_MS = 750;
+const BOTTOM_LOCK_SETTLE_FRAME_LIMIT = 60;
+const TRANSCRIPT_SCROLL_KEYS = new Set([
+  "ArrowDown",
+  "ArrowUp",
+  "End",
+  "Home",
+  "PageDown",
+  "PageUp",
+  " ",
+  "Spacebar",
+]);
+
+const TRANSCRIPT_SCROLL_INTENT_EXEMPT_SELECTOR = [
+  "button",
+  "a",
+  "input",
+  "textarea",
+  "select",
+  "summary",
+  '[role="button"]',
+  '[role="link"]',
+  '[contenteditable="true"]',
+  '[data-scroll-intent="ignore"]',
+].join(",");
+
+function getMaxScrollTop(element: HTMLElement): number {
+  return Math.max(0, element.scrollHeight - element.clientHeight);
+}
+
+function getDistanceFromBottom(element: HTMLElement): number {
+  return getMaxScrollTop(element) - element.scrollTop;
+}
+
+function isWithinBottomThreshold(element: HTMLElement, thresholdPx: number): boolean {
+  return getDistanceFromBottom(element) <= thresholdPx;
+}
+
+function isEditableKeyboardTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof Element)) return false;
+
+  return (
+    target.closest('input, textarea, select, [contenteditable="true"], [role="textbox"]') !== null
+  );
+}
+
+function isMouseDownExemptFromScrollIntent(
+  target: EventTarget | null,
+  currentTarget: HTMLElement
+): boolean {
+  if (!(target instanceof Element)) return false;
+
+  const exemptElement = target.closest(TRANSCRIPT_SCROLL_INTENT_EXEMPT_SELECTOR);
+  return exemptElement !== null && currentTarget.contains(exemptElement);
+}
 
 /**
- * Hook to manage auto-scrolling behavior for a scrollable container.
- *
- * Scroll container structure expected:
- *   <div ref={contentRef}>           ← scroll container (overflow-y: auto)
- *     <div ref={innerRef}>           ← inner content wrapper (observed for size changes)
- *       {children}
- *     </div>
- *   </div>
- *
- * Auto-scroll is enabled when:
- * - User sends a message
- * - User scrolls to bottom while content is updating
- *
- * Auto-scroll is disabled when:
- * - User scrolls up
+ * Bottom-lock invariant: while `autoScroll` is true the transcript `scrollTop`
+ * equals `scrollHeight - clientHeight`. Layout signals such as ResizeObserver,
+ * open-chat, send, and geometric relock arm a short requestAnimationFrame settle
+ * window instead of polling forever. The rAF tick lands just before paint, so
+ * sub-pixel CSS transitions, async font/image settling, and scroll-anchor races
+ * inside expanding tool panes converge without adding continuous idle work.
+ * User input releases the lock; an explicit action (open chat, send,
+ * jump-to-bottom) or geometric return-to-bottom reacquires it.
  */
 export function useAutoScroll() {
   const [autoScroll, setAutoScroll] = useState(true);
   const contentRef = useRef<HTMLDivElement>(null);
-  const lastScrollTopRef = useRef<number>(0);
-  // Tracks the most recent user-owned scroll intent signal (wheel/touch/keyboard/mouse)
-  // so we can distinguish genuine transcript scrolling from our own scrollTop writes.
-  const lastUserInteractionRef = useRef<number>(0);
-  // Ref to avoid stale closures in async callbacks - always holds current autoScroll value
-  const autoScrollRef = useRef<boolean>(true);
-  // Track the ResizeObserver so we can disconnect it when the element unmounts
-  const observerRef = useRef<ResizeObserver | null>(null);
-  // Track pending RAF to coalesce rapid resize events
-  const rafIdRef = useRef<number | null>(null);
-  // Debounce timer for "scroll settled" detection — fires after scrolling stops
-  // to catch cases where iOS momentum/inertial scrolling reaches the bottom but
-  // the user-interaction window (100ms after last touchmove) has already expired.
-  const scrollSettledTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Set by disableAutoScroll() to prevent the scroll-settled debounce from
-  // re-arming after programmatic scrolls (scrollIntoView, etc.). Cleared when
-  // the user touches the scroll container (markUserInteraction).
+  const autoScrollRef = useRef(true);
   const programmaticDisableRef = useRef(false);
+  const userScrollIntentUntilRef = useRef(0);
 
-  // Sync ref with state to ensure callbacks always have latest value
-  autoScrollRef.current = autoScroll;
-
-  // Callback ref for the inner content wrapper - sets up ResizeObserver when element mounts.
-  // ResizeObserver fires when the content size changes (Shiki highlighting, Mermaid, images, etc.),
-  // allowing us to scroll to bottom even when async content renders after the initial mount.
-  const innerRef = useCallback((element: HTMLDivElement | null) => {
-    // Cleanup previous observer and pending RAF
-    if (rafIdRef.current !== null) {
-      cancelAnimationFrame(rafIdRef.current);
-      rafIdRef.current = null;
-    }
-    if (observerRef.current) {
-      observerRef.current.disconnect();
-      observerRef.current = null;
-    }
-
-    if (!element) return;
-
-    const observer = new ResizeObserver(() => {
-      // Skip if auto-scroll is disabled (user scrolled up)
-      if (!autoScrollRef.current || !contentRef.current) return;
-
-      // Coalesce all resize events in a frame into one scroll operation.
-      // Without this, rapid resize events (Shiki highlighting, etc.) cause
-      // multiple scrolls per frame with slightly different scrollHeight values.
-      rafIdRef.current ??= requestAnimationFrame(() => {
-        rafIdRef.current = null;
-        if (autoScrollRef.current && contentRef.current) {
-          contentRef.current.scrollTop = contentRef.current.scrollHeight;
-        }
-      });
-    });
-
-    observer.observe(element);
-    observerRef.current = observer;
+  const setAutoScrollEnabled = useCallback((enabled: boolean) => {
+    autoScrollRef.current = enabled;
+    setAutoScroll(enabled);
   }, []);
 
-  const performAutoScroll = useCallback(() => {
-    if (!contentRef.current) return;
+  const stickToBottom = useCallback(() => {
+    const scrollContainer = contentRef.current;
+    if (!scrollContainer) return;
 
-    // Double RAF: First frame for DOM updates (e.g., DiffRenderer async highlighting),
-    // second frame to scroll after layout is complete
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        // Check ref.current not state - avoids race condition where queued frames
-        // execute after user scrolls up but still see old autoScroll=true
-        if (contentRef.current && autoScrollRef.current) {
-          contentRef.current.scrollTop = contentRef.current.scrollHeight;
-        }
-      });
-    });
-  }, []); // No deps - ref ensures we always check current value
+    const max = getMaxScrollTop(scrollContainer);
+    if (scrollContainer.scrollTop !== max) {
+      scrollContainer.scrollTop = max;
+    }
+  }, []);
+
+  const frameLoopRef = useRef<{ id: number | null; framesRemaining: number }>({
+    id: null,
+    framesRemaining: 0,
+  });
+
+  const stopBottomLockFrameLoop = useCallback(() => {
+    const frameId = frameLoopRef.current.id;
+    if (frameId !== null && typeof window !== "undefined") {
+      const cancelFrame = window.cancelAnimationFrame?.bind(window);
+      cancelFrame?.(frameId);
+    }
+    frameLoopRef.current.id = null;
+    frameLoopRef.current.framesRemaining = 0;
+  }, []);
+
+  const startBottomLockFrameLoop = useCallback(() => {
+    if (!autoScrollRef.current) return;
+    const win = typeof window !== "undefined" ? window : undefined;
+    const raf = win?.requestAnimationFrame?.bind(win);
+    if (!raf) return;
+
+    frameLoopRef.current.framesRemaining = BOTTOM_LOCK_SETTLE_FRAME_LIMIT;
+    if (frameLoopRef.current.id !== null) return;
+
+    const tick = () => {
+      frameLoopRef.current.id = null;
+      if (!autoScrollRef.current || frameLoopRef.current.framesRemaining <= 0) {
+        frameLoopRef.current.framesRemaining = 0;
+        return;
+      }
+
+      stickToBottom();
+      frameLoopRef.current.framesRemaining -= 1;
+      if (frameLoopRef.current.framesRemaining > 0) {
+        frameLoopRef.current.id = raf(tick);
+      }
+    };
+
+    frameLoopRef.current.id = raf(tick);
+  }, [stickToBottom]);
 
   const jumpToBottom = useCallback(() => {
-    // Enable auto-scroll first so ResizeObserver will handle subsequent changes
-    setAutoScroll(true);
-    autoScrollRef.current = true;
-
-    // Immediate scroll for content that's already rendered
-    if (contentRef.current) {
-      contentRef.current.scrollTop = contentRef.current.scrollHeight;
-    }
-  }, []);
-
-  // Programmatic disable — clears any pending scroll-settled recovery timer so
-  // intentional disables (navigate-to-message, edit-message) aren't undone by the
-  // debounced re-enable. Use this instead of setAutoScroll(false) for explicit
-  // code-driven disables; the scroll handler's own disable (user scrolls up)
-  // deliberately does NOT clear the timer so the debounce can recover when the
-  // user scrolls back to the bottom.
-  const disableAutoScroll = useCallback(() => {
-    setAutoScroll(false);
-    autoScrollRef.current = false;
-    programmaticDisableRef.current = true;
-    if (scrollSettledTimerRef.current) {
-      clearTimeout(scrollSettledTimerRef.current);
-      scrollSettledTimerRef.current = null;
-    }
-  }, []);
-
-  const handleScroll = useCallback((e: React.UIEvent<HTMLDivElement>) => {
-    const element = e.currentTarget;
-    const currentScrollTop = element.scrollTop;
-    const threshold = 100;
-    const isAtBottom = element.scrollHeight - currentScrollTop - element.clientHeight < threshold;
-
-    // Safety net: when auto-scroll is disabled and scrolling stops at the bottom,
-    // re-enable it. Only armed on downward movement, but NOT cleared on upward
-    // events — on iOS, rubber-band bounce and momentum deceleration produce
-    // upward scroll events at the tail end, which would cancel the timer and
-    // prevent recovery. The timer always re-checks position when it fires, so
-    // stale timers from earlier downward events are harmless.
-    const isMovingDown = currentScrollTop > lastScrollTopRef.current;
-    if (!autoScrollRef.current && isMovingDown && !programmaticDisableRef.current) {
-      if (scrollSettledTimerRef.current) {
-        clearTimeout(scrollSettledTimerRef.current);
-      }
-      scrollSettledTimerRef.current = setTimeout(() => {
-        scrollSettledTimerRef.current = null;
-        if (contentRef.current && !autoScrollRef.current) {
-          const el = contentRef.current;
-          const settledAtBottom = el.scrollHeight - el.scrollTop - el.clientHeight < threshold;
-          if (settledAtBottom) {
-            setAutoScroll(true);
-            autoScrollRef.current = true;
-          }
-        }
-      }, 150);
-    }
-
-    // Only process user-initiated scrolls (within 100ms of interaction)
-    const isUserScroll = Date.now() - lastUserInteractionRef.current < 100;
-
-    if (!isUserScroll) {
-      lastScrollTopRef.current = currentScrollTop;
-      return; // Ignore programmatic scrolls
-    }
-
-    // Detect scroll direction
-    const isScrollingUp = currentScrollTop < lastScrollTopRef.current;
-    const isScrollingDown = currentScrollTop > lastScrollTopRef.current;
-
-    // Detect iOS rubber-band overscroll: during the bounce at the bottom,
-    // scrollTop + clientHeight exceeds scrollHeight (the content is "past" the
-    // physical end). The bounce-back decreases scrollTop, which looks like
-    // scrolling up but shouldn't disable auto-scroll.
-    const maxScrollTop = element.scrollHeight - element.clientHeight;
-    const isRubberBanding = lastScrollTopRef.current > maxScrollTop;
-
-    if (isScrollingUp && !isRubberBanding) {
-      // Disable auto-scroll when scrolling up, unless this is just iOS
-      // rubber-band bounce-back from the bottom edge.
-      setAutoScroll(false);
-      autoScrollRef.current = false;
-      // Cancel any pending scroll-settled timer — the user explicitly scrolled
-      // up, so we should not re-enable auto-scroll even if we're near the bottom.
-      if (scrollSettledTimerRef.current) {
-        clearTimeout(scrollSettledTimerRef.current);
-        scrollSettledTimerRef.current = null;
-      }
-    } else if (isScrollingDown && isAtBottom) {
-      // Only enable auto-scroll if scrolling down AND reached the bottom
-      setAutoScroll(true);
-      autoScrollRef.current = true;
-    }
-    // If scrolling down but not at bottom, auto-scroll remains disabled
-
-    // Update last scroll position
-    lastScrollTopRef.current = currentScrollTop;
-  }, []);
-
-  const markUserInteraction = useCallback(() => {
-    lastUserInteractionRef.current = Date.now();
-    // Clear programmatic disable flag — the user is now interacting with the
-    // scroll container, so the debounced scroll-settled recovery can re-arm.
+    // Opening/sending is an explicit transfer of scroll ownership back to the
+    // transcript tail. Clear stale wheel/touch/key intent before the browser emits
+    // any scroll event caused by our own write.
+    userScrollIntentUntilRef.current = 0;
     programmaticDisableRef.current = false;
+    setAutoScrollEnabled(true);
+    stickToBottom();
+    startBottomLockFrameLoop();
+  }, [setAutoScrollEnabled, startBottomLockFrameLoop, stickToBottom]);
+
+  const disableAutoScroll = useCallback(() => {
+    userScrollIntentUntilRef.current = 0;
+    programmaticDisableRef.current = true;
+    setAutoScrollEnabled(false);
+    stopBottomLockFrameLoop();
+  }, [setAutoScrollEnabled, stopBottomLockFrameLoop]);
+
+  const markUserScrollIntent = useCallback(() => {
+    programmaticDisableRef.current = false;
+    userScrollIntentUntilRef.current = Date.now() + USER_SCROLL_INTENT_WINDOW_MS;
   }, []);
+
+  const contentMouseDownCandidateRef = useRef(false);
+
+  const handleScrollContainerMouseDown = useCallback(
+    (event: MouseEvent<HTMLDivElement>) => {
+      contentMouseDownCandidateRef.current = false;
+
+      // Scrollbar drags target the scrollport itself and are immediately scroll intent.
+      if (event.target === event.currentTarget) {
+        markUserScrollIntent();
+        return;
+      }
+
+      // Interactive transcript chrome (tool headers/buttons/links) is exempt so
+      // expanding the last bash/tool row keeps bottom ownership.
+      if (isMouseDownExemptFromScrollIntent(event.target, event.currentTarget)) {
+        return;
+      }
+
+      // A simple content click is not scroll intent. It only becomes user-owned
+      // once the pointer moves with the mouse button down, which covers
+      // drag-to-select autoscroll without letting expand/collapse clicks release
+      // the bottom lock.
+      contentMouseDownCandidateRef.current = true;
+    },
+    [markUserScrollIntent]
+  );
+
+  const handleScrollContainerMouseMove = useCallback(
+    (event: MouseEvent<HTMLDivElement>) => {
+      if (!contentMouseDownCandidateRef.current) return;
+
+      if (event.buttons !== 1) {
+        contentMouseDownCandidateRef.current = false;
+        return;
+      }
+
+      contentMouseDownCandidateRef.current = false;
+      markUserScrollIntent();
+    },
+    [markUserScrollIntent]
+  );
+
+  const handleScrollContainerMouseUp = useCallback(() => {
+    contentMouseDownCandidateRef.current = false;
+  }, []);
+
+  const handleScrollContainerKeyDown = useCallback(
+    (event: KeyboardEvent<HTMLDivElement>) => {
+      // Scroll keys (PageUp/PageDown/Home/End/Arrows/Space) cause the scrollport
+      // to scroll even when focus is on non-editable descendants such as tool-row
+      // buttons or links. Editable controls keep those keys local for caret/text
+      // navigation, so they must not open a transcript scroll-intent window.
+      if (!TRANSCRIPT_SCROLL_KEYS.has(event.key) || isEditableKeyboardTarget(event.target)) return;
+
+      markUserScrollIntent();
+    },
+    [markUserScrollIntent]
+  );
+
+  const handleScroll = useCallback(
+    (e: UIEvent<HTMLDivElement>) => {
+      const scrollContainer = e.currentTarget;
+      const now = Date.now();
+      if (now > userScrollIntentUntilRef.current) {
+        if (
+          autoScrollRef.current &&
+          !isWithinBottomThreshold(scrollContainer, BOTTOM_LOCK_EPSILON_PX)
+        ) {
+          stickToBottom();
+          startBottomLockFrameLoop();
+          return;
+        }
+
+        if (
+          !autoScrollRef.current &&
+          !programmaticDisableRef.current &&
+          isWithinBottomThreshold(scrollContainer, USER_BOTTOM_RELOCK_THRESHOLD_PX)
+        ) {
+          setAutoScrollEnabled(true);
+          startBottomLockFrameLoop();
+        }
+        return;
+      }
+
+      // Keep momentum/scrollbar drags in the user-owned window without direction
+      // bookkeeping. The geometry alone determines whether the tail is owned.
+      userScrollIntentUntilRef.current = now + USER_SCROLL_INTENT_WINDOW_MS;
+      const shouldEnableBottomLock = isWithinBottomThreshold(
+        scrollContainer,
+        USER_BOTTOM_RELOCK_THRESHOLD_PX
+      );
+      setAutoScrollEnabled(shouldEnableBottomLock);
+      if (shouldEnableBottomLock) {
+        startBottomLockFrameLoop();
+      }
+    },
+    [setAutoScrollEnabled, startBottomLockFrameLoop, stickToBottom]
+  );
+
+  // Frame-aligned bottom-lock enforcer.
+  //
+  // The rAF work is bounded: open-chat/send/relock/resize signals arm a short
+  // settle window, and the loop stops once that budget is exhausted or the user
+  // releases the lock. That keeps the paint-aligned correction without continuous
+  // idle polling in long-lived chats.
+  useEffect(() => {
+    if (autoScroll) {
+      startBottomLockFrameLoop();
+      return stopBottomLockFrameLoop;
+    }
+
+    stopBottomLockFrameLoop();
+    return undefined;
+  }, [autoScroll, startBottomLockFrameLoop, stopBottomLockFrameLoop]);
+
+  useEffect(() => {
+    if (!autoScroll) return;
+    const scrollContainer = contentRef.current;
+    const ResizeObserverCtor = typeof window !== "undefined" ? window.ResizeObserver : undefined;
+    if (!scrollContainer || !ResizeObserverCtor) return;
+
+    const observer = new ResizeObserverCtor(() => {
+      startBottomLockFrameLoop();
+    });
+    observer.observe(scrollContainer);
+    const content = scrollContainer.firstElementChild;
+    if (content) {
+      observer.observe(content);
+    }
+
+    return () => observer.disconnect();
+  }, [autoScroll, startBottomLockFrameLoop]);
 
   return {
     contentRef,
-    innerRef,
     autoScroll,
-    setAutoScroll,
     disableAutoScroll,
-    performAutoScroll,
     jumpToBottom,
     handleScroll,
-    markUserInteraction,
+    markUserScrollIntent,
+    handleScrollContainerMouseDown,
+    handleScrollContainerMouseMove,
+    handleScrollContainerMouseUp,
+    handleScrollContainerKeyDown,
   };
 }

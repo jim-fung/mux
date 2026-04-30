@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { MessageListProvider } from "./MessageListContext";
-import { markdownComponents } from "./MarkdownComponents";
+import { getCurrentHighlightedCodeBlockLines, markdownComponents } from "./MarkdownComponents";
 
 describe("MarkdownComponents command code blocks", () => {
   beforeEach(() => {
@@ -220,6 +220,30 @@ describe("MarkdownComponents command code blocks", () => {
     );
 
     expect(queryByRole("button", { name: "Run command" })).toBeNull();
+  });
+
+  test("ignores highlighted lines from a previous code block revision", () => {
+    const highlighted = {
+      code: "const oldValue = 1;",
+      shikiLanguage: "typescript",
+      theme: "dark" as const,
+      lines: ["<span>highlighted old value</span>"],
+    };
+
+    // A streaming code fence can receive a new chunk while Shiki output for the
+    // previous chunk is still cached. The renderer should fall back to current
+    // plain text until highlight output catches up to this exact code/theme tuple.
+    expect(
+      getCurrentHighlightedCodeBlockLines(
+        highlighted,
+        "const nextValue = 2;\nconsole.log(nextValue);",
+        "typescript",
+        "dark"
+      )
+    ).toBeNull();
+    expect(
+      getCurrentHighlightedCodeBlockLines(highlighted, "const oldValue = 1;", "typescript", "dark")
+    ).toEqual(["<span>highlighted old value</span>"]);
   });
 });
 

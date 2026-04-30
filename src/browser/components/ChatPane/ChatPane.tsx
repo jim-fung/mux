@@ -19,13 +19,8 @@ import { EditCutoffBarrier } from "@/browser/features/Messages/ChatBarrier/EditC
 import { StreamingBarrier } from "@/browser/features/Messages/ChatBarrier/StreamingBarrier";
 import { RetryBarrier } from "@/browser/features/Messages/ChatBarrier/RetryBarrier";
 import { PinnedTodoList } from "../PinnedTodoList/PinnedTodoList";
-import { ChatInputDecorationStack } from "./ChatInputDecorationStack";
-import { TranscriptTailStack } from "./TranscriptTailStack";
-import {
-  getLayoutStackSignature,
-  scrollElementToBottom,
-  type LayoutStackItem,
-} from "./layoutStack";
+import { LayoutStackLane } from "./LayoutStackLane";
+import type { LayoutStackItem } from "./layoutStack";
 import { VIM_ENABLED_KEY } from "@/common/constants/storage";
 import { ChatInput, type ChatInputAPI } from "@/browser/features/ChatInput/index";
 import type { QueueDispatchMode } from "@/browser/features/ChatInput/types";
@@ -387,16 +382,16 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
   // Use auto-scroll hook for scroll management
   const {
     contentRef,
-    innerRef,
     autoScroll,
-    setAutoScroll,
     disableAutoScroll,
-    performAutoScroll,
     jumpToBottom,
     handleScroll,
-    markUserInteraction,
+    markUserScrollIntent,
+    handleScrollContainerMouseDown,
+    handleScrollContainerMouseMove,
+    handleScrollContainerMouseUp,
+    handleScrollContainerKeyDown,
   } = useAutoScroll();
-  const lastTranscriptViewportHeightRef = useRef<number | null>(null);
 
   // Handler to navigate (scroll) to a specific message by historyId
   const handleNavigateToMessage = useCallback(
@@ -574,6 +569,14 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
     setEditingMessage(undefined);
   }, [setEditingMessage]);
 
+  const handleMessageSendStarted = useCallback(() => {
+    // Re-arm and pin before the send request crosses the IPC boundary. Waiting for
+    // send success can be too late because the backend may not resolve until the
+    // stream has already produced rows, leaving the first deltas offscreen when the
+    // user had previously scrolled up.
+    jumpToBottom();
+  }, [jumpToBottom]);
+
   const handleMessageSent = useCallback(
     (dispatchMode: QueueDispatchMode = "tool-end") => {
       // Only background foreground bashes for "tool-end" sends (Enter).
@@ -583,21 +586,22 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
         autoBackgroundOnSend();
       }
 
-      // Enable auto-scroll when user sends a message
-      setAutoScroll(true);
+      // Slash-command send paths still report after backend success; keep this
+      // harmless duplicate pin so those paths also re-arm auto-scroll.
+      jumpToBottom();
     },
-    [setAutoScroll, autoBackgroundOnSend]
+    [autoBackgroundOnSend, jumpToBottom]
   );
 
   const handleClearHistory = useCallback(
     async (percentage = 1.0) => {
-      // Enable auto-scroll after clearing
-      setAutoScroll(true);
+      // Re-arm the tail before clearing so the empty/starting state owns the bottom.
+      jumpToBottom();
 
       // Truncate history in backend
       await api?.workspace.truncateHistory({ workspaceId, percentage });
     },
-    [workspaceId, setAutoScroll, api]
+    [workspaceId, jumpToBottom, api]
   );
 
   const openInEditor = useOpenInEditor();
@@ -605,55 +609,20 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
     void openInEditor(workspaceId, namedWorkspacePath, runtimeConfig);
   }, [workspaceId, namedWorkspacePath, openInEditor, runtimeConfig]);
 
-  useEffect(() => {
-    const transcriptViewport = contentRef.current;
-    if (!transcriptViewport) {
-      return;
-    }
-
-    lastTranscriptViewportHeightRef.current = transcriptViewport.clientHeight;
-
-    // Sending can immediately shrink the composer below the transcript before the
-    // matching user row/streaming UI is appended. Keep the transcript pinned to the
-    // bottom when that sibling resize changes the viewport height so users don't see
-    // the tail jump between the composer collapse and the later message/tail updates.
-    const observer = new ResizeObserver((entries) => {
-      const nextHeight = entries[0]?.contentRect.height ?? transcriptViewport.clientHeight;
-      const previousHeight = lastTranscriptViewportHeightRef.current;
-      lastTranscriptViewportHeightRef.current = nextHeight;
-      if (previousHeight === null || previousHeight === nextHeight || !autoScroll) {
-        return;
-      }
-
-      scrollElementToBottom(transcriptViewport);
-    });
-
-    observer.observe(transcriptViewport);
-    return () => {
-      observer.disconnect();
-    };
-  }, [autoScroll, contentRef]);
-
-  // Auto-scroll when messages or todos update (during streaming)
-  useEffect(() => {
-    if (autoScroll) {
-      performAutoScroll();
-    }
-  }, [workspaceState?.messages, workspaceState?.todos, autoScroll, performAutoScroll]);
+  // Intentionally no message/todo-driven auto-scroll effect here. Bottom pinning is
+  // owned by the scrollport/content ResizeObservers inside `useAutoScroll`, which
+  // pins viewport or content-size changes before paint. Calling `performAutoScroll`
+  // as a separate double-RAF on every delta used to race the RO pin, occasionally
+  // painting one frame at the wrong scrollTop (visible as a brief downward jitter).
 
   const hasLoadedTranscriptRows = !workspaceState.loading && workspaceState.messages.length > 0;
 
-  // Reset transcript scroll ownership when switching workspaces. If the target workspace already
-  // has cached rows, pin to the bottom before paint; otherwise just re-arm auto-scroll so the
-  // next hydrated/streaming updates own the tail instead of showing the prior workspace's state.
+  // Reset transcript scroll ownership when switching workspaces. `jumpToBottom` both re-arms
+  // the ref-backed auto-scroll flag and pins any cached rows before paint; if rows are still
+  // hydrating, the next content resize owns the tail instead of showing the prior workspace's state.
   useLayoutEffect(() => {
-    if (hasLoadedTranscriptRows) {
-      jumpToBottom();
-      return;
-    }
-
-    setAutoScroll(true);
-  }, [hasLoadedTranscriptRows, jumpToBottom, setAutoScroll, workspaceId]);
+    jumpToBottom();
+  }, [hasLoadedTranscriptRows, jumpToBottom, workspaceId]);
 
   // Compute showRetryBarrier once for both keybinds and UI.
   // Track if last message was interrupted or errored (for RetryBarrier).
@@ -706,14 +675,11 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
       interruptedBarrierMessageIds.add(message.id);
     }
   }
-  const interruptedBarrierLayoutSignature = Array.from(interruptedBarrierMessageIds).join("|");
-
   const shouldShowStreamingBarrier = isStreamStarting || canInterrupt;
   const transcriptTailItems: LayoutStackItem[] = [];
   if (shouldMountRetryBarrier) {
     transcriptTailItems.push({
       key: "retry-barrier",
-      layoutKey: `retry-barrier:${showRetryBarrierUI ? "visible" : "hidden"}`,
       node: <RetryBarrier workspaceId={workspaceId} visible={showRetryBarrierUI} />,
     });
   }
@@ -750,7 +716,6 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
   if (concurrentLocalStreamingWorkspaceName) {
     transcriptTailItems.push({
       key: "concurrent-local-warning",
-      layoutKey: `concurrent-local-warning:${concurrentLocalStreamingWorkspaceName}`,
       node: (
         <ConcurrentLocalWarningView
           streamingWorkspaceName={concurrentLocalStreamingWorkspaceName}
@@ -758,17 +723,6 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
       ),
     });
   }
-
-  // Keep inline transcript rows pinned before paint when they change height inside the viewport.
-  // The tail and composer decoration lanes own their own layout signatures; this effect only covers
-  // layout that is inserted directly between message rows (new transcript rows, interrupted markers).
-  useLayoutEffect(() => {
-    if (!autoScroll || !contentRef.current) {
-      return;
-    }
-
-    scrollElementToBottom(contentRef.current);
-  }, [autoScroll, contentRef, latestMessageId, interruptedBarrierLayoutSignature]);
 
   const handleLoadOlderHistory = useCallback(() => {
     if (!shouldRenderLoadOlderMessagesButton || loadingOlderHistory) {
@@ -883,10 +837,12 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
           <div className="mobile-header-spacer relative flex-1 overflow-hidden">
             <div
               ref={contentRef}
-              onWheel={markUserInteraction}
-              onMouseDown={markUserInteraction}
-              onTouchMove={markUserInteraction}
-              onKeyDown={markUserInteraction}
+              onWheel={markUserScrollIntent}
+              onMouseDown={handleScrollContainerMouseDown}
+              onMouseMove={handleScrollContainerMouseMove}
+              onMouseUp={handleScrollContainerMouseUp}
+              onTouchMove={markUserScrollIntent}
+              onKeyDown={handleScrollContainerKeyDown}
               onScroll={handleScroll}
               onContextMenu={transcriptContextMenu.onContextMenu}
               role="log"
@@ -896,14 +852,13 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
               tabIndex={0}
               data-testid="message-window"
               data-loaded={!loading && !isHydratingTranscript}
-              // When ChatPane is driving the transcript to the bottom, disable browser scroll
-              // anchoring for the whole viewport so newly-added tail rows (like the starting
-              // streaming barrier) cannot win the anchor heuristic and flash the layout.
+              // Disable browser scroll anchoring only while bottom-lock owns the tail.
+              // In manual reading mode, anchoring should preserve the user's viewport
+              // when async highlights/diagrams above the fold settle.
               style={autoScroll ? AUTO_SCROLL_TRANSCRIPT_STYLE : undefined}
               className="h-full overflow-x-hidden overflow-y-auto p-[15px] leading-[1.5] break-words whitespace-pre-wrap"
             >
               <div
-                ref={innerRef}
                 className={cn(
                   "max-w-4xl mx-auto",
                   (showTranscriptHydrationPlaceholder || showEmptyTranscriptPlaceholder) && "h-full"
@@ -982,7 +937,7 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
                             : undefined;
 
                         return (
-                          <React.Fragment key={msg.id}>
+                          <React.Fragment key={`${workspaceId}:${msg.id}`}>
                             <MessageRenderer
                               message={msg}
                               onEditUserMessage={transcriptOnly ? undefined : handleEditUserMessage}
@@ -1029,11 +984,11 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
                     </>
                   </MessageListProvider>
                 )}
-                <TranscriptTailStack
+                <LayoutStackLane
                   workspaceId={workspaceId}
                   isHydrating={isHydratingTranscript}
-                  autoScroll={autoScroll}
-                  transcriptViewportRef={contentRef}
+                  align="start"
+                  overflowAnchor="none"
                   dataComponent="TranscriptTailStack"
                   items={transcriptTailItems}
                 />
@@ -1073,14 +1028,13 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
               todoCount={todoCount}
               shouldShowReviewsBanner={shouldShowReviewsBanner}
               canInterrupt={canInterrupt}
-              autoScroll={autoScroll}
-              transcriptViewportRef={contentRef}
               autoCompactionResult={autoCompactionResult}
               shouldShowCompactionWarning={shouldShowCompactionWarning}
               contextSwitchWarning={contextSwitchWarning}
               onContextSwitchCompact={handleContextSwitchCompact}
               onContextSwitchDismiss={handleContextSwitchDismiss}
               onModelChange={handleModelChange}
+              onMessageSendStarted={handleMessageSendStarted}
               onMessageSent={handleMessageSent}
               onTruncateHistory={handleClearHistory}
               editingMessage={editingMessage}
@@ -1127,14 +1081,13 @@ interface ChatInputPaneProps {
   todoCount: number;
   shouldShowReviewsBanner: boolean;
   canInterrupt: boolean;
-  autoScroll: boolean;
-  transcriptViewportRef: React.RefObject<HTMLDivElement | null>;
   autoCompactionResult: ReturnType<typeof checkAutoCompaction>;
   shouldShowCompactionWarning: boolean;
   contextSwitchWarning: ContextSwitchWarning | null;
   onContextSwitchCompact: () => void;
   onContextSwitchDismiss: () => void;
   onModelChange?: (model: string) => void;
+  onMessageSendStarted: (dispatchMode: QueueDispatchMode) => void;
   onMessageSent: (dispatchMode: QueueDispatchMode) => void;
   onTruncateHistory: (percentage?: number) => Promise<void>;
   editingMessage: EditingMessageState | undefined;
@@ -1182,7 +1135,6 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
   if (props.shouldShowPinnedTodoList) {
     decorationEntries.push({
       key: "pinned-todo-list",
-      layoutKey: `pinned-todo-list:${props.todoCount}`,
       node: <PinnedTodoList workspaceId={props.workspaceId} />,
     });
   }
@@ -1193,14 +1145,12 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
   if (props.shouldShowReviewsBanner) {
     decorationEntries.push({
       key: "reviews-banner",
-      layoutKey: `reviews-banner:${reviews.reviews.length}`,
       node: <ReviewsBanner workspaceId={props.workspaceId} />,
     });
   }
   if (props.queuedMessage) {
     decorationEntries.push({
       key: "queued-message",
-      layoutKey: `queued-message:${props.queuedMessage.id}`,
       node: (
         <QueuedMessage
           message={props.queuedMessage}
@@ -1220,28 +1170,15 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
       ),
     });
   }
-  const decorationLayoutSignature = getLayoutStackSignature(decorationEntries);
-
-  // The decoration lane changes the transcript viewport height from below, so let the lane owner
-  // report one layout signature instead of teaching ChatPane about every individual banner.
-  useLayoutEffect(() => {
-    if (!props.autoScroll) {
-      return;
-    }
-
-    const transcriptViewport = props.transcriptViewportRef.current;
-    if (!transcriptViewport) {
-      return;
-    }
-
-    scrollElementToBottom(transcriptViewport);
-  }, [decorationLayoutSignature, props.autoScroll, props.transcriptViewportRef]);
+  // The decoration lane changes the transcript viewport height from below; the
+  // scrollport ResizeObserver inside useAutoScroll owns any required bottom pin.
 
   return (
     <>
-      <ChatInputDecorationStack
+      <LayoutStackLane
         workspaceId={props.workspaceId}
         isHydrating={props.isHydratingTranscript}
+        align="end"
         dataComponent="ChatInputDecorationStack"
         items={decorationEntries}
       />
@@ -1250,6 +1187,7 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
         variant="workspace"
         workspaceId={props.workspaceId}
         runtimeType={getRuntimeTypeForTelemetry(props.runtimeConfig)}
+        onMessageSendStarted={props.onMessageSendStarted}
         onMessageSent={props.onMessageSent}
         onTruncateHistory={props.onTruncateHistory}
         onModelChange={props.onModelChange}
