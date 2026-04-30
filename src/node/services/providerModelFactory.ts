@@ -3,7 +3,7 @@ import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import type { XaiProviderOptions } from "@ai-sdk/xai";
 import { fromNodeProviderChain } from "@aws-sdk/credential-providers";
 import { wrapLanguageModel, type LanguageModel } from "ai";
-import type { ThinkingLevel } from "@/common/types/thinking";
+import { anthropicSupportsNativeXhigh, type ThinkingLevel } from "@/common/types/thinking";
 import { Ok, Err } from "@/common/types/result";
 import type { Result } from "@/common/types/result";
 import type { SendMessageError } from "@/common/types/errors";
@@ -333,9 +333,10 @@ export function wrapFetchWithAnthropicCacheControl(
       //   with the model exposed via the ai-model-id header.
       const directModel = typeof json.model === "string" ? json.model : "";
       const headerModelId = incomingHeaders.get("ai-model-id") ?? "";
-      const targetsOpus47OrNewer = [directModel, headerModelId].some((candidate) =>
-        /claude-opus-(?:4-(?:[7-9]|\d{2,})|[5-9]|\d{2,})/i.test(candidate)
-      );
+      // Reuse the shared Opus 4.7+ detector so the wire-level regex stays in
+      // one place (src/common/types/thinking.ts) — it also normalizes provider
+      // prefixes (e.g., `anthropic/claude-opus-4-7`).
+      const targetsOpus47OrNewer = [directModel, headerModelId].some(anthropicSupportsNativeXhigh);
 
       const directThinking = isRecord(json.thinking) ? json.thinking : undefined;
       const providerOpts = isRecord(json.providerOptions) ? json.providerOptions : undefined;
@@ -672,6 +673,33 @@ const CODEX_ALLOWED_PARAMS = new Set([
   "include",
   "text", // structured output via Output.object -> text.format
 ]);
+
+// ---------------------------------------------------------------------------
+// Fetch input helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract a URL string from the `input` argument of a `fetch`-compatible call.
+ * Handles the three shapes AI SDK providers pass through: plain string, `URL`,
+ * and `Request`-like objects that expose a `url` property. Returns an empty
+ * string when the URL cannot be determined so callers can fall through to
+ * normal fetch behavior without throwing.
+ */
+function getFetchInputUrl(input: Parameters<typeof fetch>[0]): string {
+  if (typeof input === "string") {
+    return input;
+  }
+  if (input instanceof URL) {
+    return input.toString();
+  }
+  if (typeof input === "object" && input !== null && "url" in input) {
+    const possibleUrl = (input as { url?: unknown }).url;
+    if (typeof possibleUrl === "string") {
+      return possibleUrl;
+    }
+  }
+  return "";
+}
 
 // ---------------------------------------------------------------------------
 // Content extraction
@@ -1277,21 +1305,7 @@ export class ProviderModelFactory {
             init?: Parameters<typeof fetch>[1]
           ): Promise<Response> => {
             try {
-              const urlString = (() => {
-                if (typeof input === "string") {
-                  return input;
-                }
-                if (input instanceof URL) {
-                  return input.toString();
-                }
-                if (typeof input === "object" && input !== null && "url" in input) {
-                  const possibleUrl = (input as { url?: unknown }).url;
-                  if (typeof possibleUrl === "string") {
-                    return possibleUrl;
-                  }
-                }
-                return "";
-              })();
+              const urlString = getFetchInputUrl(input);
 
               const method = (init?.method ?? "GET").toUpperCase();
               const isOpenAIResponses = /\/v1\/responses(\?|$)/.test(urlString);
@@ -1751,21 +1765,7 @@ export class ProviderModelFactory {
           headers.set("Authorization", `Bearer ${resolvedApiKey ?? ""}`);
           headers.set("Openai-Intent", "conversation-edits");
 
-          const urlString = (() => {
-            if (typeof input === "string") {
-              return input;
-            }
-            if (input instanceof URL) {
-              return input.toString();
-            }
-            if (typeof input === "object" && input !== null && "url" in input) {
-              const possibleUrl = (input as { url?: unknown }).url;
-              if (typeof possibleUrl === "string") {
-                return possibleUrl;
-              }
-            }
-            return "";
-          })();
+          const urlString = getFetchInputUrl(input);
 
           const method = (
             init?.method ?? (input instanceof Request ? input.method : "GET")
