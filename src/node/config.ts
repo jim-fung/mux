@@ -20,14 +20,17 @@ import type {
   UpdateChannel,
 } from "@/common/types/project";
 import type {
+  AppConfigMigrations,
   AppConfigOnDisk,
   BaseProviderConfig as ProviderConfig,
   ProvidersConfig as CanonicalProvidersConfig,
 } from "@/common/config/schemas";
 import {
   DEFAULT_TASK_SETTINGS,
+  deriveLegacySubagentAiDefaultsFromAgentDefaults,
   normalizeSubagentAiDefaults,
   normalizeTaskSettings,
+  shouldMirrorAgentDefaultToLegacySubagent,
 } from "@/common/types/tasks";
 import { isLayoutPresetsConfigEmpty, normalizeLayoutPresetsConfig } from "@/common/types/uiLayouts";
 import { normalizeAgentAiDefaults } from "@/common/types/agentAiDefaults";
@@ -299,6 +302,80 @@ function normalizeAiDefaultsModelStrings<T extends Record<string, { modelString?
   return modified ? (Object.fromEntries(normalizedEntries) as T) : value;
 }
 
+type SubagentAiDefaultsConfig = NonNullable<ProjectsConfig["subagentAiDefaults"]>;
+type AgentAiDefaultsConfig = NonNullable<ProjectsConfig["agentAiDefaults"]>;
+
+function normalizeConfigMigrations(value: unknown): AppConfigMigrations {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+
+  const record = value as Record<string, unknown>;
+  return {
+    ...(record.execSubagentDefaultsSplit === true ? { execSubagentDefaultsSplit: true } : {}),
+  };
+}
+
+function extractAgentDefaultsFromLegacySubagents(
+  legacySubagentAiDefaults: SubagentAiDefaultsConfig
+): Record<string, unknown> {
+  const fallbackDefaults: Record<string, unknown> = {};
+  for (const [agentId, entry] of Object.entries(legacySubagentAiDefaults)) {
+    if (!shouldMirrorAgentDefaultToLegacySubagent(agentId)) continue;
+    fallbackDefaults[agentId] = entry;
+  }
+  return fallbackDefaults;
+}
+
+function removeMirroredExecSubagentDefaults(params: {
+  subagentAiDefaults: SubagentAiDefaultsConfig;
+  agentAiDefaults: AgentAiDefaultsConfig;
+}): {
+  subagentAiDefaults: SubagentAiDefaultsConfig;
+  modified: boolean;
+} {
+  const execSubagentDefault = params.subagentAiDefaults.exec;
+  const execAgentDefault = params.agentAiDefaults.exec;
+  if (!execSubagentDefault || !execAgentDefault) {
+    return { subagentAiDefaults: params.subagentAiDefaults, modified: false };
+  }
+
+  const nextExecSubagentDefault = { ...execSubagentDefault };
+  let modified = false;
+
+  if (
+    nextExecSubagentDefault.modelString !== undefined &&
+    nextExecSubagentDefault.modelString === execAgentDefault.modelString
+  ) {
+    delete nextExecSubagentDefault.modelString;
+    modified = true;
+  }
+
+  if (
+    nextExecSubagentDefault.thinkingLevel !== undefined &&
+    nextExecSubagentDefault.thinkingLevel === execAgentDefault.thinkingLevel
+  ) {
+    delete nextExecSubagentDefault.thinkingLevel;
+    modified = true;
+  }
+
+  if (!modified) {
+    return { subagentAiDefaults: params.subagentAiDefaults, modified: false };
+  }
+
+  const subagentAiDefaults = { ...params.subagentAiDefaults };
+  if (
+    nextExecSubagentDefault.modelString === undefined &&
+    nextExecSubagentDefault.thinkingLevel === undefined
+  ) {
+    delete subagentAiDefaults.exec;
+  } else {
+    subagentAiDefaults.exec = nextExecSubagentDefault;
+  }
+
+  return { subagentAiDefaults, modified: true };
+}
+
 function parseOptionalPort(value: unknown): number | undefined {
   if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value)) {
     return undefined;
@@ -486,6 +563,7 @@ export class Config {
         const data = fs.readFileSync(this.configFile, "utf-8");
         const parsed = JSON.parse(data) as Partial<AppConfigOnDisk> & Record<string, unknown>;
         let configModified = false;
+        let shouldInvalidateSessionUsageCaches = false;
 
         const normalizeNestedModelStrings = (value: unknown): boolean => {
           if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -560,6 +638,7 @@ export class Config {
 
               if (routeOverridesModified) {
                 parsed.routeOverrides = mergedRouteOverrides;
+                shouldInvalidateSessionUsageCaches = true;
               }
             }
           }
@@ -595,6 +674,7 @@ export class Config {
           if (normalized !== parsed.defaultModel) {
             parsed.defaultModel = normalized;
             configModified = true;
+            shouldInvalidateSessionUsageCaches = true;
           }
         }
 
@@ -612,49 +692,17 @@ export class Config {
           ) {
             parsed.hiddenModels = normalizedHiddenModels;
             configModified = true;
+            shouldInvalidateSessionUsageCaches = true;
           }
         }
 
         if (normalizeNestedModelStrings(parsed.agentAiDefaults)) {
           configModified = true;
+          shouldInvalidateSessionUsageCaches = true;
         }
         if (normalizeNestedModelStrings(parsed.subagentAiDefaults)) {
           configModified = true;
-        }
-
-        if (configModified) {
-          // Invalidate stale usage caches: old files may contain gateway-prefixed model ids.
-          try {
-            if (fs.existsSync(this.sessionsDir)) {
-              for (const sessionEntry of fs.readdirSync(this.sessionsDir, {
-                withFileTypes: true,
-              })) {
-                if (!sessionEntry.isDirectory()) {
-                  continue;
-                }
-
-                const usagePath = path.join(
-                  this.getSessionDir(sessionEntry.name),
-                  "session-usage.json"
-                );
-                if (fs.existsSync(usagePath)) {
-                  fs.rmSync(usagePath, { force: true });
-                }
-              }
-            }
-          } catch (error) {
-            // Best-effort cleanup; never fail startup on cache invalidation issues.
-            log.warn("Failed to invalidate session usage cache during config migration", { error });
-          }
-
-          try {
-            writeFileAtomic.sync(this.configFile, JSON.stringify(parsed, null, 2), {
-              encoding: "utf-8",
-            });
-          } catch (error) {
-            // Keep startup resilient even if persisting migration fails.
-            log.warn("Failed to persist migrated config", { error });
-          }
+          shouldInvalidateSessionUsageCaches = true;
         }
 
         // Config is stored as array of [path, config] pairs.
@@ -700,7 +748,75 @@ export class Config {
             ? null
             : parseOptionalPositiveInteger(parsed.advisorMaxOutputTokens);
         const hiddenModels = normalizeOptionalModelStringArray(parsed.hiddenModels);
-        const legacySubagentAiDefaults = normalizeSubagentAiDefaults(parsed.subagentAiDefaults);
+        let legacySubagentAiDefaults = normalizeSubagentAiDefaults(parsed.subagentAiDefaults);
+        const agentAiDefaults =
+          parsed.agentAiDefaults !== undefined
+            ? normalizeAgentAiDefaults(parsed.agentAiDefaults)
+            : normalizeAgentAiDefaults(
+                extractAgentDefaultsFromLegacySubagents(legacySubagentAiDefaults)
+              );
+        const configMigrations = normalizeConfigMigrations(parsed.migrations);
+
+        const needsExecSubagentDefaultsSplitMigration =
+          configMigrations.execSubagentDefaultsSplit !== true &&
+          (legacySubagentAiDefaults.exec != null || agentAiDefaults.exec != null);
+        if (needsExecSubagentDefaultsSplitMigration) {
+          const cleanup = removeMirroredExecSubagentDefaults({
+            subagentAiDefaults: legacySubagentAiDefaults,
+            agentAiDefaults,
+          });
+          legacySubagentAiDefaults = cleanup.subagentAiDefaults;
+          if (cleanup.modified) {
+            if (Object.keys(legacySubagentAiDefaults).length > 0) {
+              parsed.subagentAiDefaults = legacySubagentAiDefaults;
+            } else {
+              delete parsed.subagentAiDefaults;
+            }
+          }
+
+          parsed.migrations = {
+            ...configMigrations,
+            execSubagentDefaultsSplit: true,
+          };
+          configModified = true;
+        }
+
+        if (shouldInvalidateSessionUsageCaches) {
+          // Invalidate stale usage caches only when model id formats changed.
+          try {
+            if (fs.existsSync(this.sessionsDir)) {
+              for (const sessionEntry of fs.readdirSync(this.sessionsDir, {
+                withFileTypes: true,
+              })) {
+                if (!sessionEntry.isDirectory()) {
+                  continue;
+                }
+
+                const usagePath = path.join(
+                  this.getSessionDir(sessionEntry.name),
+                  "session-usage.json"
+                );
+                if (fs.existsSync(usagePath)) {
+                  fs.rmSync(usagePath, { force: true });
+                }
+              }
+            }
+          } catch (error) {
+            // Best-effort cleanup; never fail startup on cache invalidation issues.
+            log.warn("Failed to invalidate session usage cache during config migration", { error });
+          }
+        }
+
+        if (configModified) {
+          try {
+            writeFileAtomic.sync(this.configFile, JSON.stringify(parsed, null, 2), {
+              encoding: "utf-8",
+            });
+          } catch (error) {
+            // Keep startup resilient even if persisting migration fails.
+            log.warn("Failed to persist migrated config", { error });
+          }
+        }
 
         const coderWorkspaceArchiveBehavior = resolveCoderWorkspaceArchiveBehavior(
           parsed.coderWorkspaceArchiveBehavior,
@@ -719,11 +835,6 @@ export class Config {
 
         const runtimeEnablement = normalizeRuntimeEnablementOverrides(parsed.runtimeEnablement);
         const defaultRuntime = normalizeRuntimeEnablementId(parsed.defaultRuntime);
-
-        const agentAiDefaults =
-          parsed.agentAiDefaults !== undefined
-            ? normalizeAgentAiDefaults(parsed.agentAiDefaults)
-            : normalizeAgentAiDefaults(legacySubagentAiDefaults);
 
         const layoutPresetsRaw = normalizeLayoutPresetsConfig(parsed.layoutPresets);
         const layoutPresets = isLayoutPresetsConfigEmpty(layoutPresetsRaw)
@@ -759,8 +870,10 @@ export class Config {
           advisorMaxOutputTokens,
           hiddenModels,
           agentAiDefaults,
-          // Legacy fields are still parsed and returned for downgrade compatibility.
+          // Subagent defaults: exec is canonical active storage, non-exec entries
+          // support legacy mirror compatibility.
           subagentAiDefaults: legacySubagentAiDefaults,
+          migrations: normalizeConfigMigrations(parsed.migrations),
           featureFlagOverrides: parsed.featureFlagOverrides,
           useSSH2Transport: parseOptionalBoolean(parsed.useSSH2Transport),
           muxGovernorUrl: parseOptionalNonEmptyString(parsed.muxGovernorUrl),
@@ -936,19 +1049,29 @@ export class Config {
         const normalizedAgentAiDefaults = normalizeAiDefaultsModelStrings(config.agentAiDefaults);
         data.agentAiDefaults = normalizedAgentAiDefaults;
 
-        const legacySubagent: Record<string, unknown> = {};
-        for (const [id, entry] of Object.entries(normalizedAgentAiDefaults)) {
-          if (id === "plan" || id === "exec" || id === "compact") continue;
-          legacySubagent[id] = entry;
-        }
+        const preservedExec = config.subagentAiDefaults?.exec;
+        const legacySubagent = deriveLegacySubagentAiDefaultsFromAgentDefaults({
+          agentAiDefaults: normalizedAgentAiDefaults,
+          preservedExec,
+        });
         if (Object.keys(legacySubagent).length > 0) {
-          data.subagentAiDefaults = legacySubagent as ProjectsConfig["subagentAiDefaults"];
+          data.subagentAiDefaults = legacySubagent;
         }
       } else {
-        // Legacy only.
+        // Subagent-only configs keep exec as active storage. Other entries are
+        // retained for legacy fallback.
         if (config.subagentAiDefaults && Object.keys(config.subagentAiDefaults).length > 0) {
           data.subagentAiDefaults = normalizeAiDefaultsModelStrings(config.subagentAiDefaults);
         }
+      }
+
+      const migrations = normalizeConfigMigrations(config.migrations);
+      if (
+        migrations.execSubagentDefaultsSplit === true ||
+        config.agentAiDefaults?.exec != null ||
+        config.subagentAiDefaults?.exec != null
+      ) {
+        data.migrations = { ...migrations, execSubagentDefaultsSplit: true };
       }
 
       if (config.useSSH2Transport !== undefined) {

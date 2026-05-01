@@ -21,8 +21,10 @@ import { enforceThinkingPolicy, getThinkingPolicyForModel } from "@/common/utils
 import { useAPI } from "@/browser/contexts/API";
 import {
   clearPendingWorkspaceAiSettings,
+  getWorkspaceAiSettingsFromMetadata,
   markPendingWorkspaceAiSettings,
 } from "@/browser/utils/workspaceAiSettingsSync";
+import { useOptionalWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 
@@ -48,23 +50,41 @@ function getCanonicalModelForScope(scopeId: string, fallbackModel: string): stri
   return normalizeToCanonical(rawModel || fallbackModel);
 }
 
+function getModelForThinkingUpdate(
+  scopeId: string,
+  metadataModel: string | undefined,
+  fallbackModel: string
+): string {
+  const persistedModel = readPersistedState<string | undefined>(getModelKey(scopeId), undefined);
+  // Prefer localStorage, then metadata, then the default model to avoid clobbering startup metadata.
+  return normalizeToCanonical(persistedModel ?? metadataModel ?? fallbackModel);
+}
+
 export const ThinkingProvider: React.FC<ThinkingProviderProps> = (props) => {
   const { api } = useAPI();
+  const workspaceContext = useOptionalWorkspaceContext();
   const defaultModel = getDefaultModel();
   const scopeId = getScopeId(props.workspaceId, props.projectPath);
   const thinkingKey = getThinkingLevelKey(scopeId);
-
-  // Workspace-scoped thinking. (No longer per-model.)
-  const [thinkingLevel, setThinkingLevelInternal] = usePersistedState<ThinkingLevel>(
-    thinkingKey,
-    THINKING_LEVEL_OFF,
-    { listener: true }
+  const metadataAgentId = readPersistedState<string>(
+    getAgentIdKey(scopeId),
+    WORKSPACE_DEFAULTS.agentId
   );
+  const metadataSettings = getWorkspaceAiSettingsFromMetadata(
+    props.workspaceId ? workspaceContext?.workspaceMetadata.get(props.workspaceId) : undefined,
+    metadataAgentId
+  );
+
+  // Workspace-scoped thinking. Null means no explicit user choice has been persisted yet.
+  const [persistedThinkingLevel, setThinkingLevelInternal] =
+    usePersistedState<ThinkingLevel | null>(thinkingKey, null, { listener: true });
+  const thinkingLevel =
+    persistedThinkingLevel ?? metadataSettings.thinkingLevel ?? THINKING_LEVEL_OFF;
 
   // One-time migration: if the new workspace-scoped key is missing, seed from the legacy per-model key.
   useEffect(() => {
-    const existing = readPersistedState<ThinkingLevel | undefined>(thinkingKey, undefined);
-    if (existing !== undefined) {
+    const existing = readPersistedState<ThinkingLevel | null | undefined>(thinkingKey, undefined);
+    if (existing != null) {
       return;
     }
 
@@ -80,7 +100,7 @@ export const ThinkingProvider: React.FC<ThinkingProviderProps> = (props) => {
 
   const setThinkingLevel = useCallback(
     (level: ThinkingLevel) => {
-      const model = getCanonicalModelForScope(scopeId, defaultModel);
+      const model = getModelForThinkingUpdate(scopeId, metadataSettings.model, defaultModel);
 
       setThinkingLevelInternal(level);
 
@@ -140,7 +160,14 @@ export const ThinkingProvider: React.FC<ThinkingProviderProps> = (props) => {
           // Best-effort only. If offline or backend is old, the next sendMessage will persist.
         });
     },
-    [api, defaultModel, props.workspaceId, scopeId, setThinkingLevelInternal]
+    [
+      api,
+      defaultModel,
+      metadataSettings.model,
+      props.workspaceId,
+      scopeId,
+      setThinkingLevelInternal,
+    ]
   );
 
   // Global keybind: cycle thinking level (Ctrl/Cmd+Shift+T).
@@ -154,7 +181,8 @@ export const ThinkingProvider: React.FC<ThinkingProviderProps> = (props) => {
 
       e.preventDefault();
 
-      const model = getCanonicalModelForScope(scopeId, defaultModel);
+      // Keep cycling aligned with setThinkingLevel so startup metadata uses the matching policy.
+      const model = getModelForThinkingUpdate(scopeId, metadataSettings.model, defaultModel);
       const allowed = getThinkingPolicyForModel(model);
       if (allowed.length <= 1) {
         return;
@@ -168,7 +196,7 @@ export const ThinkingProvider: React.FC<ThinkingProviderProps> = (props) => {
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [defaultModel, scopeId, thinkingLevel, setThinkingLevel]);
+  }, [defaultModel, metadataSettings.model, scopeId, thinkingLevel, setThinkingLevel]);
 
   // Memoize context value to prevent unnecessary re-renders of consumers.
   const contextValue = useMemo(

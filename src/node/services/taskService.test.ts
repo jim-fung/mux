@@ -25,6 +25,7 @@ import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import * as forkOrchestrator from "@/node/services/utils/forkOrchestrator";
 import { Ok, Err, type Result } from "@/common/types/result";
 import { defaultModel } from "@/common/utils/ai/models";
+import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
 import type { PlanSubagentExecutorRouting } from "@/common/types/tasks";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import type { ErrorEvent, StreamEndEvent } from "@/common/types/stream";
@@ -121,6 +122,47 @@ async function createTestProject(
     initGitRepo(projectPath);
   }
   return projectPath;
+}
+
+async function saveLocalParentWorkspace(
+  config: Config,
+  rootDir: string,
+  options?: {
+    agentAiDefaults?: Record<string, { modelString?: string; thinkingLevel?: ThinkingLevel }>;
+    subagentAiDefaults?: Record<string, { modelString?: string; thinkingLevel?: ThinkingLevel }>;
+    parentAiSettings?: { model: string; thinkingLevel: ThinkingLevel };
+  }
+): Promise<{ parentId: string; projectPath: string }> {
+  const projectPath = await createTestProject(rootDir, "repo", { initGit: false });
+  const parentId = "1111111111";
+  await config.saveConfig({
+    projects: new Map([
+      [
+        projectPath,
+        {
+          trusted: true,
+          workspaces: [
+            {
+              path: projectPath,
+              id: parentId,
+              name: "parent",
+              createdAt: new Date().toISOString(),
+              runtimeConfig: { type: "local" },
+              aiSettings: options?.parentAiSettings ?? {
+                model: "anthropic:claude-opus-4-6",
+                thinkingLevel: "high",
+              },
+            },
+          ],
+        },
+      ],
+    ]),
+    taskSettings: { maxParallelAgentTasks: 3, maxTaskNestingDepth: 3 },
+    agentAiDefaults: options?.agentAiDefaults,
+    subagentAiDefaults: options?.subagentAiDefaults,
+    migrations: { execSubagentDefaultsSplit: true },
+  });
+  return { parentId, projectPath };
 }
 
 function stubStableIds(config: Config, ids: string[], fallbackId = "fffffffff0"): void {
@@ -1640,7 +1682,7 @@ describe("TaskService", () => {
     expect(childEntry?.taskThinkingLevel).toBe("xhigh");
   }, 20_000);
 
-  test("agentAiDefaults override inherited parent model on task create", async () => {
+  test("explicit task args outrank agentAiDefaults on task create", async () => {
     const config = await createTestConfig(rootDir);
     stubStableIds(config, ["aaaaaaaaaa"], "bbbbbbbbbb");
 
@@ -1700,13 +1742,400 @@ describe("TaskService", () => {
       created.data.taskId,
       "run task with custom agent",
       {
-        model: "openai:gpt-5.3-codex",
+        model: "openai:gpt-4o-mini",
         agentId: "custom",
+        thinkingLevel: "off",
+        experiments: undefined,
+      },
+      { agentInitiated: true }
+    );
+  }, 20_000);
+
+  test("parent runtime AI settings outrank persisted parent workspace settings", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["aaaaaaaaaa"], "bbbbbbbbbb");
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir, {
+      parentAiSettings: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
+    });
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    const created = await taskService.create({
+      parentWorkspaceId: parentId,
+      kind: "agent",
+      agentType: "exec",
+      prompt: "run exec task with parent runtime fallback",
+      title: "Test task",
+      parentRuntimeAiSettings: { modelString: "openai:gpt-5.3-codex" },
+    });
+    expect(created.success).toBe(true);
+    if (!created.success) return;
+
+    expect(sendMessage).toHaveBeenCalledWith(
+      created.data.taskId,
+      "run exec task with parent runtime fallback",
+      {
+        model: "openai:gpt-5.3-codex",
+        agentId: "exec",
+        thinkingLevel: "medium",
+        experiments: undefined,
+      },
+      { agentInitiated: true }
+    );
+    const childEntry = findWorkspaceInConfig(config, created.data.taskId);
+    expect(childEntry?.taskModelString).toBe("openai:gpt-5.3-codex");
+    expect(childEntry?.taskThinkingLevel).toBe("medium");
+  }, 20_000);
+
+  test("subagentAiDefaults outrank parent runtime AI settings", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["aaaaaaaaaa"], "bbbbbbbbbb");
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir, {
+      subagentAiDefaults: {
+        exec: { modelString: "anthropic:claude-haiku-4-5", thinkingLevel: "off" },
+      },
+    });
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    const created = await taskService.create({
+      parentWorkspaceId: parentId,
+      kind: "agent",
+      agentType: "exec",
+      prompt: "run exec task with configured default",
+      title: "Test task",
+      parentRuntimeAiSettings: { modelString: "openai:gpt-5.3-codex", thinkingLevel: "xhigh" },
+    });
+    expect(created.success).toBe(true);
+    if (!created.success) return;
+
+    expect(sendMessage).toHaveBeenCalledWith(
+      created.data.taskId,
+      "run exec task with configured default",
+      {
+        model: "anthropic:claude-haiku-4-5",
+        agentId: "exec",
+        thinkingLevel: "off",
+        experiments: undefined,
+      },
+      { agentInitiated: true }
+    );
+    const childEntry = findWorkspaceInConfig(config, created.data.taskId);
+    expect(childEntry?.taskModelString).toBe("anthropic:claude-haiku-4-5");
+    expect(childEntry?.taskThinkingLevel).toBe("off");
+  }, 20_000);
+
+  test("parent runtime thinking hint is clamped by the resolved model policy", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["aaaaaaaaaa"], "bbbbbbbbbb");
+    const resolvedModel = "openai:gpt-5.5-pro";
+    const requestedThinkingLevel: ThinkingLevel = "off";
+    const expectedThinkingLevel = enforceThinkingPolicy(resolvedModel, requestedThinkingLevel);
+    expect(expectedThinkingLevel).not.toBe(requestedThinkingLevel);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir, {
+      parentAiSettings: { model: resolvedModel, thinkingLevel: "high" },
+    });
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    const created = await taskService.create({
+      parentWorkspaceId: parentId,
+      kind: "agent",
+      agentType: "exec",
+      prompt: "run exec task with parent runtime thinking fallback",
+      title: "Test task",
+      parentRuntimeAiSettings: { thinkingLevel: requestedThinkingLevel },
+    });
+    expect(created.success).toBe(true);
+    if (!created.success) return;
+
+    expect(sendMessage).toHaveBeenCalledWith(
+      created.data.taskId,
+      "run exec task with parent runtime thinking fallback",
+      {
+        model: resolvedModel,
+        agentId: "exec",
+        thinkingLevel: expectedThinkingLevel,
+        experiments: undefined,
+      },
+      { agentInitiated: true }
+    );
+    const childEntry = findWorkspaceInConfig(config, created.data.taskId);
+    expect(childEntry?.taskModelString).toBe(resolvedModel);
+    expect(childEntry?.taskThinkingLevel).toBe(expectedThinkingLevel);
+  }, 20_000);
+
+  test("exec subagent uses subagentAiDefaults exec when present", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["aaaaaaaaaa"], "bbbbbbbbbb");
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir, {
+      agentAiDefaults: {
+        exec: { modelString: "openai:gpt-5.2", thinkingLevel: "medium" },
+      },
+      subagentAiDefaults: {
+        exec: { modelString: "openai:gpt-5.3-codex", thinkingLevel: "xhigh" },
+      },
+    });
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    const created = await taskService.create({
+      parentWorkspaceId: parentId,
+      kind: "agent",
+      agentType: "exec",
+      prompt: "run exec task with subagent defaults",
+      title: "Test task",
+    });
+    expect(created.success).toBe(true);
+    if (!created.success) return;
+
+    expect(sendMessage).toHaveBeenCalledWith(
+      created.data.taskId,
+      "run exec task with subagent defaults",
+      {
+        model: "openai:gpt-5.3-codex",
+        agentId: "exec",
         thinkingLevel: "xhigh",
         experiments: undefined,
       },
       { agentInitiated: true }
     );
+    const childEntry = findWorkspaceInConfig(config, created.data.taskId);
+    expect(childEntry?.taskModelString).toBe("openai:gpt-5.3-codex");
+    expect(childEntry?.taskThinkingLevel).toBe("xhigh");
+  }, 20_000);
+
+  test("explicit task args outrank subagentAiDefaults exec on task create", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["aaaaaaaaaa"], "bbbbbbbbbb");
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir, {
+      subagentAiDefaults: {
+        exec: { modelString: "openai:gpt-5.3-codex", thinkingLevel: "xhigh" },
+      },
+    });
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    const created = await taskService.create({
+      parentWorkspaceId: parentId,
+      kind: "agent",
+      agentType: "exec",
+      prompt: "run exec task with explicit args",
+      title: "Test task",
+      modelString: "openai:gpt-5.2",
+      thinkingLevel: "medium",
+    });
+    expect(created.success).toBe(true);
+    if (!created.success) return;
+
+    expect(sendMessage).toHaveBeenCalledWith(
+      created.data.taskId,
+      "run exec task with explicit args",
+      {
+        model: "openai:gpt-5.2",
+        agentId: "exec",
+        thinkingLevel: "medium",
+        experiments: undefined,
+      },
+      { agentInitiated: true }
+    );
+    const childEntry = findWorkspaceInConfig(config, created.data.taskId);
+    expect(childEntry?.taskModelString).toBe("openai:gpt-5.2");
+    expect(childEntry?.taskThinkingLevel).toBe("medium");
+  }, 20_000);
+
+  test("exec subagent falls back to agentAiDefaults exec when subagent default is absent", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["aaaaaaaaaa"], "bbbbbbbbbb");
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir, {
+      agentAiDefaults: {
+        exec: { modelString: "openai:gpt-5.3-codex", thinkingLevel: "xhigh" },
+      },
+    });
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    const created = await taskService.create({
+      parentWorkspaceId: parentId,
+      kind: "agent",
+      agentType: "exec",
+      prompt: "run exec task with agent defaults",
+      title: "Test task",
+    });
+    expect(created.success).toBe(true);
+    if (!created.success) return;
+
+    expect(sendMessage).toHaveBeenCalledWith(
+      created.data.taskId,
+      "run exec task with agent defaults",
+      {
+        model: "openai:gpt-5.3-codex",
+        agentId: "exec",
+        thinkingLevel: "xhigh",
+        experiments: undefined,
+      },
+      { agentInitiated: true }
+    );
+  }, 20_000);
+
+  test("exec subagent partial override combines subagent model with agent thinking", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["aaaaaaaaaa"], "bbbbbbbbbb");
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir, {
+      agentAiDefaults: {
+        exec: { modelString: "openai:gpt-5.2", thinkingLevel: "xhigh" },
+      },
+      subagentAiDefaults: {
+        exec: { modelString: "openai:gpt-5.3-codex" },
+      },
+    });
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    const created = await taskService.create({
+      parentWorkspaceId: parentId,
+      kind: "agent",
+      agentType: "exec",
+      prompt: "run exec task with partial defaults",
+      title: "Test task",
+    });
+    expect(created.success).toBe(true);
+    if (!created.success) return;
+
+    expect(sendMessage).toHaveBeenCalledWith(
+      created.data.taskId,
+      "run exec task with partial defaults",
+      {
+        model: "openai:gpt-5.3-codex",
+        agentId: "exec",
+        thinkingLevel: "xhigh",
+        experiments: undefined,
+      },
+      { agentInitiated: true }
+    );
+  }, 20_000);
+
+  test("subagent thinking defaults are clamped by the resolved model policy", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["aaaaaaaaaa"], "bbbbbbbbbb");
+    const resolvedModel = "openai:gpt-5.5-pro";
+    const requestedThinkingLevel: ThinkingLevel = "off";
+    const expectedThinkingLevel = enforceThinkingPolicy(resolvedModel, requestedThinkingLevel);
+    expect(expectedThinkingLevel).not.toBe(requestedThinkingLevel);
+
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir, {
+      parentAiSettings: { model: resolvedModel, thinkingLevel: "high" },
+      subagentAiDefaults: {
+        exec: { thinkingLevel: requestedThinkingLevel },
+      },
+    });
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    const created = await taskService.create({
+      parentWorkspaceId: parentId,
+      kind: "agent",
+      agentType: "exec",
+      prompt: "run exec task with clamped default thinking",
+      title: "Test task",
+    });
+    expect(created.success).toBe(true);
+    if (!created.success) return;
+
+    expect(sendMessage).toHaveBeenCalledWith(
+      created.data.taskId,
+      "run exec task with clamped default thinking",
+      {
+        model: resolvedModel,
+        agentId: "exec",
+        thinkingLevel: expectedThinkingLevel,
+        experiments: undefined,
+      },
+      { agentInitiated: true }
+    );
+    const childEntry = findWorkspaceInConfig(config, created.data.taskId);
+    expect(childEntry?.taskModelString).toBe(resolvedModel);
+    expect(childEntry?.taskThinkingLevel).toBe(expectedThinkingLevel);
+  }, 20_000);
+
+  test("thinking policy is enforced after resolving the final subagent model", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["aaaaaaaaaa"], "bbbbbbbbbb");
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir, {
+      subagentAiDefaults: {
+        exec: { modelString: "google:gemini-3-pro" },
+      },
+    });
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    const created = await taskService.create({
+      parentWorkspaceId: parentId,
+      kind: "agent",
+      agentType: "exec",
+      prompt: "run exec task with clamped thinking",
+      title: "Test task",
+      thinkingLevel: "off",
+    });
+    expect(created.success).toBe(true);
+    if (!created.success) return;
+
+    expect(sendMessage).toHaveBeenCalledWith(
+      created.data.taskId,
+      "run exec task with clamped thinking",
+      {
+        model: "google:gemini-3-pro",
+        agentId: "exec",
+        thinkingLevel: "low",
+        experiments: undefined,
+      },
+      { agentInitiated: true }
+    );
+  }, 20_000);
+
+  test("created task metadata is not recomputed after defaults change", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["aaaaaaaaaa"], "bbbbbbbbbb");
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir, {
+      subagentAiDefaults: {
+        exec: { modelString: "openai:gpt-5.3-codex", thinkingLevel: "xhigh" },
+      },
+    });
+
+    const { taskService } = createTaskServiceHarness(config);
+    const created = await taskService.create({
+      parentWorkspaceId: parentId,
+      kind: "agent",
+      agentType: "exec",
+      prompt: "run exec task before defaults change",
+      title: "Test task",
+    });
+    expect(created.success).toBe(true);
+    if (!created.success) return;
+
+    await config.editConfig((cfg) => ({
+      ...cfg,
+      subagentAiDefaults: {
+        exec: { modelString: "openai:gpt-5.2", thinkingLevel: "medium" },
+      },
+    }));
+
+    const childEntry = findWorkspaceInConfig(config, created.data.taskId);
+    expect(childEntry?.aiSettings).toEqual({
+      model: "openai:gpt-5.3-codex",
+      thinkingLevel: "xhigh",
+    });
+    expect(childEntry?.taskModelString).toBe("openai:gpt-5.3-codex");
+    expect(childEntry?.taskThinkingLevel).toBe("xhigh");
   }, 20_000);
   test("auto-resumes a parent workspace until background tasks finish", async () => {
     const config = await createTestConfig(rootDir);
@@ -7582,6 +8011,7 @@ describe("TaskService", () => {
       string,
       { modelString: string; thinkingLevel: ThinkingLevel; enabled?: boolean }
     >;
+    subagentAiDefaults?: Record<string, { modelString?: string; thinkingLevel?: ThinkingLevel }>;
     sendMessageOverride?: ReturnType<typeof mock>;
     aiServiceOverrides?: Parameters<typeof createAIServiceMocks>[1];
   }) {
@@ -7668,6 +8098,7 @@ describe("TaskService", () => {
           : {}),
       },
       agentAiDefaults: Object.keys(agentAiDefaults).length > 0 ? agentAiDefaults : undefined,
+      subagentAiDefaults: options?.subagentAiDefaults,
     });
 
     const getInfo = mock(() => ({
@@ -7784,6 +8215,46 @@ describe("TaskService", () => {
         },
       },
       agentAiDefaults: {
+        exec: {
+          modelString: "openai:gpt-5.3-codex",
+          thinkingLevel: "xhigh",
+        },
+      },
+    });
+
+    await internal.handleStreamEnd(makeSuccessfulProposePlanStreamEndEvent(childId));
+
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage).toHaveBeenCalledWith(
+      childId,
+      expect.stringContaining("Implement the plan"),
+      expect.objectContaining({
+        agentId: "exec",
+        model: "openai:gpt-5.3-codex",
+        thinkingLevel: "xhigh",
+      }),
+      expect.objectContaining({ synthetic: true })
+    );
+
+    const postCfg = config.loadConfigOrDefault();
+    const updatedTask = Array.from(postCfg.projects.values())
+      .flatMap((project) => project.workspaces)
+      .find((workspace) => workspace.id === childId);
+
+    expect(updatedTask?.agentId).toBe("exec");
+    expect(updatedTask?.taskModelString).toBe("openai:gpt-5.3-codex");
+    expect(updatedTask?.taskThinkingLevel).toBe("xhigh");
+  });
+
+  test("stream-end with propose_plan success uses subagent exec defaults before global exec defaults", async () => {
+    const { config, childId, sendMessage, internal } = await setupPlanModeStreamEndHarness({
+      agentAiDefaults: {
+        exec: {
+          modelString: "openai:gpt-5.2",
+          thinkingLevel: "medium",
+        },
+      },
+      subagentAiDefaults: {
         exec: {
           modelString: "openai:gpt-5.3-codex",
           thinkingLevel: "xhigh",

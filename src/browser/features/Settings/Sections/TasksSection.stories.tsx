@@ -37,6 +37,7 @@ export const Tasks: Story = {
 
     await canvas.findAllByText(/^Plan$/i);
     await canvas.findAllByText(/^Exec$/i);
+    await canvas.findByRole("group", { name: "Exec defaults" });
     await canvas.findAllByText(/^Explore$/i);
     await canvas.findAllByText(/^Compact$/i);
 

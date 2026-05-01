@@ -49,6 +49,7 @@ import { normalizeAgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { isValidModelFormat, normalizeSelectedModel } from "@/common/utils/ai/models";
 import {
   DEFAULT_TASK_SETTINGS,
+  deriveLegacySubagentAiDefaultsFromAgentDefaults,
   normalizeSubagentAiDefaults,
   normalizeTaskSettings,
 } from "@/common/types/tasks";
@@ -623,7 +624,8 @@ export const router = (authToken?: string) => {
             runtimeEnablement: normalizeRuntimeEnablement(config.runtimeEnablement),
             defaultRuntime: config.defaultRuntime ?? null,
             agentAiDefaults: config.agentAiDefaults ?? {},
-            // Legacy fields (downgrade compatibility)
+            // Subagent defaults: exec is canonical active storage, non-exec entries
+            // support legacy mirror compatibility.
             subagentAiDefaults: config.subagentAiDefaults ?? {},
             // Mux Governor enrollment status (safe fields only - token never exposed)
             muxGovernorUrl,
@@ -707,20 +709,16 @@ export const router = (authToken?: string) => {
           await context.config.editConfig((config) => {
             const normalized = normalizeAgentAiDefaults(input.agentAiDefaults);
 
-            const legacySubagentDefaultsRaw: Record<string, unknown> = {};
-            for (const [agentType, entry] of Object.entries(normalized)) {
-              if (agentType === "plan" || agentType === "exec" || agentType === "compact") {
-                continue;
-              }
-              legacySubagentDefaultsRaw[agentType] = entry;
-            }
-
-            const legacySubagentDefaults = normalizeSubagentAiDefaults(legacySubagentDefaultsRaw);
+            const legacySubagentDefaults = deriveLegacySubagentAiDefaultsFromAgentDefaults({
+              agentAiDefaults: normalized,
+              preservedExec: config.subagentAiDefaults?.exec,
+            });
 
             return {
               ...config,
               agentAiDefaults: Object.keys(normalized).length > 0 ? normalized : undefined,
-              // Legacy fields (downgrade compatibility)
+              // Subagent defaults: exec is canonical active storage, non-exec entries
+              // support legacy mirror compatibility.
               subagentAiDefaults:
                 Object.keys(legacySubagentDefaults).length > 0 ? legacySubagentDefaults : undefined,
             };
@@ -959,16 +957,10 @@ export const router = (authToken?: string) => {
               result.agentAiDefaults = Object.keys(normalized).length > 0 ? normalized : undefined;
 
               if (input.subagentAiDefaults === undefined) {
-                const legacySubagentDefaultsRaw: Record<string, unknown> = {};
-                for (const [agentType, entry] of Object.entries(normalized)) {
-                  if (agentType === "plan" || agentType === "exec" || agentType === "compact") {
-                    continue;
-                  }
-                  legacySubagentDefaultsRaw[agentType] = entry;
-                }
-
-                const legacySubagentDefaults =
-                  normalizeSubagentAiDefaults(legacySubagentDefaultsRaw);
+                const legacySubagentDefaults = deriveLegacySubagentAiDefaultsFromAgentDefaults({
+                  agentAiDefaults: normalized,
+                  preservedExec: config.subagentAiDefaults?.exec,
+                });
                 result.subagentAiDefaults =
                   Object.keys(legacySubagentDefaults).length > 0
                     ? legacySubagentDefaults
@@ -981,7 +973,7 @@ export const router = (authToken?: string) => {
               result.subagentAiDefaults =
                 Object.keys(normalizedDefaults).length > 0 ? normalizedDefaults : undefined;
 
-              // Downgrade compatibility: keep agentAiDefaults in sync with legacy subagentAiDefaults.
+              // Compatibility: keep agentAiDefaults in sync with non-exec subagent entries.
               // Only mutate keys previously managed by subagentAiDefaults so we don't clobber other
               // agent defaults (e.g., UI-selectable custom agents).
               const previousLegacy = config.subagentAiDefaults ?? {};
@@ -998,7 +990,24 @@ export const router = (authToken?: string) => {
                   continue;
                 }
                 if (!(legacyAgentType in normalizedDefaults)) {
-                  delete nextAgentAiDefaults[legacyAgentType];
+                  const existing = nextAgentAiDefaults[legacyAgentType];
+                  if (existing && typeof existing === "object") {
+                    const nonAiDefaults: Record<string, unknown> = {
+                      ...(existing as Record<string, unknown>),
+                    };
+                    delete nonAiDefaults.modelString;
+                    delete nonAiDefaults.thinkingLevel;
+
+                    // Preserve non-AI fields (enabled, advisorEnabled) when the legacy mirrored AI
+                    // entry is dropped, so customer agent enable/advisor toggles do not silently reset.
+                    if (Object.keys(nonAiDefaults).length > 0) {
+                      nextAgentAiDefaults[legacyAgentType] = nonAiDefaults;
+                    } else {
+                      delete nextAgentAiDefaults[legacyAgentType];
+                    }
+                  } else {
+                    delete nextAgentAiDefaults[legacyAgentType];
+                  }
                 }
               }
 

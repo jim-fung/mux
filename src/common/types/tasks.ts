@@ -7,7 +7,9 @@ import type {
   SubagentAiDefaults,
   SubagentAiDefaultsEntry,
 } from "@/common/config/schemas/appConfigOnDisk";
+import { AgentIdSchema } from "@/common/orpc/schemas";
 import assert from "@/common/utils/assert";
+import { normalizeAgentId } from "@/common/utils/agentIds";
 import { coerceThinkingLevel, type ThinkingLevel } from "./thinking";
 
 export type { PlanSubagentExecutorRouting, SubagentAiDefaults, SubagentAiDefaultsEntry };
@@ -28,15 +30,25 @@ export const DEFAULT_TASK_SETTINGS: TaskSettings = {
   planSubagentDefaultsToOrchestrator: false,
 };
 
+const AGENT_DEFAULT_IDS_EXCLUDED_FROM_LEGACY_SUBAGENTS: ReadonlySet<string> = new Set([
+  "plan",
+  "exec",
+  "compact",
+]);
+
+export function shouldMirrorAgentDefaultToLegacySubagent(agentId: string): boolean {
+  return !AGENT_DEFAULT_IDS_EXCLUDED_FROM_LEGACY_SUBAGENTS.has(agentId);
+}
+
 export function normalizeSubagentAiDefaults(raw: unknown): SubagentAiDefaults {
   const record = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : ({} as const);
 
   const result: SubagentAiDefaults = {};
 
   for (const [agentTypeRaw, entryRaw] of Object.entries(record)) {
-    const agentType = agentTypeRaw.trim().toLowerCase();
+    const agentType = normalizeAgentId(agentTypeRaw, "");
     if (!agentType) continue;
-    if (agentType === "exec") continue;
+    if (!AgentIdSchema.safeParse(agentType).success) continue;
     if (!entryRaw || typeof entryRaw !== "object") continue;
 
     const entry = entryRaw as Record<string, unknown>;
@@ -56,6 +68,23 @@ export function normalizeSubagentAiDefaults(raw: unknown): SubagentAiDefaults {
   }
 
   return result;
+}
+
+export function deriveLegacySubagentAiDefaultsFromAgentDefaults(params: {
+  agentAiDefaults: Record<string, unknown>;
+  preservedExec?: SubagentAiDefaultsEntry;
+}): SubagentAiDefaults {
+  const legacySubagentDefaultsRaw: Record<string, unknown> = {};
+  for (const [agentId, entry] of Object.entries(params.agentAiDefaults)) {
+    if (!shouldMirrorAgentDefaultToLegacySubagent(agentId)) continue;
+    legacySubagentDefaultsRaw[agentId] = entry;
+  }
+
+  const legacySubagentDefaults = normalizeSubagentAiDefaults(legacySubagentDefaultsRaw);
+  if (params.preservedExec) {
+    legacySubagentDefaults.exec = params.preservedExec;
+  }
+  return legacySubagentDefaults;
 }
 
 function clampInt(value: unknown, fallback: number, min: number, max: number): number {
