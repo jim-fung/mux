@@ -2739,4 +2739,182 @@ describe("StreamingMessageAggregator", () => {
       expect(aggregator.getLastAbortReason()).toBeNull();
     });
   });
+
+  describe("max output tokens (finishReason: length)", () => {
+    // Regression: an assistant turn that hits max_tokens mid-thinking has
+    // `finishReason: "length"` and only reasoning parts. Without explicit UI
+    // surfacing, ReasoningMessage auto-collapses on stream-end, leaving the
+    // user staring at a single "Thinking" header with no signal that the turn
+    // truncated. SMA must synthesize a stream-error row and mark the reasoning
+    // row as the only renderable content so collapse is suppressed.
+    test("synthesizes a max_output_tokens stream-error row for reasoning-only truncated turns", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+
+      aggregator.addMessage({
+        id: "asst-truncated",
+        role: "assistant",
+        parts: [{ type: "reasoning" as const, text: "I need to think about this..." }],
+        metadata: {
+          historySequence: 1,
+          timestamp: 1,
+          model: "anthropic:claude-opus-4-7",
+          finishReason: "length",
+        },
+      });
+
+      const displayed = aggregator.getDisplayedMessages();
+
+      const errorRow = displayed.find((m) => m.type === "stream-error");
+      expect(errorRow).toBeDefined();
+      if (errorRow?.type === "stream-error") {
+        expect(errorRow.errorType).toBe("max_output_tokens");
+        expect(errorRow.historyId).toBe("asst-truncated");
+        expect(errorRow.model).toBe("anthropic:claude-opus-4-7");
+      }
+
+      const reasoningRow = displayed.find((m) => m.type === "reasoning");
+      expect(reasoningRow).toBeDefined();
+      if (reasoningRow?.type === "reasoning") {
+        expect(reasoningRow.isOnlyMessageContent).toBe(true);
+      }
+    });
+
+    test("still synthesizes the row when the turn also has text/tool parts", () => {
+      // A truncated turn can include earlier text or tool calls; the user still
+      // needs the banner so they know the response was cut off mid-flight.
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+
+      aggregator.addMessage({
+        id: "asst-mixed-truncated",
+        role: "assistant",
+        parts: [
+          { type: "reasoning" as const, text: "thinking" },
+          { type: "text" as const, text: "Partial reply" },
+        ],
+        metadata: {
+          historySequence: 1,
+          timestamp: 1,
+          model: "anthropic:claude-opus-4-7",
+          finishReason: "length",
+        },
+      });
+
+      const displayed = aggregator.getDisplayedMessages();
+      const errorRow = displayed.find((m) => m.type === "stream-error");
+      expect(errorRow).toBeDefined();
+      expect(errorRow?.type === "stream-error" && errorRow.errorType).toBe("max_output_tokens");
+
+      // Reasoning here is *not* the only content, so collapse should be allowed.
+      const reasoningRow = displayed.find((m) => m.type === "reasoning");
+      if (reasoningRow?.type === "reasoning") {
+        expect(reasoningRow.isOnlyMessageContent).toBe(false);
+      }
+    });
+
+    test("treats reasoning + skipped (empty-text) parts as reasoning-only", () => {
+      // Regression: assistant turns can contain non-renderable parts like empty
+      // text (the renderer's predicate filters them out). The
+      // `isOnlyMessageContent` flag must use that same predicate, otherwise a
+      // turn that visually consists of only a reasoning block still gets
+      // auto-collapsed when it ends — exactly the silent-end UX this PR fixes.
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+
+      aggregator.addMessage({
+        id: "asst-reasoning-and-empty-text",
+        role: "assistant",
+        parts: [
+          { type: "reasoning" as const, text: "thinking..." },
+          { type: "text" as const, text: "" },
+        ],
+        metadata: {
+          historySequence: 1,
+          timestamp: 1,
+          model: "anthropic:claude-opus-4-7",
+          finishReason: "length",
+        },
+      });
+
+      const displayed = aggregator.getDisplayedMessages();
+      const reasoningRow = displayed.find((m) => m.type === "reasoning");
+      expect(reasoningRow).toBeDefined();
+      if (reasoningRow?.type === "reasoning") {
+        expect(reasoningRow.isOnlyMessageContent).toBe(true);
+      }
+      // Empty text part should not produce an assistant row at all.
+      expect(displayed.find((m) => m.type === "assistant")).toBeUndefined();
+    });
+
+    test("survives malformed text parts in persisted history", () => {
+      // Self-healing: chat.jsonl is loaded via plain JSON parse, so an entry
+      // with `type: "text"` but a missing/non-string `text` field is reachable.
+      // getDisplayedMessages must not crash on this — it should just skip the
+      // bad part and continue.
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+
+      aggregator.addMessage({
+        id: "asst-malformed",
+        role: "assistant",
+        parts: [
+          { type: "reasoning" as const, text: "thinking" },
+          // Cast through unknown to model a malformed history entry.
+          { type: "text" } as unknown as { type: "text"; text: string },
+        ],
+        metadata: {
+          historySequence: 1,
+          timestamp: 1,
+          model: "anthropic:claude-opus-4-7",
+          finishReason: "length",
+        },
+      });
+
+      // The call itself must not throw.
+      const displayed = aggregator.getDisplayedMessages();
+      expect(displayed.find((m) => m.type === "reasoning")).toBeDefined();
+      expect(displayed.find((m) => m.type === "stream-error")).toBeDefined();
+    });
+
+    test("does not synthesize the row when finishReason is a normal stop", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+
+      aggregator.addMessage({
+        id: "asst-normal",
+        role: "assistant",
+        parts: [{ type: "text" as const, text: "All done." }],
+        metadata: {
+          historySequence: 1,
+          timestamp: 1,
+          model: "anthropic:claude-opus-4-7",
+          finishReason: "stop",
+        },
+      });
+
+      const displayed = aggregator.getDisplayedMessages();
+      expect(displayed.find((m) => m.type === "stream-error")).toBeUndefined();
+    });
+
+    test("does not stack a length banner on top of an existing stream error", () => {
+      // If the message already failed with a real error, that takes precedence —
+      // we don't want two banners on the same turn.
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+
+      aggregator.addMessage({
+        id: "asst-errored",
+        role: "assistant",
+        parts: [{ type: "reasoning" as const, text: "hmm" }],
+        metadata: {
+          historySequence: 1,
+          timestamp: 1,
+          model: "anthropic:claude-opus-4-7",
+          finishReason: "length",
+          error: "Network timed out",
+          errorType: "network",
+        },
+      });
+
+      const displayed = aggregator.getDisplayedMessages();
+      const errorRows = displayed.filter((m) => m.type === "stream-error");
+      expect(errorRows).toHaveLength(1);
+      expect(errorRows[0]?.type === "stream-error" && errorRows[0].errorType).toBe("network");
+    });
+  });
 });

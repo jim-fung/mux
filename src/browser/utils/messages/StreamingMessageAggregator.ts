@@ -2901,25 +2901,43 @@ export class StreamingMessageAggregator {
       // Merge adjacent text/reasoning parts for display
       const mergedParts = mergeAdjacentParts(message.parts);
 
-      // Find the last part that will produce a DisplayedMessage
-      // (reasoning, text parts with content, OR tool parts)
+      // A part is "renderable" when getDisplayedMessages will emit a row for
+      // it. Empty text parts and other unsupported types are silently skipped
+      // by the loop below, so any flag derived from "what the user sees" must
+      // share this predicate to stay in sync. The text check uses a truthy
+      // test (rather than `.length > 0`) to keep self-healing behavior for
+      // malformed history entries where `part.text` may be undefined.
+      const isRenderablePart = (part: (typeof mergedParts)[number]): boolean =>
+        part.type === "reasoning" ||
+        (part.type === "text" && Boolean(part.text)) ||
+        isDynamicToolPart(part);
+
+      // Find the last part that will produce a DisplayedMessage and tally
+      // renderable parts to detect reasoning-only turns. Done in a single
+      // pass so the two derivations can't drift.
       let lastPartIndex = -1;
-      for (let i = mergedParts.length - 1; i >= 0; i--) {
+      let renderableCount = 0;
+      let renderableReasoningCount = 0;
+      for (let i = 0; i < mergedParts.length; i++) {
         const part = mergedParts[i];
-        if (
-          part.type === "reasoning" ||
-          (part.type === "text" && part.text) ||
-          isDynamicToolPart(part)
-        ) {
-          lastPartIndex = i;
-          break;
-        }
+        if (!isRenderablePart(part)) continue;
+        lastPartIndex = i;
+        renderableCount++;
+        if (part.type === "reasoning") renderableReasoningCount++;
       }
 
       const isCompactionBoundarySummary = this.isCompactionBoundarySummaryMessage(message);
       if (isCompactionBoundarySummary) {
         displayedMessages.push(this.createCompactionBoundaryRow(message, historySequence));
       }
+
+      // A turn whose *renderable* parts are entirely reasoning (no text, no tool
+      // calls) is the visible signature of a max_tokens truncation mid-thinking.
+      // We pass this hint down so ReasoningMessage can skip its auto-collapse —
+      // otherwise the user is left looking at a single collapsed "Thinking"
+      // header with no other output to read.
+      const isReasoningOnlyMessage =
+        renderableCount > 0 && renderableCount === renderableReasoningCount;
 
       mergedParts.forEach((part, partIndex) => {
         const isLastPart = partIndex === lastPartIndex;
@@ -2938,6 +2956,7 @@ export class StreamingMessageAggregator {
             isStreaming,
             isPartial,
             isLastPartOfMessage: isLastPart,
+            isOnlyMessageContent: isReasoningOnlyMessage,
             timestamp: part.timestamp ?? baseTimestamp,
             streamPresentation: isStreaming
               ? { source: streamContext?.isReplay ? "replay" : "live" }
@@ -3054,6 +3073,31 @@ export class StreamingMessageAggregator {
           historyId: message.id,
           error: message.metadata.error,
           errorType: message.metadata.errorType ?? "unknown",
+          historySequence,
+          model: message.metadata.model,
+          routedThroughGateway: message.metadata?.routedThroughGateway,
+          timestamp: baseTimestamp,
+        });
+      } else if (
+        // Stream ended cleanly *but* the provider truncated us at max_tokens.
+        // The backend's stream-end path treats this as a successful completion
+        // (no error metadata), so without this synthesis the chat appears to
+        // silently end — especially painful for reasoning-only turns where
+        // ReasoningMessage would otherwise auto-collapse the only output.
+        // Skip while still streaming: finishReason is only authoritative once
+        // the stream has settled.
+        message.role === "assistant" &&
+        !hasActiveStream &&
+        message.metadata?.finishReason === "length"
+      ) {
+        displayedMessages.push({
+          type: "stream-error",
+          id: `${message.id}-length`,
+          historyId: message.id,
+          error:
+            "The model hit its max output token limit before finishing this response. " +
+            "Lower the thinking level (or split the turn into smaller steps) to give it more headroom.",
+          errorType: "max_output_tokens",
           historySequence,
           model: message.metadata.model,
           routedThroughGateway: message.metadata?.routedThroughGateway,
