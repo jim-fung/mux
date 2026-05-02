@@ -2738,27 +2738,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                     (showSkillSuggestions && skillSuggestions.length > 0)
                   }
                   className={variant === "creation" ? "min-h-28" : "min-h-16"}
-                  trailingAction={
-                    <div className="flex items-center gap-1">
-                      <AttachFileButton
-                        onFiles={handleAttachFiles}
-                        disabled={disabled || sendInFlightBlocksInput || !!editingMessageForUi}
-                      />
-                      <VoiceInputButton
-                        state={voiceInput.state}
-                        isAvailable={voiceInput.isAvailable}
-                        shouldShowUI={voiceInput.shouldShowUI}
-                        requiresSecureContext={voiceInput.requiresSecureContext}
-                        onToggle={voiceInput.toggle}
-                        disabled={disabled || sendInFlightBlocksInput}
-                        agentColor={focusBorderColor}
-                      />
-                    </div>
-                  }
                 />
                 {/* Keep shortcuts visible in both creation + workspace without bloating the footer or crowding it. */}
                 {input.trim() === "" && !editingMessageForUi && (
-                  <div className="mobile-hide-shortcut-hints text-muted @container pointer-events-none absolute right-18 bottom-3 left-2 flex flex-nowrap items-center gap-4 overflow-hidden text-[11px] whitespace-nowrap">
+                  <div className="mobile-hide-shortcut-hints text-muted @container pointer-events-none absolute right-2 bottom-3 left-2 flex flex-nowrap items-center gap-4 overflow-hidden text-[11px] whitespace-nowrap">
                     <span className="shrink-0">
                       <span className="font-mono">{formatKeybind(KEYBINDS.FOCUS_CHAT)}</span>
                       <span> - focus chat</span>
@@ -2865,7 +2848,34 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                   />
                 </div>
 
-                <div ref={sendModeMenuContainerRef} className="relative">
+                {/*
+                  Input-method icons (attach, voice) cluster tightly with the Send button so
+                  the trailing actions read as one unit, rather than as small icons stranded
+                  inside the row's gap-1.5 cadence. They live below the textarea (not as an
+                  absolute overlay) so they can never visually intersect typed/wrapped text.
+                */}
+                <div className="flex shrink-0 items-center gap-0" data-component="InputMethodGroup">
+                  <AttachFileButton
+                    onFiles={handleAttachFiles}
+                    disabled={disabled || sendInFlightBlocksInput || !!editingMessageForUi}
+                  />
+                  <VoiceInputButton
+                    state={voiceInput.state}
+                    isAvailable={voiceInput.isAvailable}
+                    shouldShowUI={voiceInput.shouldShowUI}
+                    requiresSecureContext={voiceInput.requiresSecureContext}
+                    onToggle={voiceInput.toggle}
+                    disabled={disabled || sendInFlightBlocksInput}
+                    agentColor={focusBorderColor}
+                  />
+                </div>
+
+                {/*
+                  Pull the Send button flush against the input-method icons (override the
+                  parent's gap-1.5 with a negative margin) so they form a single trailing
+                  cluster.
+                */}
+                <div ref={sendModeMenuContainerRef} className="relative -ml-1.5">
                   <Tooltip>
                     <TooltipTrigger asChild>
                       <Button
