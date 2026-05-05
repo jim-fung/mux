@@ -49,6 +49,30 @@ describe("formatModelDisplayName", () => {
     });
   });
 
+  describe("DeepSeek models", () => {
+    test("preserves DeepSeek camel-case branding and uppercases version tags", () => {
+      expect(formatModelDisplayName("deepseek-v4-pro")).toBe("DeepSeek V4 Pro");
+      expect(formatModelDisplayName("deepseek-v4-flash")).toBe("DeepSeek V4 Flash");
+      expect(formatModelDisplayName("deepseek-r1")).toBe("DeepSeek R1");
+      expect(formatModelDisplayName("deepseek-chat")).toBe("DeepSeek Chat");
+    });
+
+    test("strips provider prefix when DeepSeek model is gateway-scoped", () => {
+      // OpenRouter exposes the same models under "deepseek/deepseek-v4-pro"; the
+      // existing slash-stripping branch should route through the DeepSeek handler.
+      expect(formatModelDisplayName("deepseek/deepseek-v4-pro")).toBe("DeepSeek V4 Pro");
+    });
+
+    test("colon-suffixed Ollama IDs preserve DeepSeek branding and size", () => {
+      // Locally-pulled DeepSeek models use Ollama tags like "deepseek-r1:8b".
+      // Both the DeepSeek brand casing and the parenthesized size suffix must
+      // be preserved; the generic digit-split formatter would otherwise render
+      // "Deepseek-r 1 (8B)".
+      expect(formatModelDisplayName("deepseek-r1:8b")).toBe("DeepSeek R1 (8B)");
+      expect(formatModelDisplayName("deepseek-coder:6.7b")).toBe("DeepSeek Coder (6.7B)");
+    });
+  });
+
   describe("Ollama models", () => {
     test("formats Llama models with size", () => {
       expect(formatModelDisplayName("llama3.2:7b")).toBe("Llama 3.2 (7B)");

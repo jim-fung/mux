@@ -143,10 +143,38 @@ export function formatModelDisplayName(modelName: string): string {
     }
   }
 
+  // DeepSeek models - keep camel-cased "DeepSeek" branding and uppercase the
+  // version segment (e.g. "v4-pro" -> "V4 Pro") since "Deepseek V4 Pro" mis-cases
+  // the brand name.
+  //
+  // Skip when the name carries a colon-suffixed size tag like "deepseek-r1:8b" —
+  // those are Ollama-style local model IDs and must fall through to the colon-size
+  // handler below so the size renders as "(8B)" rather than being concatenated
+  // verbatim.
+  if (lower.startsWith("deepseek-") && !modelName.includes(":")) {
+    const parts = lower.replace("deepseek-", "").split("-");
+    const formatted = parts
+      .map((part) => {
+        // Uppercase short tokens that look like a version tag (e.g. "v4", "r1").
+        if (/^[a-z]\d+(?:\.\d+)?$/.test(part)) return part.toUpperCase();
+        return capitalize(part);
+      })
+      .join(" ");
+    return formatted ? `DeepSeek ${formatted}` : "DeepSeek";
+  }
+
   // Ollama models - handle format like "llama3.2:7b" or "codellama:13b"
   // Split by colon to handle quantization/size suffix
   const [baseName, size] = modelName.split(":");
   if (size) {
+    // DeepSeek IDs published as Ollama tags (e.g. "deepseek-r1:8b") need to
+    // preserve the DeepSeek brand casing before the size suffix is appended.
+    // Recurse into the formatter for the colon-stripped base so the DeepSeek
+    // branch above produces "DeepSeek R1", then append "(8B)". Without this,
+    // the generic digit-split below would render "Deepseek-r 1 (8B)".
+    if (baseName.toLowerCase().startsWith("deepseek-")) {
+      return `${formatModelDisplayName(baseName)} (${size.toUpperCase()})`;
+    }
     // "llama3.2:7b" -> "Llama 3.2 (7B)"
     // "codellama:13b" -> "Codellama (13B)"
     const formatted = baseName
