@@ -21,6 +21,8 @@ import {
   wrapFetchWithAnthropicCacheControl,
 } from "./providerModelFactory";
 import { MUX_ANTHROPIC_EFFORT_OVERRIDE_HEADER } from "@/common/utils/ai/providerOptions";
+import { hasLanguageModelCleanup } from "./languageModelCleanup";
+import type { DevToolsService } from "./devToolsService";
 import { CodexOauthService } from "./codexOauthService";
 import { PolicyService } from "./policyService";
 import { ProviderService } from "./providerService";
@@ -37,6 +39,27 @@ async function withTempConfig(
     await run(config, factory);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
+async function withOpenAIBaseUrlEnvUnset(run: () => Promise<void>): Promise<void> {
+  const savedBaseUrl = process.env.OPENAI_BASE_URL;
+  const savedApiBase = process.env.OPENAI_API_BASE;
+  delete process.env.OPENAI_BASE_URL;
+  delete process.env.OPENAI_API_BASE;
+  try {
+    await run();
+  } finally {
+    if (savedBaseUrl === undefined) {
+      delete process.env.OPENAI_BASE_URL;
+    } else {
+      process.env.OPENAI_BASE_URL = savedBaseUrl;
+    }
+    if (savedApiBase === undefined) {
+      delete process.env.OPENAI_API_BASE;
+    } else {
+      process.env.OPENAI_API_BASE = savedApiBase;
+    }
   }
 }
 
@@ -777,6 +800,146 @@ describe("ProviderModelFactory GitHub Copilot", () => {
       }
 
       expect(result.data.constructor.name).toBe("OpenAIChatLanguageModel");
+    });
+  });
+});
+
+describe("ProviderModelFactory OpenAI WebSocket transport", () => {
+  it("attaches cleanup when enabled for Responses models", async () => {
+    await withOpenAIBaseUrlEnvUnset(async () =>
+      withTempConfig(async (config, factory) => {
+        config.saveProvidersConfig({
+          openai: {
+            apiKey: "sk-test",
+            webSocketTransportEnabled: true,
+          },
+        });
+
+        const result = await factory.createModel("openai:gpt-4.1-mini");
+
+        expect(result.success).toBe(true);
+        if (!result.success) {
+          return;
+        }
+        expect(hasLanguageModelCleanup(result.data)).toBe(true);
+      })
+    );
+  });
+
+  it("does not attach cleanup for Codex OAuth routed models", async () => {
+    await withTempConfig(async (config, factory) => {
+      config.saveProvidersConfig({
+        openai: {
+          webSocketTransportEnabled: true,
+          codexOauth: {
+            type: "oauth",
+            access: "test-access-token",
+            refresh: "test-refresh-token",
+            expires: Date.now() + 60_000,
+            accountId: "test-account-id",
+          },
+        },
+      });
+
+      const result = await factory.createModel(KNOWN_MODELS.GPT_53_CODEX.id);
+
+      expect(result.success).toBe(true);
+      if (!result.success) {
+        return;
+      }
+      expect(hasLanguageModelCleanup(result.data)).toBe(false);
+      expect(modelCostsIncluded(result.data)).toBe(true);
+    });
+  });
+
+  it("does not attach cleanup when a custom OpenAI base URL is configured", async () => {
+    await withTempConfig(async (config, factory) => {
+      config.saveProvidersConfig({
+        openai: {
+          apiKey: "sk-test",
+          baseURL: "https://proxy.openai.test/v1",
+          webSocketTransportEnabled: true,
+        },
+      });
+
+      const result = await factory.createModel("openai:gpt-4.1-mini");
+
+      expect(result.success).toBe(true);
+      if (!result.success) {
+        return;
+      }
+      expect(hasLanguageModelCleanup(result.data)).toBe(false);
+    });
+  });
+
+  it("preserves cleanup when DevTools wraps an OpenAI WebSocket model", async () => {
+    await withOpenAIBaseUrlEnvUnset(async () =>
+      withTempConfig(async (config) => {
+        config.saveProvidersConfig({
+          openai: {
+            apiKey: "sk-test",
+            webSocketTransportEnabled: true,
+          },
+        });
+        const providerService = new ProviderService(config);
+        const devToolsService = { enabled: true } as unknown as DevToolsService;
+        const factory = new ProviderModelFactory(
+          config,
+          providerService,
+          undefined,
+          undefined,
+          devToolsService
+        );
+
+        const result = await factory.createModel("openai:gpt-4.1-mini", undefined, {
+          workspaceId: "devtools-workspace",
+        });
+
+        expect(result.success).toBe(true);
+        if (!result.success) {
+          return;
+        }
+        expect(hasLanguageModelCleanup(result.data)).toBe(true);
+      })
+    );
+  });
+
+  it("does not attach cleanup when Chat Completions is selected", async () => {
+    await withTempConfig(async (config, factory) => {
+      config.saveProvidersConfig({
+        openai: {
+          apiKey: "sk-test",
+          wireFormat: "chatCompletions",
+          webSocketTransportEnabled: true,
+        },
+      });
+
+      const result = await factory.createModel("openai:gpt-4.1-mini");
+
+      expect(result.success).toBe(true);
+      if (!result.success) {
+        return;
+      }
+      expect(hasLanguageModelCleanup(result.data)).toBe(false);
+    });
+  });
+
+  it("ignores invalid persisted WebSocket transport values", async () => {
+    await withTempConfig(async (config, factory) => {
+      config.saveProvidersConfig({
+        openai: {
+          apiKey: "sk-test",
+          webSocketTransportEnabled: "true",
+        },
+      } as unknown as Parameters<Config["saveProvidersConfig"]>[0]);
+
+      const result = await factory.createModel("openai:gpt-4.1-mini");
+
+      expect(result.success).toBe(true);
+      if (!result.success) {
+        return;
+      }
+      expect(hasLanguageModelCleanup(result.data)).toBe(false);
     });
   });
 });
