@@ -33,8 +33,10 @@ import {
 import { GOAL_BUDGET_LIMIT_KIND, GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import type { StreamErrorType } from "@/common/types/errors";
+import type { ImageGenerateToolResult } from "@/common/types/tools";
 import type { TodoItem, StatusSetToolResult, NotifyToolResult } from "@/common/types/tools";
 import { completeInProgressTodoItems } from "@/common/utils/todoList";
+import { ImageGenerateToolResultSchema } from "@/common/utils/tools/toolDefinitions";
 import { getToolOutputUiOnly } from "@/common/utils/tools/toolOutputUiOnly";
 
 import { computePriorHistoryFingerprint } from "@/common/orpc/onChatCursorFingerprint";
@@ -162,6 +164,52 @@ interface StreamingContext {
 interface PendingCompactionRequest {
   parsed: CompactionRequestData;
   source?: "idle-compaction" | "auto-compaction";
+}
+
+function isSuccessfulImageGenerateResult(
+  result: unknown
+): result is Extract<ImageGenerateToolResult, { success: true }> {
+  const parsed = ImageGenerateToolResultSchema.safeParse(result);
+  return parsed.success && parsed.data.success;
+}
+
+function hasVisibleHookOutput(result: unknown): boolean {
+  if (typeof result !== "object" || result === null || Array.isArray(result)) {
+    return false;
+  }
+  const hookOutput = (result as Record<string, unknown>).hook_output;
+  return typeof hookOutput === "string" && hookOutput.length > 0;
+}
+
+function appendGeneratedImageMessage(
+  displayedMessages: DisplayedMessage[],
+  options: {
+    id: string;
+    historyId: string;
+    toolCallId: string;
+    output: Extract<ImageGenerateToolResult, { success: true }>;
+    isPartial: boolean;
+    historySequence: number;
+    streamSequence: number;
+    isLastPartOfMessage: boolean;
+    timestamp?: number;
+  }
+): void {
+  displayedMessages.push({
+    type: "generated-image",
+    id: options.id,
+    historyId: options.historyId,
+    toolCallId: options.toolCallId,
+    prompt: options.output.prompt,
+    model: options.output.model,
+    images: options.output.images,
+    warnings: options.output.warnings,
+    isPartial: options.isPartial,
+    historySequence: options.historySequence,
+    streamSequence: options.streamSequence,
+    isLastPartOfMessage: options.isLastPartOfMessage,
+    timestamp: options.timestamp,
+  });
 }
 
 /**
@@ -3101,22 +3149,78 @@ export class StreamingMessageAggregator {
             }
           }
 
-          displayedMessages.push({
-            type: "tool",
-            id: `${message.id}-${partIndex}`,
-            historyId: message.id,
-            toolCallId: part.toolCallId,
-            toolName: part.toolName,
-            args: part.input,
-            result: part.state === "output-available" ? part.output : undefined,
-            status,
-            isPartial,
-            historySequence,
-            streamSequence: streamSeq++,
-            isLastPartOfMessage: isLastPart,
-            timestamp: part.timestamp ?? baseTimestamp,
-            nestedCalls,
-          });
+          const nestedGeneratedImages =
+            !isPartial && nestedCalls
+              ? nestedCalls.filter(
+                  (
+                    nestedCall
+                  ): nestedCall is typeof nestedCall & {
+                    output: Extract<ImageGenerateToolResult, { success: true }>;
+                  } =>
+                    nestedCall.toolName === "image_generate" &&
+                    nestedCall.state === "output-available" &&
+                    !hasVisibleHookOutput(nestedCall.output) &&
+                    isSuccessfulImageGenerateResult(nestedCall.output)
+                )
+              : [];
+
+          const nestedGeneratedImageIds = new Set(
+            nestedGeneratedImages.map((nestedCall) => nestedCall.toolCallId)
+          );
+          const nestedCallsForToolRow = nestedCalls?.filter(
+            (nestedCall) => !nestedGeneratedImageIds.has(nestedCall.toolCallId)
+          );
+
+          if (
+            part.toolName === "image_generate" &&
+            part.state === "output-available" &&
+            status === "completed" &&
+            !isPartial &&
+            !hasVisibleHookOutput(part.output) &&
+            isSuccessfulImageGenerateResult(part.output)
+          ) {
+            appendGeneratedImageMessage(displayedMessages, {
+              id: `${message.id}-${partIndex}`,
+              historyId: message.id,
+              toolCallId: part.toolCallId,
+              output: part.output,
+              isPartial,
+              historySequence,
+              streamSequence: streamSeq++,
+              isLastPartOfMessage: isLastPart,
+              timestamp: part.timestamp ?? baseTimestamp,
+            });
+          } else {
+            displayedMessages.push({
+              type: "tool",
+              id: `${message.id}-${partIndex}`,
+              historyId: message.id,
+              toolCallId: part.toolCallId,
+              toolName: part.toolName,
+              args: part.input,
+              result: part.state === "output-available" ? part.output : undefined,
+              status,
+              isPartial,
+              historySequence,
+              streamSequence: streamSeq++,
+              isLastPartOfMessage: isLastPart && nestedGeneratedImages.length === 0,
+              timestamp: part.timestamp ?? baseTimestamp,
+              nestedCalls: nestedCallsForToolRow,
+            });
+            nestedGeneratedImages.forEach((nestedCall, nestedIndex) => {
+              appendGeneratedImageMessage(displayedMessages, {
+                id: `${message.id}-${partIndex}-nested-image-${nestedIndex}`,
+                historyId: message.id,
+                toolCallId: nestedCall.toolCallId,
+                output: nestedCall.output,
+                isPartial,
+                historySequence,
+                streamSequence: streamSeq++,
+                isLastPartOfMessage: isLastPart && nestedIndex === nestedGeneratedImages.length - 1,
+                timestamp: nestedCall.timestamp ?? part.timestamp ?? baseTimestamp,
+              });
+            });
+          }
         }
       });
 

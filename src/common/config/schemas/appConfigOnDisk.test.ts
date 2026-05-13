@@ -62,6 +62,30 @@ describe("AppConfigOnDiskSchema", () => {
     ).toBe(true);
   });
 
+  it("accepts sparse configs without image generation settings", () => {
+    expect(AppConfigOnDiskSchema.safeParse({ defaultModel: "openai:gpt-4o" }).success).toBe(true);
+  });
+
+  it("validates image generation configuration limits", () => {
+    expect(
+      AppConfigOnDiskSchema.safeParse({
+        imageGeneration: {
+          modelString: "openai:gpt-image-1.5",
+          maxImagesPerCall: 10,
+        },
+      }).success
+    ).toBe(true);
+
+    expect(
+      AppConfigOnDiskSchema.safeParse({
+        imageGeneration: {
+          modelString: "openai:gpt-image-1.5",
+          maxImagesPerCall: 11,
+        },
+      }).success
+    ).toBe(false);
+  });
+
   it("preserves unknown fields via passthrough", () => {
     const valid = { futureField: "something" };
 

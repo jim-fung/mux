@@ -62,6 +62,286 @@ function seedPendingStreamState(aggregator: StreamingMessageAggregator): void {
 }
 
 describe("StreamingMessageAggregator", () => {
+  describe("image generation display messages", () => {
+    test("renders successful image_generate tool output as a generated-image row", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      const assistantMessage = createMuxMessage("assistant-image", "assistant", "", {
+        historySequence: 7,
+        timestamp: 1234,
+      });
+      assistantMessage.parts.push({
+        type: "dynamic-tool",
+        toolCallId: "image-tool-1",
+        toolName: "image_generate",
+        input: { prompt: "A small blue square" },
+        state: "output-available",
+        output: {
+          success: true,
+          model: "openai:gpt-image-1.5",
+          prompt: "A small blue square",
+          requestedCount: 1,
+          images: [
+            {
+              path: "/tmp/mux/imagegen/image-tool-1/image-1.png",
+              filename: "image-1.png",
+              mediaType: "image/png",
+            },
+          ],
+        },
+      });
+
+      aggregator.loadHistoricalMessages([assistantMessage]);
+
+      const displayed = aggregator.getDisplayedMessages();
+      expect(displayed).toHaveLength(1);
+      expect(displayed[0]?.type).toBe("generated-image");
+      if (displayed[0]?.type !== "generated-image") {
+        throw new Error("Expected generated-image display row");
+      }
+      expect(displayed[0].toolCallId).toBe("image-tool-1");
+      expect(displayed[0].model).toBe("openai:gpt-image-1.5");
+      expect(displayed[0].images[0]?.path).toBe("/tmp/mux/imagegen/image-tool-1/image-1.png");
+    });
+
+    test("keeps image_generate output with hook output as a normal tool row", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      const assistantMessage = createMuxMessage("assistant-image-hook", "assistant", "", {
+        historySequence: 8,
+        timestamp: 1235,
+      });
+      assistantMessage.parts.push({
+        type: "dynamic-tool",
+        toolCallId: "image-tool-hook",
+        toolName: "image_generate",
+        input: { prompt: "A small blue square" },
+        state: "output-available",
+        output: {
+          success: true,
+          model: "openai:gpt-image-1.5",
+          prompt: "A small blue square",
+          requestedCount: 1,
+          images: [
+            {
+              path: "/tmp/mux/imagegen/image-tool-1/image-1.png",
+              filename: "image-1.png",
+              mediaType: "image/png",
+            },
+          ],
+          hook_output: "post-processing hook ran",
+        },
+      });
+
+      aggregator.loadHistoricalMessages([assistantMessage]);
+
+      const displayed = aggregator.getDisplayedMessages();
+      expect(displayed).toHaveLength(1);
+      expect(displayed[0]?.type).toBe("tool");
+      if (displayed[0]?.type !== "tool") {
+        throw new Error("Expected hooked image generation to remain a tool row");
+      }
+      expect(displayed[0].toolName).toBe("image_generate");
+      expect(displayed[0].result).toMatchObject({ hook_output: "post-processing hook ran" });
+    });
+
+    test("renders nested PTC image_generate output as a generated-image row", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      const assistantMessage = createMuxMessage("assistant-ptc-image", "assistant", "", {
+        historySequence: 8,
+        timestamp: 1235,
+      });
+      const imageOutput = {
+        success: true,
+        model: "openai:gpt-image-1.5",
+        prompt: "A nested blue square",
+        requestedCount: 1,
+        images: [
+          {
+            path: "/tmp/mux/generated_images/ptc-image/image-1.png",
+            filename: "image-1.png",
+            mediaType: "image/png",
+          },
+        ],
+      };
+      assistantMessage.parts.push({
+        type: "dynamic-tool",
+        toolCallId: "code-tool-1",
+        toolName: "code_execution",
+        input: { code: "await mux.image_generate(...)" },
+        state: "output-available",
+        output: {
+          success: true,
+          result: "done",
+          toolCalls: [
+            {
+              toolName: "image_generate",
+              args: { prompt: "A nested blue square" },
+              result: imageOutput,
+              duration_ms: 12,
+            },
+          ],
+        },
+      });
+
+      aggregator.loadHistoricalMessages([assistantMessage]);
+
+      const displayed = aggregator.getDisplayedMessages();
+      expect(displayed).toHaveLength(2);
+      expect(displayed[0]?.type).toBe("tool");
+      expect(displayed[1]?.type).toBe("generated-image");
+      if (displayed[0]?.type !== "tool" || displayed[1]?.type !== "generated-image") {
+        throw new Error("Expected code_execution tool row followed by generated image row");
+      }
+      expect(displayed[0].toolName).toBe("code_execution");
+      expect(displayed[0].nestedCalls).toEqual([]);
+      expect(displayed[0].isLastPartOfMessage).toBe(false);
+      expect(displayed[1].toolCallId).toBe("code-tool-1-nested-0");
+      expect(displayed[1].prompt).toBe("A nested blue square");
+      expect(displayed[1].images[0]?.path).toBe("/tmp/mux/generated_images/ptc-image/image-1.png");
+      expect(displayed[1].isLastPartOfMessage).toBe(true);
+    });
+
+    test("keeps malformed successful image_generate output as a normal tool row", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      const assistantMessage = createMuxMessage("assistant-image-malformed", "assistant", "", {
+        historySequence: 8,
+        timestamp: 1235,
+      });
+      assistantMessage.parts.push({
+        type: "dynamic-tool",
+        toolCallId: "image-tool-malformed",
+        toolName: "image_generate",
+        input: { prompt: "A small blue square" },
+        state: "output-available",
+        output: {
+          success: true,
+          model: "openai:gpt-image-1.5",
+          prompt: "A small blue square",
+          requestedCount: 1,
+          images: [null],
+        },
+      });
+
+      aggregator.loadHistoricalMessages([assistantMessage]);
+
+      const displayed = aggregator.getDisplayedMessages();
+      expect(displayed).toHaveLength(1);
+      expect(displayed[0]?.type).toBe("tool");
+      if (displayed[0]?.type !== "tool") {
+        throw new Error("Expected malformed image generation to remain a tool row");
+      }
+      expect(displayed[0].toolName).toBe("image_generate");
+      expect(displayed[0].status).toBe("completed");
+    });
+
+    test("keeps non-string image_generate warnings as a normal tool row", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      const assistantMessage = createMuxMessage("assistant-image-bad-warnings", "assistant", "", {
+        historySequence: 9,
+        timestamp: 1236,
+      });
+      assistantMessage.parts.push({
+        type: "dynamic-tool",
+        toolCallId: "image-tool-bad-warnings",
+        toolName: "image_generate",
+        input: { prompt: "A small blue square" },
+        state: "output-available",
+        output: {
+          success: true,
+          model: "openai:gpt-image-1.5",
+          prompt: "A small blue square",
+          requestedCount: 1,
+          images: [
+            {
+              path: "/tmp/mux/generated_images/image-tool-1/image-1.png",
+              filename: "image-1.png",
+              mediaType: "image/png",
+            },
+          ],
+          warnings: "thumbnail warning",
+        },
+      });
+
+      aggregator.loadHistoricalMessages([assistantMessage]);
+
+      const displayed = aggregator.getDisplayedMessages();
+      expect(displayed).toHaveLength(1);
+      expect(displayed[0]?.type).toBe("tool");
+      if (displayed[0]?.type !== "tool") {
+        throw new Error("Expected bad image warnings to remain a tool row");
+      }
+      expect(displayed[0].toolName).toBe("image_generate");
+    });
+
+    test("keeps successful image_generate output as a normal tool row when the message is partial", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      const assistantMessage = createMuxMessage("assistant-image-partial", "assistant", "", {
+        historySequence: 10,
+        timestamp: 1237,
+        partial: true,
+      });
+      assistantMessage.parts.push({
+        type: "dynamic-tool",
+        toolCallId: "image-tool-partial",
+        toolName: "image_generate",
+        input: { prompt: "A small blue square" },
+        state: "output-available",
+        output: {
+          success: true,
+          model: "openai:gpt-image-1.5",
+          prompt: "A small blue square",
+          requestedCount: 1,
+          images: [
+            {
+              path: "/tmp/mux/generated_images/image-tool-1/image-1.png",
+              filename: "image-1.png",
+              mediaType: "image/png",
+            },
+          ],
+        },
+      });
+
+      aggregator.loadHistoricalMessages([assistantMessage]);
+
+      const displayed = aggregator.getDisplayedMessages();
+      expect(displayed).toHaveLength(1);
+      expect(displayed[0]?.type).toBe("tool");
+      if (displayed[0]?.type !== "tool") {
+        throw new Error("Expected partial image generation to remain a tool row");
+      }
+      expect(displayed[0].status).toBe("completed");
+    });
+
+    test("keeps failed image_generate output as a normal tool row", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      const assistantMessage = createMuxMessage("assistant-image-failed", "assistant", "", {
+        historySequence: 8,
+        timestamp: 1235,
+      });
+      assistantMessage.parts.push({
+        type: "dynamic-tool",
+        toolCallId: "image-tool-failed",
+        toolName: "image_generate",
+        input: { prompt: "A small blue square" },
+        state: "output-available",
+        output: {
+          success: false,
+          error: "Image generation requires an OpenAI API key.",
+        },
+      });
+
+      aggregator.loadHistoricalMessages([assistantMessage]);
+
+      const displayed = aggregator.getDisplayedMessages();
+      expect(displayed).toHaveLength(1);
+      expect(displayed[0]?.type).toBe("tool");
+      if (displayed[0]?.type !== "tool") {
+        throw new Error("Expected failed image generation to remain a tool row");
+      }
+      expect(displayed[0].toolName).toBe("image_generate");
+      expect(displayed[0].status).toBe("failed");
+    });
+  });
+
   describe("init state reference stability", () => {
     test("should return new array reference when state changes", async () => {
       const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);

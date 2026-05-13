@@ -1,3 +1,4 @@
+import { expect, userEvent, within } from "@storybook/test";
 import type { WorkspaceChatMessage, ChatMuxMessage } from "@/common/orpc/types";
 import type { AppStory } from "@/browser/stories/meta.js";
 import { appMeta, AppWithMocks, CHROMATIC_SMOKE_MODES } from "@/browser/stories/meta.js";
@@ -305,6 +306,88 @@ export const BudgetLimitWrapupMessages: AppStory = {
       }}
     />
   ),
+};
+
+export const GeneratedImages: AppStory = {
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        collapseLeftSidebar();
+        return setupSimpleChatStory({
+          workspaceId: "ws-generated-images",
+          messages: [
+            createUserMessage("msg-1", "/imagegen generate three soft gradient orb variants", {
+              historySequence: 1,
+              timestamp: STABLE_TIMESTAMP - 120000,
+            }),
+            createAssistantMessage("msg-2", "", {
+              historySequence: 2,
+              timestamp: STABLE_TIMESTAMP - 110000,
+              toolCalls: [
+                {
+                  type: "dynamic-tool" as const,
+                  toolCallId: "image-tool-1",
+                  toolName: "image_generate",
+                  input: { prompt: "Three soft gradient orb variants" },
+                  state: "output-available" as const,
+                  output: {
+                    success: true,
+                    model: "openai:gpt-image-1.5",
+                    prompt: "Three soft gradient orb variants",
+                    requestedCount: 3,
+                    images: [
+                      {
+                        path: "/tmp/mux/imagegen/image-tool-1/image-1.png",
+                        filename: "image-1.png",
+                        mediaType: "image/png",
+                        thumbnail: {
+                          data: "UklGRvYAAABXRUJQVlA4IOoAAACQEgCdASpAAdwAPpFIoU0lpCMiICgAsBIJaW7hd2EIQAnsA99snIe+2TkPfbJyHvtk5D6F9LteLk5D325l+ntk5D32yc4iLk5D32ych9C+l2vFych77cy/T2ych77ZOcRFych77ZOQ+hfS7Xi5OQ99uZfp7ZOQ99snOIi5OQ99snIfQvpdrxcnIe+3Mv09snIe+2TnERcnIe+2ThQAAP7/Q8H//M0f+k3/Ybtc/pLpcY3xLt3+3jjX4zxxr8Z441+M8ca+4CDr+AHZM0QqO+UnfKTvlJ3yk75Sd8pO+UnfKTvlJ3yk74AAAAA=",
+                          mediaType: "image/webp",
+                          width: 320,
+                          height: 220,
+                        },
+                      },
+                      {
+                        path: "/tmp/mux/imagegen/image-tool-1/image-2.png",
+                        filename: "image-2.png",
+                        mediaType: "image/png",
+                        thumbnail: {
+                          data: "UklGRtQAAABXRUJQVlA4IMgAAABQEgCdASpAAdwAPpFIoU0lpCMiICgAsBIJaW7hd2EWgA7/Ie+2TkPfbJyHvtk5D32ych77ZOQ99snIe+2TkPfbJyHvtk5D32ych77ZOQ99snIe+2TkPfbJyHvtk5D32ych77ZOQ99snIe+2TkPfbJyHvtk5D32ych77ZOQ99snIe+2TkPfbJyHvtk5D32ych77ZOQ99snIe+1YAAD+ZP+dtop/ov//z8z/+B//dPl7L+4zc5pge8hugeOnA34EAAAAAAAAAAAAAA==",
+                          mediaType: "image/webp",
+                          width: 320,
+                          height: 220,
+                        },
+                      },
+                      {
+                        path: "/tmp/mux/imagegen/image-tool-1/image-3.png",
+                        filename: "image-3.png",
+                        mediaType: "image/png",
+                        thumbnail: {
+                          data: "UklGRtYAAABXRUJQVlA4IMoAAADQEgCdASpAAdwAPpFIoU0lpCMiICgAsBIJaW7hd2EaHAfgAAAT2Ae+2TkPfbKBl4uTkPfbJyIgeTkPfbJyHvtk5D32ych77ZOQ99snIe+2TkPfbJyHvtk5D32ych77ZOQ99snIe+2TkPfbJyHvtk5D32ych77ZOQ99snIe+2TkPfbJyHvtk5D32ych77ZOQ99snIe+2TkPfbJyHvtkxAAA/v89Yf//NgVzXPqj///OJY6ndzYJN7fLMDchXQVoJwLkgQAAAAAAAAAA",
+                          mediaType: "image/webp",
+                          width: 320,
+                          height: 220,
+                        },
+                      },
+                    ],
+                  },
+                },
+              ],
+            }),
+          ],
+        });
+      }}
+    />
+  ),
+};
+
+GeneratedImages.play = async ({ canvasElement }) => {
+  const canvas = within(canvasElement);
+  await expect(canvas.findByText("Generated 3 image previews")).resolves.toBeInTheDocument();
+  await expect(canvas.findByAltText("Generated image 3")).resolves.toBeInTheDocument();
+  await userEvent.click(await canvas.findByAltText("Generated image 2"));
+  const body = within(document.body);
+  await expect(body.findByAltText("Generated image preview")).resolves.toBeInTheDocument();
 };
 
 export const WithReasoning: AppStory = {
