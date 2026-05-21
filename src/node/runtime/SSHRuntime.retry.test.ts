@@ -206,6 +206,9 @@ class CleanupCommandSSHRuntime extends SSHRuntime {
       return Promise.resolve(createExecStream(this.promisorStdout));
     }
     if (command.includes(" gc --prune=now")) {
+      // Spawn-only call: production code returns as soon as the remote shell
+      // has detached `git gc`. The mock mirrors that shape (stdout/stderr/exit
+      // here represent the detached spawn, not gc itself).
       return Promise.resolve(createExecStream(this.gcStdout, this.gcStderr, this.gcExitCode));
     }
     return Promise.resolve(createExecStream(""));
@@ -218,6 +221,20 @@ class CleanupCommandSSHRuntime extends SSHRuntime {
 // a half-completed repair leaves the repo non-promisor (and therefore safe
 // from the upstream `check_connected()` sideband deadlock — see the doc
 // comment on `stripBaseRepoPromisorConfig` in SSHRuntime.ts).
+// Detached gc invocation: `setsid -f` puts gc in its own session/PGID before
+// execing git so that neither the SSH channel closing nor the `timeout -s KILL`
+// process-group kill that `RemoteRuntime.exec` wraps every command in can
+// SIGKILL gc mid-finalization. Retry cleanup uses `setsid -w` to wait for
+// the detached child; proactive preflight only waits for the detached spawn.
+function expectedGcCommand(baseRepoPathArg: string, waitForGc: boolean): string {
+  const setsidArgs = waitForGc ? "-f -w" : "-f";
+  return [
+    `base_repo=${baseRepoPathArg}`,
+    "command -v setsid >/dev/null 2>&1 || { echo 'setsid command not found; cannot detach git gc' >&2; exit 127; }",
+    `setsid ${setsidArgs} sh -c 'exec git -C "$1" gc --prune=now >>/tmp/.mux-base-repo-gc.log 2>&1' sh "$base_repo" </dev/null`,
+  ].join("\n");
+}
+
 function expectedStripPromisorCommand(baseRepoPathArg: string): string {
   return (
     `git -C ${baseRepoPathArg} config --unset-all remote.origin.promisor; ` +
@@ -248,9 +265,11 @@ describe("SSHRuntime project sync retry orchestration", () => {
     expect(runtime.commands).toEqual([
       expectedStripPromisorCommand(baseRepoPathArg),
       `find ${baseRepoPathArg}/objects/pack -name '*.promisor' -print -delete 2>/dev/null || true`,
-      `git -C ${baseRepoPathArg} gc --prune=now`,
+      expectedGcCommand(baseRepoPathArg, true),
     ]);
-    expect(runtime.timeouts).toEqual([10, 10, 120]);
+    // Last timeout waits for `setsid -w`. It can stop waiting without killing
+    // the detached gc process itself.
+    expect(runtime.timeouts).toEqual([10, 10, 30 * 60]);
   });
 
   it("proactively repairs fragmented base repos before sync", async () => {
@@ -267,9 +286,10 @@ describe("SSHRuntime project sync retry orchestration", () => {
       `git -C ${baseRepoPathArg} count-objects -v`,
       expectedStripPromisorCommand(baseRepoPathArg),
       `find ${baseRepoPathArg}/objects/pack -name '*.promisor' -print -delete 2>/dev/null || true`,
-      `git -C ${baseRepoPathArg} gc --prune=now`,
+      expectedGcCommand(baseRepoPathArg, false),
     ]);
-    expect(runtime.timeouts).toEqual([10, 10, 10, 120]);
+    // Last timeout is the SSH spawn round-trip, NOT gc itself.
+    expect(runtime.timeouts).toEqual([10, 10, 10, 10]);
   });
 
   it("skips proactive maintenance for healthy base repos", async () => {
@@ -297,12 +317,12 @@ describe("SSHRuntime project sync retry orchestration", () => {
     expect(runtime.timeouts).toEqual([10]);
   });
 
-  it("keeps proactive maintenance best-effort when git gc exits non-zero", async () => {
+  it("keeps proactive maintenance best-effort when the gc spawn fails", async () => {
     const runtime = new CleanupCommandSSHRuntime();
     const baseRepoPathArg = '"/remote/src/project/.mux-base.git"';
     runtime.countObjectsStdout = "count: 0\npacks: 50\n";
     runtime.gcExitCode = 1;
-    runtime.gcStderr = "warning: gc skipped";
+    runtime.gcStderr = "setsid: command not found";
 
     await runtime.runEnsureHealthy(baseRepoPathArg);
 
@@ -313,9 +333,9 @@ describe("SSHRuntime project sync retry orchestration", () => {
       `git -C ${baseRepoPathArg} count-objects -v`,
       expectedStripPromisorCommand(baseRepoPathArg),
       `find ${baseRepoPathArg}/objects/pack -name '*.promisor' -print -delete 2>/dev/null || true`,
-      `git -C ${baseRepoPathArg} gc --prune=now`,
+      expectedGcCommand(baseRepoPathArg, false),
     ]);
-    expect(runtime.timeouts).toEqual([10, 10, 10, 120]);
+    expect(runtime.timeouts).toEqual([10, 10, 10, 10]);
   });
 
   it("propagates aborts during proactive maintenance preflight", async () => {
