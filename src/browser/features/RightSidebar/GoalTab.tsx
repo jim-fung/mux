@@ -1,4 +1,14 @@
-import { CheckCircle2, Pause, Pencil, Play, RotateCcw, Settings2, Target } from "lucide-react";
+import {
+  CheckCircle2,
+  Inbox,
+  Pause,
+  Pencil,
+  Play,
+  RotateCcw,
+  Settings2,
+  Target,
+  Trash2,
+} from "lucide-react";
 import { useContext, useEffect, useRef, useState, type KeyboardEvent } from "react";
 import {
   goalActiveMode,
@@ -20,7 +30,10 @@ import { cn } from "@/common/lib/utils";
 // the tool-call cards as goal status labels evolve.
 import { formatGoalElapsed, goalStatusLabel } from "@/browser/features/Tools/Goal/goalToolUtils";
 import { GoalDefaultsModal } from "@/browser/features/RightSidebar/GoalDefaultsModal";
-import { GoalBoardSections } from "@/browser/features/RightSidebar/GoalBoardSections";
+import {
+  GoalBoardSections,
+  RowActionButton,
+} from "@/browser/features/RightSidebar/GoalBoardSections";
 import { useGoalBoard } from "@/browser/features/RightSidebar/useGoalBoard";
 
 /**
@@ -608,29 +621,21 @@ export function GoalTab(props: GoalTabProps) {
               Pause
             </button>
           )}
-          {canResume && (
-            // Resume / Reopen tints with the goal-green accent so the
-            // primary "get this goal running again" action is the
-            // obvious next step when the header is amber. The same
-            // styling covers both `paused → resume` and `complete →
-            // reopen`; the icon swaps (`Play` vs `RotateCcw`) to make
-            // the difference between resuming an in-flight goal and
-            // reviving a closed one explicit.
+          {/* For paused (lifecycle-active) goals, Resume is the obvious
+              recovery action and keeps its green-tinted "primary" look.
+              The lifecycle === "complete" path renders Reopen + Archive
+              in their own branch below where Archive is the primary and
+              Reopen is the secondary, so we exclude that case here to
+              avoid double-rendering Reopen. */}
+          {canResume && lifecycle !== "complete" && (
             <button
               type="button"
               className="border-success/40 bg-success/10 text-success hover:bg-success/20 inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm"
-              aria-label={lifecycle === "complete" ? "Reopen goal" : "Resume goal"}
+              aria-label="Resume goal"
               onClick={() => void setStatus("active")}
             >
-              {lifecycle === "complete" ? (
-                <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" />
-              ) : (
-                <Play className="h-3.5 w-3.5" aria-hidden="true" />
-              )}
-              {/* "Reopen" reads better than "Resume" when the goal was
-                  marked complete — the user is reviving a goal the
-                  agent decided was done, not resuming a paused one. */}
-              {lifecycle === "complete" ? "Reopen" : "Resume"}
+              <Play className="h-3.5 w-3.5" aria-hidden="true" />
+              Resume
             </button>
           )}
           {canComplete && (
@@ -644,46 +649,68 @@ export function GoalTab(props: GoalTabProps) {
               Mark complete
             </button>
           )}
+          {/* Completed-goal action pair: Reopen on the left as the
+              de-emphasized secondary (only reach for it if the agent
+              declared done too eagerly), Archive on the right as the
+              accent-colored primary because filing a finished goal is
+              the obvious next step. Both buttons are sized like the rest
+              of the action row (`px-3 py-1.5 text-sm`) so they read as
+              peers, not as a chip-style afterthought. */}
+          {lifecycle === "complete" && (
+            <>
+              <button
+                type="button"
+                className="border-border-light bg-surface-secondary text-foreground hover:bg-surface-tertiary inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm"
+                aria-label="Reopen goal"
+                onClick={() => void setStatus("active")}
+              >
+                <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" />
+                Reopen
+              </button>
+              <button
+                type="button"
+                className="bg-accent text-accent-foreground hover:bg-accent-dark inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm"
+                aria-label="Archive goal"
+                onClick={() => {
+                  // Route through `archiveGoal` so the goal lands in the
+                  // Archived board section instead of the legacy
+                  // `clearGoal` path (which would record an
+                  // `endReason: "completed"` history entry and land it in
+                  // Completed). `refreshBoard` is the same nudge the row
+                  // Archive button in `CompletedSection` uses.
+                  if (api && props.goal) {
+                    void api.workspace
+                      .archiveGoal({
+                        workspaceId: props.workspaceId ?? "",
+                        goalId: props.goal.goalId,
+                      })
+                      .then(() => refreshBoard())
+                      .catch(() => {
+                        /* swallow; UI stays at the current state */
+                      });
+                  }
+                }}
+              >
+                <Inbox className="h-3.5 w-3.5" aria-hidden="true" />
+                Archive
+              </button>
+            </>
+          )}
         </div>
       )}
 
-      {/*
-        Clear is intentionally de-emphasized so it does not compete visually
-        with Pause / Resume / Mark complete. Gated on `canEdit` so
-        transcript-only / pending-persistence goals do not expose a
-        destructive action.
-      */}
-      {canEdit && (
-        <div className="-mt-1 text-xs">
-          <button
-            type="button"
-            className="text-muted hover:text-foreground underline"
-            aria-label={lifecycle === "complete" ? "Archive goal" : "Clear goal"}
-            onClick={() => {
-              // when the active goal is complete, the user-
-              // visible "Archive this goal" label needs to land in the
-              // Archived board section. The legacy `clearGoal` path
-              // records an `endReason: "completed"` history entry, so
-              // it would land in Completed instead. Route to the new
-              // `archiveGoal` endpoint for complete goals; everything
-              // else still uses `clearGoal`.
-              if (lifecycle === "complete" && api && props.goal) {
-                void api.workspace
-                  .archiveGoal({
-                    workspaceId: props.workspaceId ?? "",
-                    goalId: props.goal.goalId,
-                  })
-                  .then(() => refreshBoard())
-                  .catch(() => {
-                    /* swallow; UI stays at the current state */
-                  });
-              } else {
-                void clearGoal();
-              }
-            }}
-          >
-            {lifecycle === "complete" ? "Archive this goal" : "Clear goal"}
-          </button>
+      {/* Clear stays as a small de-emphasized chip below the main row
+          for lifecycle-active goals, where the goal is still in flight
+          and clearing it is destructive. For completed goals, Archive
+          (above) replaces this surface. Gated on `canEdit` so
+          transcript-only / pending-persistence goals do not expose a
+          destructive action. */}
+      {canEdit && lifecycle !== "complete" && (
+        <div className="-mt-1">
+          <RowActionButton aria-label="Clear goal" onClick={() => void clearGoal()}>
+            <Trash2 className="h-3 w-3" aria-hidden="true" />
+            Clear goal
+          </RowActionButton>
         </div>
       )}
 
