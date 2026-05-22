@@ -23,7 +23,7 @@
  */
 
 import { LRUCache } from "lru-cache";
-import { AlertTriangle, Lightbulb, Loader2 } from "lucide-react";
+import { AlertTriangle, Lightbulb, Loader2, Sparkles } from "lucide-react";
 import React, {
   useState,
   useEffect,
@@ -32,7 +32,7 @@ import React, {
   useRef,
   useSyncExternalStore,
 } from "react";
-import { findAssistedMatch } from "@/common/utils/review/assistedReview";
+import { findAssistedMatch, formatAssistedFilter } from "@/common/utils/review/assistedReview";
 import { createPortal } from "react-dom";
 import { HunkViewer } from "./HunkViewer";
 import { InlineReviewNote, type ReviewActionCallbacks } from "../../Shared/InlineReviewNote";
@@ -559,16 +559,43 @@ export function getEffectiveReviewIncludeUncommitted(params: {
 export function getEffectiveReviewFrontendFilters(params: {
   assistedOnly: boolean;
   showReadHunks: boolean;
+  assistedShowReadHunks: boolean;
   searchTerm: string;
 }): { showReadHunks: boolean; searchTerm: string } {
-  if (params.assistedOnly) {
-    // An agent pin is an explicit request to put that hunk in front of the user.
-    // Ignore stale user-side visibility filters while Assisted is on so a
-    // successful `review_pane_update` cannot be hidden by search/read state.
-    return { showReadHunks: true, searchTerm: "" };
+  // Honor the user's read-state filter in both modes, but pick which one to
+  // consult based on whether Assisted is on. Outside of Assisted mode we use
+  // `showReadHunks` (the long-standing global preference, defaults true).
+  // While Assisted is on we use `assistedShowReadHunks` (defaults false so
+  // marking an assisted pin as read clears it from the worklist — the most
+  // common user complaint after Assisted shipped).
+  //
+  // We intentionally do NOT override the user's search term here anymore:
+  // the previous behavior cleared it whenever Assisted toggled on, which
+  // surprised users who had legitimately narrowed the diff and discarded
+  // their query without warning. Searching across the assisted subset is a
+  // useful workflow that the override prevented.
+  const effectiveShowRead = params.assistedOnly
+    ? params.assistedShowReadHunks
+    : params.showReadHunks;
+  return { showReadHunks: effectiveShowRead, searchTerm: params.searchTerm };
+}
+
+export function getNextDismissedAssistedKeys(params: {
+  dismissedKeys: string[];
+  rawAssistedHunks: readonly AssistedReviewHunk[];
+  isTranscriptHydrated: boolean;
+}): string[] {
+  if (params.dismissedKeys.length === 0) {
+    return params.dismissedKeys;
   }
 
-  return { showReadHunks: params.showReadHunks, searchTerm: params.searchTerm };
+  if (params.rawAssistedHunks.length === 0) {
+    return params.isTranscriptHydrated ? [] : params.dismissedKeys;
+  }
+
+  const liveKeys = new Set(params.rawAssistedHunks.map((hunk) => formatAssistedFilter(hunk)));
+  const pruned = params.dismissedKeys.filter((key) => liveKeys.has(key));
+  return pruned.length === params.dismissedKeys.length ? params.dismissedKeys : pruned;
 }
 
 interface ReviewAssistedStatsReporterProps {
@@ -596,9 +623,54 @@ export const ReviewAssistedStatsReporter: React.FC<ReviewAssistedStatsReporterPr
     (callback: () => void) => rawWorkspaceStore.subscribeKey(workspaceId, callback),
     [rawWorkspaceStore, workspaceId]
   );
-  const assistedHunks = useSyncExternalStore(subscribeAssistedHunks, () =>
+  const rawAssistedHunks = useSyncExternalStore(subscribeAssistedHunks, () =>
     rawWorkspaceStore.getAssistedReviewHunks(workspaceId)
   );
+  const isTranscriptHydrated = useSyncExternalStore(subscribeAssistedHunks, () =>
+    rawWorkspaceStore.isWorkspaceTranscriptCaughtUp(workspaceId)
+  );
+  // Subscribe to the user's per-workspace dismissed pin list (same key the
+  // panel writes via `usePersistedState`). Listening here keeps the Review
+  // tab badge in lock-step with dismissals so the user doesn't get attention
+  // cues for pins they explicitly silenced — even when the Review panel
+  // itself isn't mounted.
+  const [dismissedAssistedKeys, setDismissedAssistedKeys] = usePersistedState<string[]>(
+    STORAGE_KEYS.reviewAssistedDismissed(workspaceId),
+    [],
+    { listener: true }
+  );
+  const assistedHunks = useMemo(() => {
+    if (dismissedAssistedKeys.length === 0) return rawAssistedHunks;
+    const dismissed = new Set(dismissedAssistedKeys);
+    return rawAssistedHunks.filter((entry) => !dismissed.has(formatAssistedFilter(entry)));
+  }, [rawAssistedHunks, dismissedAssistedKeys]);
+
+  // Self-heal the dismissed-pin list whenever the agent's set changes:
+  // drop any dismissed key that is no longer present in the agent's pins
+  // so the localStorage entry stays bounded across long-lived workspaces.
+  //
+  // This effect lives in the always-mounted stats reporter (not the panel)
+  // because the user may dismiss pins, switch tabs, the agent then
+  // clears/replaces the set, and the panel never remounts — without this
+  // the dismissed entry would silently filter a future re-appearance of
+  // the same key until manual restore. The panel's `usePersistedState`
+  // listener picks up the pruned value automatically on next mount.
+  //
+  // Empty `rawAssistedHunks` is ambiguous on its own. Before transcript replay
+  // catches up, it can be only a cold-load or reconnect placeholder, so keep
+  // dismissals. Once replay is caught up, an empty set is authoritative: the
+  // agent either had no pins or cleared them while the app was closed, so clear
+  // local dismissals to avoid suppressing a future re-add of the same path:range.
+  useEffect(() => {
+    const nextDismissedAssistedKeys = getNextDismissedAssistedKeys({
+      dismissedKeys: dismissedAssistedKeys,
+      rawAssistedHunks,
+      isTranscriptHydrated,
+    });
+    if (nextDismissedAssistedKeys !== dismissedAssistedKeys) {
+      setDismissedAssistedKeys(nextDismissedAssistedKeys);
+    }
+  }, [rawAssistedHunks, dismissedAssistedKeys, isTranscriptHydrated, setDismissedAssistedKeys]);
 
   const projectDefaultBaseKey = STORAGE_KEYS.reviewDefaultBase(projectPath);
   const workspaceDiffBaseKey = STORAGE_KEYS.reviewDiffBase(workspaceId);
@@ -982,8 +1054,14 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
   }, [hunks, reviews]);
 
   const planOrphanReviews = orphanReviews.plan;
+  // `assistedShowReadHunks` is intentionally NOT persisted across workspaces:
+  // it's a transient worklist preference scoped to a single Assisted session.
+  // Defaulting to `false` makes the "Read:" toggle behave as the user expects
+  // when Assisted is on — marking an assisted pin as read clears it from the
+  // view. A user who wants to inspect already-read pins can flip it on.
   const [filters, setFilters] = useState<ReviewFiltersType>({
     showReadHunks: showReadHunks,
+    assistedShowReadHunks: false,
     diffBase: diffBase,
     includeUncommitted: includeUncommitted,
     sortOrder: sortOrder,
@@ -998,10 +1076,52 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
     (callback: () => void) => rawWorkspaceStore.subscribeKey(workspaceId, callback),
     [rawWorkspaceStore, workspaceId]
   );
-  const assistedHunks = useSyncExternalStore(subscribeAssistedHunks, () =>
+  const rawAssistedHunks = useSyncExternalStore(subscribeAssistedHunks, () =>
     rawWorkspaceStore.getAssistedReviewHunks(workspaceId)
   );
+
+  // Per-workspace user-dismissed pin keys (formatted path[:range]). This is
+  // a purely user-side quiet list — we don't mutate the agent's view of the
+  // assisted set, we just filter dismissed entries out of the panel so users
+  // can quiet a noisy agent without waiting for the agent to clear/replace
+  // its pins. Cleared entries naturally fall off the list once the agent
+  // drops them.
+  const [dismissedAssistedKeys, setDismissedAssistedKeys] = usePersistedState<string[]>(
+    STORAGE_KEYS.reviewAssistedDismissed(workspaceId),
+    [],
+    { listener: true }
+  );
+  const dismissedAssistedKeySet = useMemo(
+    () => new Set(dismissedAssistedKeys),
+    [dismissedAssistedKeys]
+  );
+
+  // Effective assisted set after applying user dismissals. Memoized so all
+  // downstream maps depend on a stable reference when nothing changes.
+  const assistedHunks = useMemo(() => {
+    if (dismissedAssistedKeySet.size === 0) return rawAssistedHunks;
+    return rawAssistedHunks.filter(
+      (entry) => !dismissedAssistedKeySet.has(formatAssistedFilter(entry))
+    );
+  }, [rawAssistedHunks, dismissedAssistedKeySet]);
+
+  // The self-healing prune of stale dismissed keys lives in
+  // `ReviewAssistedStatsReporter` (always mounted) so it runs even when the
+  // user is on another tab — see the note next to its prune effect.
+
+  const handleDismissAssistedPin = useCallback(
+    (key: string) => {
+      setDismissedAssistedKeys((prev) => (prev.includes(key) ? prev : [...prev, key]));
+    },
+    [setDismissedAssistedKeys]
+  );
+
+  const handleRestoreDismissedAssisted = useCallback(() => {
+    setDismissedAssistedKeys([]);
+  }, [setDismissedAssistedKeys]);
+
   const hasAssistedHunks = assistedHunks.length > 0;
+  const hasDismissedAssistedHunks = dismissedAssistedKeys.length > 0;
 
   // Auto-focus the Review pane on the agent's flagged hunks the first time
   // they appear in a session: flip `assistedOnly` to true so the user lands
@@ -1058,8 +1178,19 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
     lastGitStatusBaseRef.current = diffBase;
   }, [workspaceId, diffBase]);
 
-  // Keep showReadHunksRef in sync for stable callbacks
-  showReadHunksRef.current = filters.showReadHunks;
+  // Keep showReadHunksRef in sync for stable callbacks.
+  //
+  // We deliberately mirror the *effective* show-read value here (i.e. the
+  // assisted-scoped flag while Assisted is on, the global flag otherwise) so
+  // `handleToggleRead`/`handleMarkAsRead` can compute the correct
+  // "will this hunk still be visible after marking it read?" decision
+  // without needing the filters object as a dependency. Previously this
+  // mirrored only `filters.showReadHunks`, which caused the panel to
+  // navigate away from a hunk that was actually still visible whenever
+  // Assisted's override forced show-read true.
+  showReadHunksRef.current = filters.assistedOnly
+    ? filters.assistedShowReadHunks
+    : filters.showReadHunks;
 
   // Track if user is drafting a review note (selection or editing an existing note).
   // We only pause scheduled refreshes while drafting so tool-driven refresh stays unified
@@ -1646,6 +1777,115 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
     return result;
   }, [assistedMatchByHunkId]);
 
+  // Stable formatted key per matched hunk so HunkViewer can request a
+  // user-side dismissal without leaking the structured AssistedReviewHunk.
+  const assistedKeyByHunkId = useMemo(() => {
+    if (assistedMatchByHunkId.size === 0) return new Map<string, string>();
+    const result = new Map<string, string>();
+    for (const [hunkId, match] of assistedMatchByHunkId) {
+      result.set(hunkId, formatAssistedFilter(match.entry));
+    }
+    return result;
+  }, [assistedMatchByHunkId]);
+
+  // Source-message lookup so each hunk can render a "jump to source turn"
+  // affordance. Empty when no pins carry a sourceMessageId yet (replayed
+  // from history without context, etc.).
+  const assistedSourceMessageIdByHunkId = useMemo(() => {
+    if (assistedMatchByHunkId.size === 0) return new Map<string, string>();
+    const result = new Map<string, string>();
+    for (const [hunkId, match] of assistedMatchByHunkId) {
+      if (match.entry.sourceMessageId) {
+        result.set(hunkId, match.entry.sourceMessageId);
+      }
+    }
+    return result;
+  }, [assistedMatchByHunkId]);
+
+  // Set of hunkIds whose pin was added recently enough to qualify for the
+  // transient "new" badge.
+  //
+  // Subtle: we need wall-clock invalidation, not just structural — otherwise
+  // a badge can linger far beyond the threshold if no further assisted
+  // updates land (the memo never re-runs). To fix that we drive recomputation
+  // off a `newPinTick` state and schedule a single `setTimeout` for the next
+  // pending expiry; the timeout re-bumps the tick and the effect itself
+  // re-evaluates, which schedules the following expiry (or stops if none).
+  // This is cheaper than a periodic interval and keeps idle workspaces
+  // completely quiet once every pin has expired.
+  //
+  // We schedule against the FULL `assistedHunks` list rather than just the
+  // currently-matched subset: a pin that's added while it doesn't match the
+  // diff (e.g., wrong base) still needs its 60s clock to tick down, so that
+  // if/when it becomes matched later (refresh, rebase) the badge has already
+  // expired and we don't surface a stale "new" cue.
+  const newAssistedPinThresholdMs = 60_000;
+  const [newPinTick, setNewPinTick] = useState(() => Date.now());
+  useEffect(() => {
+    if (assistedHunks.length === 0) return;
+    const now = Date.now();
+    let nextExpiry = Infinity;
+    for (const entry of assistedHunks) {
+      const addedAt = entry.addedAt;
+      if (!addedAt) continue;
+      const expiry = addedAt + newAssistedPinThresholdMs;
+      if (expiry > now && expiry < nextExpiry) {
+        nextExpiry = expiry;
+      }
+    }
+    if (nextExpiry === Infinity) return;
+    // Round up by 50ms so the recompute lands just after the boundary —
+    // avoids a flap where the tick fires a hair too early and re-schedules
+    // itself for the same expiry.
+    const delay = nextExpiry - now + 50;
+    const id = window.setTimeout(() => setNewPinTick(Date.now()), delay);
+    return () => window.clearTimeout(id);
+  }, [assistedHunks, newPinTick, newAssistedPinThresholdMs]);
+
+  const assistedNewByHunkId = useMemo(() => {
+    if (assistedMatchByHunkId.size === 0) return new Set<string>();
+    const cutoff = newPinTick - newAssistedPinThresholdMs;
+    const result = new Set<string>();
+    for (const [hunkId, match] of assistedMatchByHunkId) {
+      const addedAt = match.entry.addedAt;
+      if (addedAt && addedAt >= cutoff) result.add(hunkId);
+    }
+    return result;
+  }, [assistedMatchByHunkId, newPinTick, newAssistedPinThresholdMs]);
+
+  // Stable Set view over the match-map keys so the immersive view (and any
+  // future read-only consumer) can do O(1) "is this assisted?" lookups
+  // without re-deriving from the Map on every render.
+  const assistedHunkIdSet = useMemo(
+    () => new Set(assistedMatchByHunkId.keys()),
+    [assistedMatchByHunkId]
+  );
+
+  // Count of agent-flagged hunks the user hasn't read yet, restricted to
+  // pins that actually match a currently-loaded diff hunk. We pin this in
+  // the control bar so the toggle's "(unread/total)" label matches the
+  // Review-tab badge and avoids the bug where the static `assistedCount`
+  // tooltip never decremented as the user worked through the worklist.
+  const unreadAssistedInDiff = useMemo(() => {
+    if (assistedMatchByHunkId.size === 0) return 0;
+    let count = 0;
+    for (const hunkId of assistedMatchByHunkId.keys()) {
+      if (!isRead(hunkId)) count += 1;
+    }
+    return count;
+  }, [assistedMatchByHunkId, isRead]);
+
+  // Jump-to-source: scrolls the chat transcript so the originating agent
+  // turn is in view. The transcript already tags each message boundary with
+  // `data-message-id` (see MessageRenderer); we use that as the lookup key
+  // rather than threading another callback through the workspace store.
+  const handleJumpToAssistedSource = useCallback((messageId: string) => {
+    if (!messageId || typeof document === "undefined") return;
+    const element = document.querySelector(`[data-message-id="${CSS.escape(messageId)}"]`);
+    if (!element) return;
+    element.scrollIntoView({ behavior: "smooth", block: "center" });
+  }, []);
+
   // Apply frontend filters (read state, search term) and sorting
   // Note: selectedFilePath is a git-level filter, applied when fetching hunks
   const filteredHunks = useMemo(() => {
@@ -1661,6 +1901,7 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
     const effectiveFrontendFilters = getEffectiveReviewFrontendFilters({
       assistedOnly: filters.assistedOnly,
       showReadHunks: filters.showReadHunks,
+      assistedShowReadHunks: filters.assistedShowReadHunks,
       searchTerm: debouncedSearchTerm,
     });
 
@@ -1712,6 +1953,10 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
   }, [
     hunks,
     filters.showReadHunks,
+    // `assistedShowReadHunks` is the effective read filter while Assisted is
+    // on; if we don't list it, toggling the scoped checkbox won't recompute
+    // `filteredHunks` and the user's input becomes a no-op.
+    filters.assistedShowReadHunks,
     filters.sortOrder,
     filters.assistedOnly,
     assistedMatchByHunkId,
@@ -1852,15 +2097,19 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
       // Mark all hunks in the file as read
       markAsRead(fileHunkIds);
 
-      // If marking the selected hunk's file as read and hunks will be filtered out, navigate
-      if (hunkId === selectedHunkId && !filters.showReadHunks) {
+      // If marking the selected hunk's file as read and hunks will be filtered out, navigate.
+      // Consult the *effective* show-read flag via `showReadHunksRef` so this stays in sync
+      // with Assisted mode (which uses `assistedShowReadHunks`). Reading `filters.showReadHunks`
+      // directly meant that marking a file read in Assisted mode left the selection on a now-
+      // hidden hunk, breaking subsequent keyboard navigation when `currentIndex` became -1.
+      if (hunkId === selectedHunkId && !showReadHunksRef.current) {
         // Use ref to get current filtered/sorted list, then find next hunk not in same file
         setSelectedHunkId(
           findNextHunkIdAfterFileRemoval(filteredHunksRef.current, hunkId, hunk.filePath)
         );
       }
     },
-    [hunks, markAsRead, filters.showReadHunks, selectedHunkId, setSelectedHunkId]
+    [hunks, markAsRead, selectedHunkId, setSelectedHunkId]
   );
 
   // Count agent-flagged hunks the user hasn't acked. The panel still reports
@@ -1918,6 +2167,29 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
       // Immersive mode has its own keyboard handler; don't double-handle
       if (isImmersive) return;
 
+      // The Assisted-toggle shortcut must work even in empty states (no
+      // selected hunk, or selection filtered out by the active set of
+      // pins). Handle it BEFORE the selection-required guards below so
+      // the escape hatch advertised in the empty-state UI ("press p")
+      // actually fires.
+      if (matchesKeybind(e, KEYBINDS.TOGGLE_ASSISTED_REVIEW)) {
+        // Skip the keystroke only when nothing assisted is reachable: no
+        // live pins, no currently-active worklist mode, AND no dismissed
+        // pins waiting to be restored. The last condition lets users
+        // re-enter Assisted via the keyboard to discover the restore
+        // button in the empty state, instead of getting stuck.
+        if (
+          assistedHunks.length === 0 &&
+          !filters.assistedOnly &&
+          dismissedAssistedKeys.length === 0
+        ) {
+          return;
+        }
+        e.preventDefault();
+        setFilters((prev) => ({ ...prev, assistedOnly: !prev.assistedOnly }));
+        return;
+      }
+
       if (!selectedHunkId) return;
 
       const currentIndex = filteredHunks.findIndex((h) => h.id === selectedHunkId);
@@ -1958,6 +2230,8 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
           toggleFn();
         }
       }
+      // Note: TOGGLE_ASSISTED_REVIEW is handled above the selection guards so
+      // it works in empty-state cases (no selected hunk, all pins filtered).
     };
 
     window.addEventListener("keydown", handleKeyDown);
@@ -1970,6 +2244,10 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
     handleToggleRead,
     handleMarkAsRead,
     handleMarkAsUnread,
+    assistedHunks.length,
+    filters.assistedOnly,
+    dismissedAssistedKeys.length,
+    setFilters,
     handleMarkFileAsRead,
     isImmersive,
   ]);
@@ -2035,6 +2313,9 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
         lastRefreshInfo={lastRefreshInfo}
         lastRefreshFailure={lastRefreshFailure}
         assistedCount={assistedHunks.length}
+        assistedUnreadCount={unreadAssistedInDiff}
+        assistedDismissedCount={dismissedAssistedKeys.length}
+        onRestoreDismissedAssisted={handleRestoreDismissedAssisted}
       />
 
       {diffState.status === "error" ? (
@@ -2171,6 +2452,77 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
                 </div>
               )}
 
+              {/* Assisted-mode mode banner. Surfaces the worklist status above
+                  the hunk list so the user always has a glanceable cue and a
+                  one-click exit from the focused view. Only renders when the
+                  user is actually in Assisted mode AND there are pins to
+                  describe — keeps the panel quiet during normal review. */}
+              {filters.assistedOnly && assistedHunks.length > 0 && (
+                <div
+                  className="border-review-accent/40 bg-review-accent/5 text-foreground mb-2 flex items-start gap-2 rounded border px-2 py-1.5 text-[11px] leading-[1.4]"
+                  data-testid="assisted-mode-banner"
+                  role="status"
+                  aria-live="polite"
+                >
+                  <Sparkles
+                    aria-hidden="true"
+                    className="text-review-accent mt-[2px] h-3 w-3 shrink-0"
+                  />
+                  <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                    <div className="flex flex-wrap items-baseline gap-1">
+                      <span className="text-foreground font-medium">Assisted review</span>
+                      {assistedMatchByHunkId.size === 0 ? (
+                        <span className="text-muted">
+                          · {assistedHunks.length} agent pin
+                          {assistedHunks.length === 1 ? "" : "s"} — none match the current diff
+                        </span>
+                      ) : unreadAssistedInDiff === 0 ? (
+                        <span className="text-muted">
+                          · all caught up ({assistedMatchByHunkId.size} read)
+                        </span>
+                      ) : (
+                        <span className="text-muted">
+                          · {unreadAssistedInDiff} of {assistedMatchByHunkId.size} unread
+                        </span>
+                      )}
+                    </div>
+                    <div className="text-muted flex flex-wrap items-center gap-3 text-[10px]">
+                      <button
+                        type="button"
+                        onClick={() => setFilters((prev) => ({ ...prev, assistedOnly: false }))}
+                        className="hover:text-foreground cursor-pointer border-none bg-transparent p-0 underline-offset-2 transition-colors hover:underline"
+                        data-testid="assisted-mode-banner-exit"
+                      >
+                        Exit Assisted ({formatKeybind(KEYBINDS.TOGGLE_ASSISTED_REVIEW)})
+                      </button>
+                      {!filters.assistedShowReadHunks && unreadAssistedInDiff === 0 && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setFilters((prev) => ({
+                              ...prev,
+                              assistedShowReadHunks: true,
+                            }))
+                          }
+                          className="hover:text-foreground cursor-pointer border-none bg-transparent p-0 underline-offset-2 transition-colors hover:underline"
+                        >
+                          Show read pins
+                        </button>
+                      )}
+                      {hasDismissedAssistedHunks && (
+                        <button
+                          type="button"
+                          onClick={handleRestoreDismissedAssisted}
+                          className="hover:text-foreground cursor-pointer border-none bg-transparent p-0 underline-offset-2 transition-colors hover:underline"
+                        >
+                          Restore {dismissedAssistedKeys.length} dismissed
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
+
               {hunks.length === 0 ? (
                 <div className="text-muted flex flex-col items-center justify-start gap-3 px-6 pt-12 pb-6 text-center">
                   <div className="text-foreground text-base font-medium">No changes found</div>
@@ -2216,14 +2568,63 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
                   <div className="text-[13px] leading-[1.5]">
                     {filters.assistedOnly
                       ? assistedHunks.length === 0
-                        ? "The agent hasn't pinned any hunks. Turn off Assisted to see all hunks."
-                        : "None of the agent-flagged hunks match the current diff. Turn off Assisted, or try a different diff base."
+                        ? "The agent hasn't pinned any hunks."
+                        : assistedMatchByHunkId.size === 0
+                          ? "None of the agent-flagged hunks match the current diff. The branch may have moved since the agent flagged them."
+                          : debouncedSearchTerm.trim()
+                            ? // Search-driven empty state takes precedence over
+                              // the read-state copy: claiming "all read" when
+                              // the user simply has unmatched search terms is
+                              // confusing (they'd flip Read and still see
+                              // nothing). Point them at clearing the search.
+                              `No agent-flagged hunks match "${debouncedSearchTerm}". Clear the search or try a different term.`
+                            : unreadAssistedInDiff === 0
+                              ? "You've read every agent-flagged hunk. Toggle Read to see them again, or exit Assisted to keep reviewing the rest of the diff."
+                              : "All agent-flagged hunks in this diff are read. Toggle Read or exit Assisted to see more."
                       : debouncedSearchTerm.trim()
                         ? `No hunks match "${debouncedSearchTerm}". Try a different search term.`
                         : selectedFilePath
                           ? `No hunks in ${selectedFilePath}. Try selecting a different file.`
                           : "No hunks match the current filters. Try adjusting your filter settings."}
                   </div>
+                  {filters.assistedOnly && (
+                    <div className="flex flex-wrap items-center justify-center gap-2 text-[11px]">
+                      {/* Most likely escape hatches for the assisted-only empty
+                          state. Keep them inline rather than only in the
+                          control bar so the user doesn't have to scroll back
+                          up to recover. */}
+                      <button
+                        type="button"
+                        onClick={() => setFilters((prev) => ({ ...prev, assistedOnly: false }))}
+                        className="border-border-light hover:bg-hover hover:text-foreground rounded border bg-transparent px-2 py-0.5 transition-colors"
+                        data-testid="review-assisted-empty-exit"
+                      >
+                        Exit Assisted
+                      </button>
+                      {assistedHunks.length > 0 && !filters.assistedShowReadHunks && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setFilters((prev) => ({ ...prev, assistedShowReadHunks: true }))
+                          }
+                          className="border-border-light hover:bg-hover hover:text-foreground rounded border bg-transparent px-2 py-0.5 transition-colors"
+                          data-testid="review-assisted-empty-show-read"
+                        >
+                          Show read pins
+                        </button>
+                      )}
+                      {hasDismissedAssistedHunks && (
+                        <button
+                          type="button"
+                          onClick={handleRestoreDismissedAssisted}
+                          className="border-border-light hover:bg-hover hover:text-foreground rounded border bg-transparent px-2 py-0.5 transition-colors"
+                          data-testid="review-assisted-empty-restore-dismissed"
+                        >
+                          Restore {dismissedAssistedKeys.length} dismissed
+                        </button>
+                      )}
+                    </div>
+                  )}
                 </div>
               ) : (
                 filteredHunks.map((hunk) => {
@@ -2254,6 +2655,11 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
                       reviewActions={reviewActions}
                       assistedComment={assistedCommentByHunkId.get(hunk.id)}
                       isAssisted={assistedMatchByHunkId.has(hunk.id)}
+                      isAssistedNew={assistedNewByHunkId.has(hunk.id)}
+                      assistedKey={assistedKeyByHunkId.get(hunk.id)}
+                      assistedSourceMessageId={assistedSourceMessageIdByHunkId.get(hunk.id)}
+                      onDismissAssisted={handleDismissAssistedPin}
+                      onJumpToAssistedSource={handleJumpToAssistedSource}
                       visibleNewLineRange={assistedRangeByHunkId.get(hunk.id)}
                     />
                   );
@@ -2290,6 +2696,8 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
               reviewActions={reviewActions}
               reviewsByFilePath={reviewsByFilePath}
               firstSeenMap={firstSeenMap}
+              assistedHunkIds={assistedHunkIdSet}
+              assistedCommentByHunkId={assistedCommentByHunkId}
             />,
             root
           );
