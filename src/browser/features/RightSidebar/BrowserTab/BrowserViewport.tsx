@@ -23,6 +23,7 @@ import type {
 } from "./browserBridgeTypes";
 
 interface BrowserViewportProps {
+  panelId?: string;
   workspaceId: string;
   session: BrowserSession | null;
   screenshotSrc: string | null;
@@ -551,7 +552,12 @@ export function BrowserViewport(props: BrowserViewportProps) {
     );
 
   return (
-    <div className="bg-background-secondary relative min-h-0 flex-1 overflow-hidden">
+    <div
+      id={props.panelId}
+      role={props.panelId != null ? "tabpanel" : undefined}
+      aria-label={props.panelId != null ? "Browser viewport" : undefined}
+      className="bg-background-secondary relative min-h-0 flex-1 overflow-hidden"
+    >
       {interactiveSurface}
       {blockingOverlay}
       {props.visibleError && props.screenshotSrc && (
