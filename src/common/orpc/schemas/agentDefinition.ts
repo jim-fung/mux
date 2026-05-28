@@ -6,29 +6,14 @@ export const AgentDefinitionScopeSchema = z.enum(["built-in", "project", "global
 
 export { AgentIdSchema } from "@/common/schemas/ids";
 
-const AgentDefinitionUiRequirementSchema = z.enum(["plan", "desktop"]);
-
 const AgentDefinitionUiSchema = z
   .object({
-    // New: hidden is opt-out. Default: visible.
+    // Opt out of the agent picker. Hidden agents can still run as subagents
+    // (set `subagent.runnable: true`).
     hidden: z.boolean().optional(),
-
-    // Legacy: selectable was opt-in. Keep for backwards compatibility.
-    selectable: z.boolean().optional(),
-
-    // When true, completely hides this agent (useful for disabling built-ins)
-    disabled: z.boolean().optional(),
 
     // UI color (CSS color value). Inherited from base agent if not specified.
     color: z.string().min(1).optional(),
-
-    // When true, this agent is eligible for switch_agent routing even when hidden.
-    // Defaults to the same policy as uiSelectable when omitted.
-    routable: z.boolean().optional(),
-
-    // Requirements for this agent to be selectable in the UI.
-    // Enforced in agents.list by toggling uiSelectable.
-    requires: z.array(AgentDefinitionUiRequirementSchema).min(1).optional(),
   })
   .strip();
 
@@ -82,12 +67,8 @@ export const AgentDefinitionFrontmatterSchema = z
     // Inheritance: reference a built-in or custom agent ID
     base: AgentIdSchema.optional(),
 
-    // When true, this agent is disabled by default.
-    //
-    // Notes:
-    // - This is a top-level flag (separate from ui.disabled) so repos can ship agents that are
-    //   present on disk but opt-in.
-    // - When both are set, `disabled` takes precedence over `ui.disabled`.
+    // When true, this agent is hidden from discovery — useful for shipping an
+    // opt-in agent or for disabling a built-in by creating a same-name override.
     disabled: z.boolean().optional(),
 
     // UI metadata (color, visibility, etc.)
@@ -113,7 +94,6 @@ export const AgentDefinitionDescriptorSchema = z
     name: z.string().min(1).max(128),
     description: z.string().min(1).max(1024).optional(),
     uiSelectable: z.boolean(),
-    uiRoutable: z.boolean(),
     uiColor: z.string().min(1).optional(),
     subagentRunnable: z.boolean(),
     // Base agent ID for inheritance (e.g., "exec", "plan", or custom agent)

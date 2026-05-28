@@ -1165,9 +1165,9 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     };
   }
 
-  const START_STREAM_ON_CHUNK_INDEX = 22;
-  const START_STREAM_ON_STEP_MESSAGES_INDEX = 23;
-  const START_STREAM_RUNTIME_TEMP_DIR_INDEX = 24;
+  const START_STREAM_ON_CHUNK_INDEX = 21;
+  const START_STREAM_ON_STEP_MESSAGES_INDEX = 22;
+  const START_STREAM_RUNTIME_TEMP_DIR_INDEX = 23;
 
   interface AdvisorRuntimeForTests {
     createModel: (modelString: string) => Promise<LanguageModel>;
@@ -2343,7 +2343,7 @@ describe("AIService.streamMessage model parameter overrides", () => {
   function callSettingsOverridesFromStartStreamCall(
     startStreamArgs: unknown[]
   ): Record<string, unknown> {
-    const callSettingsOverrides = startStreamArgs[21];
+    const callSettingsOverrides = startStreamArgs[20];
     if (
       !callSettingsOverrides ||
       typeof callSettingsOverrides !== "object" ||
@@ -2542,7 +2542,7 @@ describe("AIService.streamMessage model parameter overrides", () => {
     spyOn(harness.config, "loadProvidersConfig").mockReturnValue({});
 
     const startStreamArgs = await streamAndGetStartStreamArgs(harness, workspaceId);
-    expect(startStreamArgs[21]).toEqual({});
+    expect(startStreamArgs[20]).toEqual({});
   });
 
   it("preserves Mux-built provider options when provider extras conflict", async () => {
@@ -2847,23 +2847,12 @@ describe("discoverAvailableSubagentsForToolContext", () => {
     }
   });
 
-  it("filters desktop-only agents with a single capability probe", async () => {
+  it("filters the desktop agent when capability is unavailable", async () => {
     using project = new DisposableTempDir("available-subagents-desktop");
     using muxHome = new DisposableTempDir("available-subagents-desktop-home");
 
     const agentsRoot = path.join(project.path, ".mux", "agents");
     await fs.mkdir(agentsRoot, { recursive: true });
-
-    await fs.writeFile(
-      path.join(agentsRoot, "desktop-one.md"),
-      `---\nname: Desktop One\nbase: exec\nui:\n  requires:\n    - desktop\n---\nBody\n`,
-      "utf-8"
-    );
-    await fs.writeFile(
-      path.join(agentsRoot, "desktop-two.md"),
-      `---\nname: Desktop Two\nbase: exec\nui:\n  requires:\n    - desktop\n---\nBody\n`,
-      "utf-8"
-    );
     await fs.writeFile(
       path.join(agentsRoot, "plain.md"),
       `---\nname: Plain Agent\nbase: exec\n---\nBody\n`,
@@ -2890,24 +2879,14 @@ describe("discoverAvailableSubagentsForToolContext", () => {
       loadDesktopCapability,
     });
 
-    expect(loadDesktopCapability).toHaveBeenCalledTimes(1);
-    expect(availableSubagents.find((agent) => agent.id === "desktop-one")).toBeUndefined();
-    expect(availableSubagents.find((agent) => agent.id === "desktop-two")).toBeUndefined();
+    // The built-in `desktop` agent should be filtered out when capability is unavailable.
+    expect(availableSubagents.find((agent) => agent.id === "desktop")).toBeUndefined();
     expect(availableSubagents.find((agent) => agent.id === "plain")?.subagentRunnable).toBe(true);
   });
 
-  it("keeps desktop-only agents when desktop capability is available", async () => {
+  it("keeps the desktop agent when capability is available", async () => {
     using project = new DisposableTempDir("available-subagents-desktop-enabled");
     using muxHome = new DisposableTempDir("available-subagents-desktop-enabled-home");
-
-    const agentsRoot = path.join(project.path, ".mux", "agents");
-    await fs.mkdir(agentsRoot, { recursive: true });
-
-    await fs.writeFile(
-      path.join(agentsRoot, "desktop-enabled.md"),
-      `---\nname: Desktop Enabled\nbase: exec\nui:\n  requires:\n    - desktop\n---\nBody\n`,
-      "utf-8"
-    );
 
     const runtime = new LocalRuntime(project.path);
     const cfg = new Config(muxHome.path).loadConfigOrDefault();
@@ -2925,15 +2904,53 @@ describe("discoverAvailableSubagentsForToolContext", () => {
       workspacePath: project.path,
       cfg,
       roots: {
+        projectRoot: path.join(project.path, "empty-project-agents"),
+        globalRoot: path.join(project.path, "empty-global-agents"),
+      },
+      loadDesktopCapability,
+    });
+
+    expect(availableSubagents.find((agent) => agent.id === "desktop")?.subagentRunnable).toBe(true);
+  });
+
+  it("keeps a project-scope `desktop.md` override even when capability is unavailable", async () => {
+    using project = new DisposableTempDir("available-subagents-desktop-override");
+    using muxHome = new DisposableTempDir("available-subagents-desktop-override-home");
+
+    const agentsRoot = path.join(project.path, ".mux", "agents");
+    await fs.mkdir(agentsRoot, { recursive: true });
+    // A user-defined `desktop` agent that does not need real desktop capability.
+    // The built-in same-name agent should be shadowed by this project-scope override;
+    // the runtime gate must not hide the override just because it shares the `desktop` id.
+    await fs.writeFile(
+      path.join(agentsRoot, "desktop.md"),
+      `---\nname: Custom Desktop\nbase: exec\nsubagent:\n  runnable: true\n---\nBody\n`,
+      "utf-8"
+    );
+
+    const runtime = new LocalRuntime(project.path);
+    const cfg = new Config(muxHome.path).loadConfigOrDefault();
+    const loadDesktopCapability = mock(() =>
+      Promise.resolve({
+        available: false as const,
+        reason: "unsupported_runtime" as const,
+      })
+    );
+
+    const availableSubagents = await discoverAvailableSubagentsForToolContext({
+      runtime,
+      workspacePath: project.path,
+      cfg,
+      roots: {
         projectRoot: agentsRoot,
         globalRoot: path.join(project.path, "empty-global-agents"),
       },
       loadDesktopCapability,
     });
 
-    expect(loadDesktopCapability).toHaveBeenCalledTimes(1);
-    expect(
-      availableSubagents.find((agent) => agent.id === "desktop-enabled")?.subagentRunnable
-    ).toBe(true);
+    const desktop = availableSubagents.find((agent) => agent.id === "desktop");
+    expect(desktop).toBeDefined();
+    expect(desktop?.scope).toBe("project");
+    expect(desktop?.subagentRunnable).toBe(true);
   });
 });

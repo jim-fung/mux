@@ -47,42 +47,6 @@ Do the thing.
     expect(result.body).toContain("# Instructions");
   });
 
-  test("accepts legacy ui.selectable", () => {
-    const content = `---
-name: Legacy UI
-ui:
-  selectable: false
----
-Body
-`;
-
-    const result = parseAgentDefinitionMarkdown({
-      content,
-      byteSize: Buffer.byteLength(content, "utf-8"),
-    });
-
-    expect(result.frontmatter.ui?.selectable).toBe(false);
-  });
-
-  test("parses ui.requires", () => {
-    const content = `---
-name: Requires Capabilities
-ui:
-  requires:
-    - plan
-    - desktop
----
-Body
-`;
-
-    const result = parseAgentDefinitionMarkdown({
-      content,
-      byteSize: Buffer.byteLength(content, "utf-8"),
-    });
-
-    expect(result.frontmatter.ui?.requires).toEqual(["plan", "desktop"]);
-  });
-
   test("parses subagent.skip_init_hook", () => {
     const content = `---
 name: Skip Init
@@ -121,7 +85,7 @@ tools:
   remove:
     - task
   require:
-    - switch_agent
+    - propose_plan
 ---
 Body
 `;
@@ -134,7 +98,7 @@ Body
     expect(result.frontmatter.tools).toEqual({
       add: ["file_read", "bash.*", "task_.*"],
       remove: ["task"],
-      require: ["switch_agent"],
+      require: ["propose_plan"],
     });
   });
 });

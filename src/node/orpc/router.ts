@@ -41,7 +41,7 @@ import { createReplayBufferedStreamMessageRelay } from "./replayBufferedStreamMe
 
 import { createRuntime, checkRuntimeAvailability } from "@/node/runtime/runtimeFactory";
 import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
-import { hasNonEmptyPlanFile, readPlanFile } from "@/node/utils/runtime/helpers";
+import { readPlanFile } from "@/node/utils/runtime/helpers";
 import { secretsToRecord } from "@/common/types/secrets";
 import { roundToBase2 } from "@/common/telemetry/utils";
 import { createAsyncEventQueue } from "@/common/utils/asyncEventIterator";
@@ -80,6 +80,7 @@ import {
   resolveAgentFrontmatter,
 } from "@/node/services/agentDefinitions/agentDefinitionsService";
 import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/agentEnablement";
+import { resolveAgentVisibility } from "@/node/services/agentDefinitions/agentVisibility";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import assert from "node:assert/strict";
 import * as fsPromises from "fs/promises";
@@ -1463,26 +1464,7 @@ export const router = (authToken?: string) => {
             await context.aiService.waitForInit(input.workspaceId);
           }
 
-          const { runtime, discoveryPath, metadata } = await resolveAgentDiscoveryContext(
-            context,
-            input
-          );
-
-          // Agents can require a plan file before they're selectable (via `ui.requires: ["plan"]`).
-          // Fail closed: if plan state cannot be determined, treat it as missing.
-          let planReady = false;
-          if (input.workspaceId && metadata) {
-            try {
-              planReady = await hasNonEmptyPlanFile(
-                runtime,
-                metadata.name,
-                metadata.projectName,
-                input.workspaceId
-              );
-            } catch {
-              planReady = false;
-            }
-          }
+          const { runtime, discoveryPath } = await resolveAgentDiscoveryContext(context, input);
 
           const descriptors = await discoverAgentDefinitions(runtime, discoveryPath);
 
@@ -1514,13 +1496,9 @@ export const router = (authToken?: string) => {
                   return null;
                 }
 
-                // NOTE: hidden is opt-out. selectable is legacy opt-in.
-                const uiSelectableBase =
-                  typeof resolvedFrontmatter.ui?.hidden === "boolean"
-                    ? !resolvedFrontmatter.ui.hidden
-                    : typeof resolvedFrontmatter.ui?.selectable === "boolean"
-                      ? resolvedFrontmatter.ui.selectable
-                      : true;
+                const { selectable: uiSelectableBase } = resolveAgentVisibility(
+                  resolvedFrontmatter.ui
+                );
 
                 return {
                   kind: "resolved" as const,
@@ -1534,26 +1512,6 @@ export const router = (authToken?: string) => {
             })
           );
 
-          const needsDesktopCapability = resolved.some(
-            (entry) =>
-              entry?.kind === "resolved" &&
-              (entry.resolvedFrontmatter.ui?.requires?.includes("desktop") ?? false)
-          );
-          // Fail closed: desktop-only agents stay non-selectable unless this request proves
-          // the active workspace has desktop capability.
-          let desktopCapabilityAvailable = false;
-          if (needsDesktopCapability && input.workspaceId) {
-            try {
-              // DesktopSessionManager.getCapability() is the source of truth for desktop-only UI
-              // gating. Reuse one request-scoped probe for every desktop-required agent.
-              desktopCapabilityAvailable = (
-                await context.desktopSessionManager.getCapability(input.workspaceId)
-              ).available;
-            } catch {
-              desktopCapabilityAvailable = false;
-            }
-          }
-
           return resolved.flatMap((entry) => {
             if (!entry) {
               return [];
@@ -1562,20 +1520,12 @@ export const router = (authToken?: string) => {
               return [entry.descriptor];
             }
 
-            const requiresPlan = entry.resolvedFrontmatter.ui?.requires?.includes("plan") ?? false;
-            const requiresDesktop =
-              entry.resolvedFrontmatter.ui?.requires?.includes("desktop") ?? false;
-            const uiSelectable =
-              entry.uiSelectableBase &&
-              (!requiresPlan || planReady) &&
-              (!requiresDesktop || desktopCapabilityAvailable);
-
             return [
               {
                 ...entry.descriptor,
                 name: entry.resolvedFrontmatter.name,
                 description: entry.resolvedFrontmatter.description,
-                uiSelectable,
+                uiSelectable: entry.uiSelectableBase,
                 uiColor: entry.resolvedFrontmatter.ui?.color,
                 subagentRunnable: entry.resolvedFrontmatter.subagent?.runnable ?? false,
                 base: entry.resolvedFrontmatter.base,

@@ -663,8 +663,16 @@ export async function discoverAvailableSubagentsForToolContext(args: {
           return null;
         }
 
-        const requiresDesktop = resolvedFrontmatter.ui?.requires?.includes("desktop") ?? false;
-        if (requiresDesktop && !(await isDesktopAvailable())) {
+        // The built-in `desktop` agent is the only definition whose subagent menu visibility
+        // depends on runtime capability. Limit the gate to the built-in scope so a user
+        // override at `.mux/agents/desktop.md` (or the global equivalent) replaces the built-in
+        // semantics entirely and is not silently hidden when the workspace lacks a desktop
+        // session.
+        if (
+          descriptor.id === "desktop" &&
+          descriptor.scope === "built-in" &&
+          !(await isDesktopAvailable())
+        ) {
           return null;
         }
 
@@ -673,14 +681,6 @@ export async function discoverAvailableSubagentsForToolContext(args: {
           // Important: descriptor.subagentRunnable comes from the agent's own frontmatter only.
           // Re-resolve with inheritance so derived agents inherit runnable: true from their base.
           subagentRunnable: resolvedFrontmatter.subagent?.runnable ?? false,
-          uiRoutable:
-            typeof resolvedFrontmatter.ui?.routable === "boolean"
-              ? resolvedFrontmatter.ui.routable
-              : typeof resolvedFrontmatter.ui?.hidden === "boolean"
-                ? !resolvedFrontmatter.ui.hidden
-                : typeof resolvedFrontmatter.ui?.selectable === "boolean"
-                  ? resolvedFrontmatter.ui.selectable
-                  : true,
         };
       } catch {
         // Best-effort: keep the descriptor if enablement or inheritance can't be resolved.
