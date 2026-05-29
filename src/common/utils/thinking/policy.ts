@@ -14,6 +14,8 @@
 
 import {
   THINKING_LEVELS,
+  DEFAULT_THINKING_LEVEL,
+  THINKING_LEVEL_OFF,
   anthropicSupportsNativeXhigh,
   type ThinkingLevel,
   type ParsedThinkingInput,
@@ -58,6 +60,24 @@ export function isGeminiFlashThinkingLevelModelName(modelName: string): boolean 
  * Does NOT match gpt-5-pro-mini (uses negative lookahead).
  */
 export function getThinkingPolicyForModel(modelString: string): ThinkingPolicy {
+  return getExplicitThinkingPolicy(modelString) ?? DEFAULT_THINKING_POLICY;
+}
+
+/**
+ * Standard fallback policy for models without an explicitly-recognized reasoning rule.
+ * Shared by both standard reasoning models and non-reasoning models, so it is NOT a
+ * reliable "supports reasoning" signal on its own (see getDefaultMinimumThinkingLevel).
+ */
+const DEFAULT_THINKING_POLICY: ThinkingPolicy = ["off", "low", "medium", "high"];
+
+/**
+ * Returns the policy for a model that matches an explicit reasoning rule, or `null`
+ * when the model falls through to {@link DEFAULT_THINKING_POLICY}.
+ *
+ * A non-null result means Mux explicitly recognizes the model as a reasoning model,
+ * which is the signal used to decide whether to apply a default thinking floor.
+ */
+function getExplicitThinkingPolicy(modelString: string): ThinkingPolicy | null {
   // Normalize to be robust to provider prefixes, whitespace, gateway wrappers, and version suffixes
   const normalized = modelString.trim().toLowerCase();
   const withoutPrefix = normalized.replace(/^[a-z0-9_-]+:\s*/, "");
@@ -120,8 +140,90 @@ export function getThinkingPolicyForModel(modelString: string): ThinkingPolicy {
     return ["low", "high"];
   }
 
-  // Default policy: standard 4 levels (off/low/medium/high). Models with xhigh must opt in above.
-  return ["off", "low", "medium", "high"];
+  // No explicit reasoning rule matched.
+  return null;
+}
+
+/** Canonical ordering index for a level (off=0 … max=5). */
+function thinkingLevelIndex(level: ThinkingLevel): number {
+  return THINKING_LEVELS.indexOf(level);
+}
+
+/**
+ * Default *minimum* thinking level (floor) for a model.
+ *
+ * Most users never want off/low thinking, so models Mux explicitly recognizes as
+ * reasoning models default to a "medium" floor — hiding off/low in the thinking slider
+ * so cycling is more efficient.
+ *
+ * Models that fall through to the shared default policy keep an "off" floor. That policy
+ * is also used by non-reasoning models (e.g. gpt-4o, claude-3.5), and defaulting them to
+ * medium would send unsupported reasoning params (buildProviderOptions emits reasoning
+ * config whenever the level is non-off). Such models can still be raised per-model on the
+ * Models settings page.
+ *
+ * This is only a default; users can override it per-model on the Models settings page.
+ */
+export function getDefaultMinimumThinkingLevel(modelString: string): ThinkingLevel {
+  return hasExplicitThinkingPolicy(modelString) ? DEFAULT_THINKING_LEVEL : THINKING_LEVEL_OFF;
+}
+
+/**
+ * True when Mux explicitly recognizes the model's reasoning levels (i.e. it matches a
+ * specific rule rather than falling through to the shared default policy).
+ *
+ * Used to gate the per-model minimum-thinking control: only recognized reasoning models
+ * expose a floor selector and default to medium. Unrecognized / non-reasoning models keep
+ * the legacy off-default behavior.
+ */
+export function hasExplicitThinkingPolicy(modelString: string): boolean {
+  return getExplicitThinkingPolicy(modelString) !== null;
+}
+
+/**
+ * Resolve the effective minimum thinking level for a model, preferring an explicit
+ * per-model override (from config) and otherwise falling back to the built-in default.
+ * Always returns a concrete level (never null), so callers can pass the result straight
+ * into {@link getAvailableThinkingLevels} / {@link enforceThinkingPolicy}.
+ */
+export function resolveMinimumThinkingLevel(
+  modelString: string,
+  override?: ThinkingLevel | null
+): ThinkingLevel {
+  return override ?? getDefaultMinimumThinkingLevel(modelString);
+}
+
+/**
+ * Thinking levels available for a model after applying a minimum floor.
+ *
+ * - `minimum == null` → no floor; returns the raw capability policy.
+ * - Otherwise filters the capability policy to levels at or above `minimum` by
+ *   canonical ordering. For example a "medium" floor applied to gemini-3's
+ *   ["low", "high"] yields ["high"].
+ *
+ * Invariant: never returns an empty set. If the floor exceeds the model's maximum
+ * supported level, it locks to the highest supported level so the slider stays usable.
+ */
+export function getAvailableThinkingLevels(
+  modelString: string,
+  minimum?: ThinkingLevel | null
+): ThinkingPolicy {
+  const capability = getThinkingPolicyForModel(modelString);
+  if (minimum == null) {
+    return capability;
+  }
+
+  const minIndex = thinkingLevelIndex(minimum);
+  const filtered = capability.filter((level) => thinkingLevelIndex(level) >= minIndex);
+  if (filtered.length > 0) {
+    return filtered;
+  }
+
+  // Floor sits above the model's maximum capability: lock to the highest supported level.
+  const highest = [...capability]
+    .sort((left, right) => thinkingLevelIndex(left) - thinkingLevelIndex(right))
+    .at(-1);
+  return highest ? [highest] : capability;
 }
 
 /**
@@ -132,12 +234,18 @@ export function getThinkingPolicyForModel(modelString: string): ThinkingPolicy {
  * 2. If the request is above the model's maximum, clamp to the highest allowed level.
  * 3. If the request is below the model's minimum, clamp to the lowest allowed level.
  * 4. Otherwise, pick the closest allowed level by order.
+ *
+ * When `minimum` is provided, the allowed set is the model's capability filtered to that
+ * floor (see {@link getAvailableThinkingLevels}). A below-floor request (e.g. a stored
+ * "off" with a "medium" floor) therefore clamps up to the floor. Omitting `minimum`
+ * preserves the legacy capability-only behavior.
  */
 export function enforceThinkingPolicy(
   modelString: string,
-  requested: ThinkingLevel
+  requested: ThinkingLevel,
+  minimum?: ThinkingLevel | null
 ): ThinkingLevel {
-  const allowed = getThinkingPolicyForModel(modelString);
+  const allowed = getAvailableThinkingLevels(modelString, minimum);
 
   if (allowed.includes(requested)) {
     return requested;

@@ -559,6 +559,8 @@ describe("ThinkingContext", () => {
       );
     });
 
+    // gpt-4.1 is not an explicitly-recognized reasoning model, so it keeps the legacy
+    // off-default floor and cycles off → low.
     await waitFor(() => {
       expect(view.getByTestId("thinking-project").textContent).toBe("low");
     });
