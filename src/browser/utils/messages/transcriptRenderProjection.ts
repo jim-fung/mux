@@ -35,7 +35,9 @@ export interface WorkBundleInfo {
   /** Render slot where the work-bundle header is placed. */
   headIndex: number;
   entries: readonly WorkBundleEntry[];
+  startedAtMs?: number;
   durationMs?: number;
+  state: "active" | "settled";
   defaultExpanded: boolean;
 }
 
@@ -116,56 +118,59 @@ export function computeWorkBundleInfos(
   let index = 0;
 
   while (index < messages.length) {
-    const historyId = getWorkBundleHistoryId(messages[index]);
-    if (historyId === undefined) {
+    const span = findWorkBundleSpan(messages, index);
+    if (span === undefined) {
       index += 1;
-      continue;
-    }
-
-    const startIndex = index;
-    while (getWorkBundleHistoryId(messages[index + 1]) === historyId) {
-      index += 1;
-    }
-
-    const finalIndex = index;
-    index += 1;
-
-    if (finalIndex <= startIndex) {
-      continue;
-    }
-
-    if (messages[finalIndex]?.type !== "assistant") {
       continue;
     }
 
     const entries: WorkBundleEntry[] = [];
-    for (let entryIndex = startIndex; entryIndex < finalIndex; entryIndex++) {
+    for (let entryIndex = span.firstEntryIndex; entryIndex <= span.finalIndex; entryIndex++) {
       entries.push({ message: messages[entryIndex], originalIndex: entryIndex });
     }
 
-    const groupMessages = [...entries.map((entry) => entry.message), messages[finalIndex]];
-    if (groupMessages.some(isActiveWorkBundleMessage)) {
+    const finalMessage = messages[span.finalIndex];
+    if (span.state === "settled" && finalMessage?.type !== "assistant") {
+      index = span.finalIndex + 1;
       continue;
     }
 
     const frozenEntries = Object.freeze(entries);
-    const first = entries[0].message;
+    const firstAgentMessage = frozenEntries.find((entry) =>
+      isWorkBundleAgentMessage(entry.message)
+    );
+    if (firstAgentMessage === undefined) {
+      index = span.finalIndex + 1;
+      continue;
+    }
+
     const info: WorkBundleInfo = {
-      key: `work:${first.id}`,
+      key: `work:${firstAgentMessage.message.id}`,
       position: "head",
-      headIndex: startIndex,
+      headIndex: span.headIndex,
       entries: frozenEntries,
-      durationMs: computeWorkBundleDurationMs(frozenEntries, messages[finalIndex]),
-      defaultExpanded: false,
+      startedAtMs: getMessageTimestamp(frozenEntries[0].message),
+      durationMs:
+        span.state === "active"
+          ? undefined
+          : computeWorkBundleDurationMs(frozenEntries, finalMessage),
+      state: span.state,
+      defaultExpanded: span.state === "active",
     };
 
+    infos[span.headIndex] = info;
     for (const entry of entries) {
       infos[entry.originalIndex] = {
         ...info,
-        position: entry.originalIndex === startIndex ? "head" : "member",
+        position:
+          entry.originalIndex === span.headIndex
+            ? "head"
+            : span.state === "settled" && entry.originalIndex === span.finalIndex
+              ? "final"
+              : "member",
       };
     }
-    infos[finalIndex] = { ...info, position: "final" };
+    index = span.finalIndex + 1;
   }
 
   return infos;
@@ -241,16 +246,194 @@ export function computeOperationalBundleInfos(
   return infos;
 }
 
-function getWorkBundleHistoryId(message: DisplayedMessage | undefined): string | undefined {
-  switch (message?.type) {
-    case "assistant":
-    case "reasoning":
-      return message.historyId;
-    case "tool":
-      return isBundleableToolMessage(message) ? message.historyId : undefined;
-    default:
-      return undefined;
+interface WorkBundleSpan {
+  headIndex: number;
+  firstEntryIndex: number;
+  finalIndex: number;
+  state: "active" | "settled";
+}
+
+function findWorkBundleSpan(
+  messages: DisplayedMessage[],
+  index: number
+): WorkBundleSpan | undefined {
+  const message = messages[index];
+  const firstEntryIndex = message?.type === "user" ? index + 1 : index;
+  const firstEntry = messages[firstEntryIndex];
+  if (getWorkBundleAgentHistoryId(firstEntry) === undefined) {
+    return undefined;
   }
+
+  const finalIndex = findWorkBundleFinalIndex(messages, firstEntryIndex);
+  if (finalIndex === undefined) {
+    return undefined;
+  }
+
+  return {
+    headIndex: message?.type === "user" ? index : firstEntryIndex,
+    firstEntryIndex,
+    ...finalIndex,
+  };
+}
+
+function findWorkBundleFinalIndex(
+  messages: DisplayedMessage[],
+  startIndex: number
+): Pick<WorkBundleSpan, "finalIndex" | "state"> | undefined {
+  const firstHistoryId = getWorkBundleAgentHistoryId(messages[startIndex]);
+  if (firstHistoryId === undefined) {
+    return undefined;
+  }
+
+  const historyIds = new Set<string>([firstHistoryId]);
+  let canCrossVisibleConversation = false;
+  let sawVisibleConversationSinceLastAgent = false;
+  let sawAnyOperationalMessage = false;
+  let sawOperationalMessage = false;
+  let sawActiveMessage = false;
+  let lastAgentIndex = startIndex;
+  let finalIndex: number | undefined;
+
+  for (let index = startIndex; index < messages.length; index++) {
+    const message = messages[index];
+    if (!isWorkBundleTimelineMessage(message)) {
+      break;
+    }
+
+    if (isWorkBundleVisibleConversationMessage(message)) {
+      if (finalIndex !== undefined) {
+        break;
+      }
+      if (message.type === "assistant" || isSideQuestionStart(messages, index)) {
+        continue;
+      }
+      if (!canCrossVisibleConversation) {
+        break;
+      }
+      if (!hasFutureWorkBundleAgentMessage(messages, index + 1)) {
+        break;
+      }
+      sawVisibleConversationSinceLastAgent = true;
+      sawOperationalMessage = false;
+      sawActiveMessage = false;
+      canCrossVisibleConversation = false;
+      continue;
+    }
+
+    const messageHistoryId = getWorkBundleAgentHistoryId(message);
+    if (messageHistoryId === undefined) {
+      break;
+    }
+    if (!historyIds.has(messageHistoryId)) {
+      if (!sawVisibleConversationSinceLastAgent) {
+        break;
+      }
+      historyIds.add(messageHistoryId);
+    }
+    sawVisibleConversationSinceLastAgent = false;
+    lastAgentIndex = index;
+    if (isActiveWorkBundleMessage(message)) {
+      sawActiveMessage = true;
+    }
+
+    if (isWorkBundleOperationalMessage(message)) {
+      sawAnyOperationalMessage = true;
+      sawOperationalMessage = true;
+    }
+    canCrossVisibleConversation = canContinueWorkBundleAcrossConversation(message);
+
+    if (message.type !== "assistant" || message.isPartial || !sawOperationalMessage) {
+      continue;
+    }
+
+    finalIndex = index;
+    canCrossVisibleConversation = false;
+  }
+
+  if (!sawAnyOperationalMessage) {
+    return undefined;
+  }
+  if (finalIndex !== undefined && finalIndex >= startIndex) {
+    return { finalIndex, state: "settled" };
+  }
+  if (sawActiveMessage && lastAgentIndex >= startIndex) {
+    return { finalIndex: lastAgentIndex, state: "active" };
+  }
+
+  return undefined;
+}
+
+function isSideQuestionStart(messages: DisplayedMessage[], index: number): boolean {
+  const next = messages[index + 1];
+  return (
+    messages[index]?.type === "user" && next?.type === "assistant" && next.isSideAnswer === true
+  );
+}
+
+function hasFutureWorkBundleAgentMessage(
+  messages: DisplayedMessage[],
+  startIndex: number
+): boolean {
+  for (let index = startIndex; index < messages.length; index++) {
+    const message = messages[index];
+    if (!isWorkBundleTimelineMessage(message)) {
+      return false;
+    }
+    if (isWorkBundleVisibleConversationMessage(message)) {
+      continue;
+    }
+
+    return getWorkBundleAgentHistoryId(message) !== undefined;
+  }
+
+  return false;
+}
+
+function canContinueWorkBundleAcrossConversation(message: DisplayedMessage): boolean {
+  // Only partial tool rows prove the agent was still doing operational work when
+  // the user spoke. Partial reasoning/text alone can also be an interrupted turn;
+  // do not anchor the next prompt under that old turn's work bundle.
+  return (
+    message.type === "tool" &&
+    message.isPartial === true &&
+    (message.status === "pending" ||
+      message.status === "executing" ||
+      message.toolName === "ask_user_question")
+  );
+}
+
+function getWorkBundleAgentHistoryId(message: DisplayedMessage | undefined): string | undefined {
+  if (!isWorkBundleAgentMessage(message) || isWorkBundleVisibleConversationMessage(message)) {
+    return undefined;
+  }
+  return message.historyId;
+}
+
+function isWorkBundleTimelineMessage(
+  message: DisplayedMessage | undefined
+): message is DisplayedMessage & { type: "assistant" | "reasoning" | "tool" | "user" } {
+  return (
+    message?.type === "assistant" ||
+    message?.type === "reasoning" ||
+    message?.type === "tool" ||
+    message?.type === "user"
+  );
+}
+
+function isWorkBundleAgentMessage(
+  message: DisplayedMessage | undefined
+): message is DisplayedMessage & { type: "assistant" | "reasoning" | "tool" } {
+  return message?.type === "assistant" || message?.type === "reasoning" || message?.type === "tool";
+}
+
+function isWorkBundleVisibleConversationMessage(message: DisplayedMessage | undefined): boolean {
+  return (
+    message?.type === "user" || (message?.type === "assistant" && message.isSideAnswer === true)
+  );
+}
+
+function isWorkBundleOperationalMessage(message: DisplayedMessage | undefined): boolean {
+  return message?.type === "reasoning" || message?.type === "tool";
 }
 
 function isActiveWorkBundleMessage(message: DisplayedMessage): boolean {
@@ -323,15 +506,6 @@ export function summarizeOperationalBundle(
   };
 }
 
-function isBundleableToolMessage(message: DisplayedMessage & { type: "tool" }): boolean {
-  if (message.isPartial) {
-    return false;
-  }
-  return (
-    message.status === "completed" || message.status === "pending" || message.status === "executing"
-  );
-}
-
 function isEmptyCompletedWebSearch(message: OperationalBundleMemberMessage): boolean {
   return (
     message.type === "tool" &&
@@ -366,7 +540,7 @@ function isOperationalBundleMemberMessage(
     return message.isOnlyMessageContent !== true;
   }
   if (message?.type === "tool") {
-    return isBundleableToolMessage(message);
+    return true;
   }
   return false;
 }

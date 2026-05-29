@@ -1239,11 +1239,19 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                         ? (workBundleOverride ?? workBundle.defaultExpanded)
                         : false;
 
-                      if (workBundle?.position === "member") {
+                      const keepCollapsedWorkBundleMemberVisible =
+                        msg.type === "user" ||
+                        (msg.type === "assistant" &&
+                          (msg.isSideAnswer === true || workBundle?.position === "final"));
+                      if (
+                        (workBundle?.position === "member" || workBundle?.position === "final") &&
+                        (isWorkBundleExpanded || !keepCollapsedWorkBundleMemberVisible)
+                      ) {
                         return null;
                       }
 
                       const renderWorkBundle = workBundle?.position === "head";
+                      const renderMessageBeforeWorkBundle = renderWorkBundle && msg.type === "user";
                       const renderMessageAfterWorkBundle = !renderWorkBundle;
                       const operationalBundle = workBundle
                         ? undefined
@@ -1269,6 +1277,10 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
 
                       return (
                         <React.Fragment key={`${workspaceId}:${msg.id}`}>
+                          {renderMessageBeforeWorkBundle &&
+                            renderMessageAtIndex(msg, index, {
+                              key: `${workspaceId}:${msg.id}:message`,
+                            })}
                           {renderWorkBundle && workBundle && (
                             <WorkBundleMessage
                               item={workBundle}
@@ -1309,23 +1321,20 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                                   key={`${workspaceId}:${workBundle.key}:${entry.message.id}`}
                                 >
                                   {renderNestedBundle && nestedOperationalBundle && (
-                                    <div className="ml-4">
-                                      <OperationalBundleMessage
-                                        item={nestedOperationalBundle}
-                                        expanded={isNestedExpanded}
-                                        onToggle={() =>
-                                          setOperationalBundleExpanded(
-                                            nestedOperationalBundle.key,
-                                            !isNestedExpanded
-                                          )
-                                        }
-                                      />
-                                    </div>
+                                    <OperationalBundleMessage
+                                      item={nestedOperationalBundle}
+                                      expanded={isNestedExpanded}
+                                      onToggle={() =>
+                                        setOperationalBundleExpanded(
+                                          nestedOperationalBundle.key,
+                                          !isNestedExpanded
+                                        )
+                                      }
+                                    />
                                   )}
                                   {renderNestedMessage &&
                                     renderMessageAtIndex(entry.message, entry.originalIndex, {
                                       key: `${workspaceId}:${workBundle.key}:${entry.message.id}:message`,
-                                      className: nestedOperationalBundle ? "ml-8" : "ml-4",
                                     })}
                                 </React.Fragment>
                               );

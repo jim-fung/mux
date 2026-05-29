@@ -14,7 +14,9 @@ const item: WorkBundleInfo = {
   position: "head",
   headIndex: 1,
   entries: [],
+  startedAtMs: 0,
   durationMs: 180_000,
+  state: "settled",
   defaultExpanded: false,
 };
 
@@ -44,6 +46,24 @@ describe("WorkBundleMessage", () => {
     view.rerender(<WorkBundleMessage item={item} expanded={expanded} onToggle={onToggle} />);
 
     expect(view.getByRole("button", { expanded: true })).toBeDefined();
+  });
+
+  test("renders active working label with elapsed duration", () => {
+    const view = render(
+      <WorkBundleMessage
+        item={{
+          ...item,
+          state: "active",
+          startedAtMs: Date.now() - 35_000,
+          durationMs: undefined,
+          defaultExpanded: true,
+        }}
+        expanded
+        onToggle={() => undefined}
+      />
+    );
+
+    expect(view.getByText(/Working for \d+s\.\.\./)).toBeDefined();
   });
 
   test("renders fallback label without duration", () => {
