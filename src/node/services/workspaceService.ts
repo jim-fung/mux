@@ -120,6 +120,12 @@ import {
   type MuxMessageMetadata,
   type MuxMessage,
 } from "@/common/types/message";
+import type { WorkflowRunRecord } from "@/common/types/workflow";
+import {
+  WORKFLOW_RUN_CARD_DISPLAY_METADATA_TYPE,
+  WORKFLOW_TRIGGER_DISPLAY_METADATA_TYPE,
+  buildWorkflowRunCardMessage,
+} from "@/common/utils/workflowRunMessages";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import {
   hasSrcBaseDir,
@@ -256,6 +262,30 @@ type WorktreeArchiveSnapshotLifecycleService = Pick<
 >;
 // Trim and normalize a heartbeat message for storage. Accepts `unknown` so it safely handles
 // both user input (string | undefined) and persisted config values that may have been corrupted.
+function isWorkflowInvocationMessage(message: MuxMessage, runId: string): boolean {
+  if (
+    message.metadata?.muxMetadata?.type === WORKFLOW_RUN_CARD_DISPLAY_METADATA_TYPE &&
+    message.metadata.muxMetadata.runId === runId
+  ) {
+    return true;
+  }
+
+  return message.parts.some((part) => {
+    if (part.type !== "dynamic-tool" || part.toolName !== "workflow_run") {
+      return false;
+    }
+    if (part.state !== "output-available") {
+      return false;
+    }
+    const output = part.output;
+    return (
+      output != null &&
+      typeof output === "object" &&
+      (output as Record<string, unknown>).runId === runId
+    );
+  });
+}
+
 function sanitizeHeartbeatMessage(message: unknown): string | undefined {
   if (typeof message !== "string") {
     return undefined;
@@ -5770,6 +5800,110 @@ export class WorkspaceService extends EventEmitter {
       const message = getErrorMessage(error);
       return Err(`Failed to fork workspace: ${message}`);
     }
+  }
+
+  async appendWorkflowRunInvocation(input: {
+    workspaceId: string;
+    rawCommand: string;
+    name: string;
+    args: unknown;
+    runId: string;
+    status: string;
+    result: unknown;
+    run?: WorkflowRunRecord;
+  }): Promise<boolean> {
+    assert(input.workspaceId.length > 0, "appendWorkflowRunInvocation requires workspaceId");
+    assert(input.rawCommand.trim().length > 0, "appendWorkflowRunInvocation requires rawCommand");
+    assert(input.name.length > 0, "appendWorkflowRunInvocation requires workflow name");
+    assert(input.runId.length > 0, "appendWorkflowRunInvocation requires runId");
+
+    const now = Date.now();
+    void this.updateRecencyTimestamp(input.workspaceId, now);
+    const commandPrefix = input.rawCommand.trim().split(/\s+/u)[0] ?? `/${input.name}`;
+    const userMessage = createMuxMessage(
+      `workflow-run-command-${input.runId}`,
+      "user",
+      input.rawCommand,
+      {
+        timestamp: now,
+        muxMetadata: {
+          type: WORKFLOW_TRIGGER_DISPLAY_METADATA_TYPE,
+          rawCommand: input.rawCommand,
+          commandPrefix,
+          runId: input.runId,
+        },
+      }
+    );
+    const workflowMessage = buildWorkflowRunCardMessage(
+      { name: input.name, args: input.args },
+      {
+        runId: input.runId,
+        status: input.status,
+        result: input.result,
+        ...(input.run != null ? { run: input.run } : {}),
+      },
+      now
+    );
+    workflowMessage.metadata = {
+      timestamp: now,
+      synthetic: true,
+      uiVisible: true,
+      muxMetadata: {
+        type: WORKFLOW_RUN_CARD_DISPLAY_METADATA_TYPE,
+        runId: input.runId,
+      },
+    };
+
+    const session = this.getOrCreateSession(input.workspaceId);
+    const userAppend = await this.historyService.appendToHistory(input.workspaceId, userMessage);
+    if (!userAppend.success) {
+      log.error("Failed to append workflow slash command to history", {
+        workspaceId: input.workspaceId,
+        runId: input.runId,
+        error: userAppend.error,
+      });
+      return false;
+    }
+    session.emitChatEvent({ ...userMessage, type: "message" });
+
+    const toolAppend = await this.historyService.appendToHistory(
+      input.workspaceId,
+      workflowMessage
+    );
+    if (!toolAppend.success) {
+      log.error("Failed to append workflow run card to history", {
+        workspaceId: input.workspaceId,
+        runId: input.runId,
+        error: toolAppend.error,
+      });
+      return false;
+    }
+    session.emitChatEvent({ ...workflowMessage, type: "message" });
+    return true;
+  }
+
+  async isWorkflowInvocationCurrent(workspaceId: string, runId: string): Promise<boolean> {
+    assert(workspaceId.length > 0, "isWorkflowInvocationCurrent requires workspaceId");
+    assert(runId.length > 0, "isWorkflowInvocationCurrent requires runId");
+
+    const historyResult = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
+    if (!historyResult.success) {
+      log.warn("Could not read history before workflow continuation", {
+        workspaceId,
+        runId,
+        error: historyResult.error,
+      });
+      return false;
+    }
+
+    const runCardIndex = historyResult.data.findIndex((message) =>
+      isWorkflowInvocationMessage(message, runId)
+    );
+    if (runCardIndex === -1) {
+      return false;
+    }
+
+    return !historyResult.data.slice(runCardIndex + 1).some((message) => message.role === "user");
   }
 
   async sendMessage(
