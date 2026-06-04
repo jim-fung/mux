@@ -430,7 +430,7 @@ export const TaskAwaitToolArgsSchema = z
       .nullish()
       .describe(
         "List of task IDs or workflow run IDs to await — use only real IDs returned by prior task, bash, workflow_run, or task_list tool results; never fabricate an ID. " +
-          "When omitted, waits for all active descendant tasks and workflow runs of the current workspace."
+          "When omitted, waits for active descendant tasks and workflow runs of the current workspace, excluding workflow-owned sub-agents and their background bash tasks because those results are consumed through workflow runs."
       ),
     filter: z
       .string()
@@ -1516,7 +1516,7 @@ export const TOOL_DEFINITIONS = {
       "\n\nIMPORTANT: Do not call task_await in the same parallel tool-call batch as task or bash — " +
       "the taskId is not available until the spawning tool returns. " +
       "Always wait for the task/bash tool result first, then call task_await in a subsequent step. " +
-      "When omitting task_ids to await all active tasks/workflows, ensure at least one background task or workflow was already spawned in a prior step. " +
+      "When omitting task_ids to await active tasks/workflows, ensure at least one background task or workflow was already spawned in a prior step. Omitted task_ids exclude workflow-owned sub-agents and their background bash tasks because those results are consumed through workflow runs. " +
       "\n\nAgent tasks and workflow runs return reports when completed. " +
       "Bash tasks return incremental output while running and a final reportMarkdown when they exit. " +
       "For bash tasks, you may optionally pass filter/filter_exclude to include/exclude output lines by regex. " +
@@ -1542,7 +1542,7 @@ export const TOOL_DEFINITIONS = {
   task_list: {
     description:
       "List descendant tasks for the current workspace, including status + metadata. " +
-      "This includes sub-agent tasks and background bash tasks. " +
+      "This includes sub-agent tasks and background bash tasks, but omits workflow-owned sub-agents (and their background bash tasks) whose reports are consumed through their workflow run. " +
       "Use this after compaction or interruptions to rediscover which tasks are still active. " +
       "This is a discovery tool, NOT a waiting mechanism. If the current request actually depends on a task's output, call task_await with the specific task IDs you need; do not await all active tasks just because they appear here.",
     schema: TaskListToolArgsSchema,
