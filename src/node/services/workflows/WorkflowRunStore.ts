@@ -35,6 +35,7 @@ export interface CreateWorkflowRunInput {
   definition: WorkflowDefinitionDescriptor;
   definitionSource: string;
   args: unknown;
+  defaultActionCwd?: string;
   now: string;
 }
 
@@ -89,6 +90,7 @@ export class WorkflowRunStore {
       definitionSource: input.definitionSource,
       definitionHash: hashSource(input.definitionSource),
       args: input.args,
+      ...(input.defaultActionCwd != null ? { defaultActionCwd: input.defaultActionCwd } : {}),
       status: "pending",
       createdAt: input.now,
       updatedAt: input.now,
@@ -516,6 +518,14 @@ export class WorkflowRunStore {
   private async writeRunFile(runId: string, run: WorkflowRunRecord): Promise<void> {
     const runForDisk = WorkflowRunRecordSchema.parse(run);
     await writeJsonAtomic(this.runFile(runId), runForDisk);
+  }
+
+  getStepArtifactsDir(runId: string, stepId: string, inputHash: string): string {
+    assertValidWorkflowRunId(runId);
+    assert(stepId.length > 0, "WorkflowRunStore.getStepArtifactsDir: stepId is required");
+    assert(inputHash.length > 0, "WorkflowRunStore.getStepArtifactsDir: inputHash is required");
+    const stepKey = crypto.createHash("sha256").update(`${stepId}\0${inputHash}`).digest("hex");
+    return path.join(this.runDir(runId), "artifacts", stepKey);
   }
 
   private workflowsDir(): string {

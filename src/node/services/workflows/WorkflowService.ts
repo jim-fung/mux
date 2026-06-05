@@ -1,12 +1,16 @@
 import * as crypto from "node:crypto";
 
 import type {
+  WorkflowActionDescriptor,
   WorkflowDefinitionDescriptor,
   WorkflowRunRecord,
   WorkflowRunStatus,
 } from "@/common/types/workflow";
 import assert from "@/common/utils/assert";
+import { getErrorMessage } from "@/common/utils/errors";
 import type { IJSRuntimeFactory } from "@/node/services/ptc/runtime";
+import type { WorkflowActionRegistry } from "./WorkflowActionRegistry";
+import { WorkflowActionRunner } from "./WorkflowActionRunner";
 import type {
   WorkflowDefinitionStore,
   WorkflowDefinitionReadResult,
@@ -31,6 +35,9 @@ export interface WorkflowBackgroundRunTerminalEvent {
 export interface WorkflowServiceOptions {
   definitionStore: WorkflowDefinitionStore;
   runStore: WorkflowRunStore;
+  actionRegistry?: WorkflowActionRegistry;
+  actionRunner?: WorkflowActionRunner;
+  defaultActionCwd?: string;
   runtimeFactory: IJSRuntimeFactory;
   taskAdapter?: WorkflowTaskAdapter;
   taskAdapterFactory?: (runId: string) => WorkflowTaskAdapter;
@@ -97,6 +104,9 @@ const activeWorkflowRunnerAbortControllers = new Map<string, AbortController>();
 export class WorkflowService {
   private readonly definitionStore: WorkflowDefinitionStore;
   private readonly runStore: WorkflowRunStore;
+  private readonly actionRegistry?: WorkflowActionRegistry;
+  private readonly actionRunner: WorkflowActionRunner;
+  private readonly defaultActionCwd?: string;
   private readonly runtimeFactory: IJSRuntimeFactory;
   private readonly taskAdapter?: WorkflowTaskAdapter;
   private readonly taskAdapterFactory?: (runId: string) => WorkflowTaskAdapter;
@@ -114,6 +124,9 @@ export class WorkflowService {
     assert(options.runnerId.length > 0, "WorkflowService: runnerId is required");
     this.definitionStore = options.definitionStore;
     this.runStore = options.runStore;
+    this.actionRegistry = options.actionRegistry;
+    this.actionRunner = options.actionRunner ?? new WorkflowActionRunner();
+    this.defaultActionCwd = options.defaultActionCwd;
     this.runtimeFactory = options.runtimeFactory;
     assert(
       options.taskAdapter != null || options.taskAdapterFactory != null,
@@ -132,6 +145,39 @@ export class WorkflowService {
     projectTrusted: boolean;
   }): Promise<WorkflowDefinitionDescriptor[]> {
     return await this.definitionStore.listDefinitions(options);
+  }
+
+  async listActions(options: { projectTrusted: boolean }): Promise<WorkflowActionDescriptor[]> {
+    const registry = this.actionRegistry;
+    if (registry == null) {
+      return [];
+    }
+
+    const actions = await registry.listActions(options);
+    const descriptors: WorkflowActionDescriptor[] = [];
+    for (const action of actions) {
+      try {
+        const resolvedAction = await registry.resolveAction(action.name, options);
+        const description = await this.actionRunner.describe(resolvedAction);
+        descriptors.push({
+          name: resolvedAction.name,
+          scope: resolvedAction.scope,
+          sourcePath: resolvedAction.sourcePath,
+          executable: true,
+          metadata: description.metadata,
+          hasReconcile: description.hasReconcile,
+        });
+      } catch (error) {
+        descriptors.push({
+          name: action.name,
+          scope: action.scope,
+          sourcePath: action.sourcePath,
+          executable: false,
+          blockedReason: getErrorMessage(error),
+        });
+      }
+    }
+    return descriptors;
   }
 
   async readDefinition(input: {
@@ -212,6 +258,7 @@ export class WorkflowService {
     assertWorkflowRunCanTransition(run.status, "running");
     await this.runInBackground(input.runId, "Background workflow resume failed:", {
       allowResumeFromInterrupted: run.status === "interrupted",
+      projectTrusted: input.projectTrusted,
     });
     return { runId: input.runId, status: "running", result: null };
   }
@@ -227,7 +274,7 @@ export class WorkflowService {
     const runnerAbortController = new AbortController();
     let unregisterRunnerAbort: () => void = () => undefined;
     try {
-      const runner = this.createRunner(input.runId);
+      const runner = this.createRunner(input.runId, input.projectTrusted);
       const result = await runner.run(input.runId, {
         abortSignal: runnerAbortController.signal,
         onLeaseAcquired: () => {
@@ -241,9 +288,9 @@ export class WorkflowService {
       return { runId: input.runId, status: "completed", result };
     } catch (error) {
       if (error instanceof WorkflowRunBackgroundedError) {
-        void this.runInBackground(input.runId, "Backgrounded workflow resume failed:").catch(
-          () => undefined
-        );
+        void this.runInBackground(input.runId, "Backgrounded workflow resume failed:", {
+          projectTrusted: input.projectTrusted,
+        }).catch(() => undefined);
         return { runId: input.runId, status: "backgrounded", result: null };
       }
       throw error;
@@ -308,7 +355,9 @@ export class WorkflowService {
       this.clock?.nowIso() ?? new Date().toISOString()
     );
     await input.onBackgroundRunCreated?.({ runId, status: "running", result: null, run });
-    void this.runInBackground(runId, "Background workflow run failed:").catch(() => undefined);
+    void this.runInBackground(runId, "Background workflow run failed:", {
+      projectTrusted: input.projectTrusted,
+    }).catch(() => undefined);
     return { runId, status: "running", result: null };
   }
 
@@ -328,7 +377,7 @@ export class WorkflowService {
       runnerAbortController
     );
     try {
-      const runner = this.createRunner(runId);
+      const runner = this.createRunner(runId, input.projectTrusted);
       const result = await runner.run(runId, {
         abortSignal: runnerAbortController.signal,
         onLeaseAcquired: () => {
@@ -341,9 +390,9 @@ export class WorkflowService {
       return { runId, status: "completed", result };
     } catch (error) {
       if (error instanceof WorkflowRunBackgroundedError) {
-        void this.runInBackground(runId, "Backgrounded workflow run failed:").catch(
-          () => undefined
-        );
+        void this.runInBackground(runId, "Backgrounded workflow run failed:", {
+          projectTrusted: input.projectTrusted,
+        }).catch(() => undefined);
         return { runId, status: "backgrounded", result: null };
       }
       throw error;
@@ -375,7 +424,7 @@ export class WorkflowService {
     }
 
     try {
-      await this.runInBackground(input.runId, input.failureMessage);
+      await this.runInBackground(input.runId, input.failureMessage, { projectTrusted });
       return true;
     } catch (error) {
       if (isWorkflowRunAlreadyActiveError(error, input.runId)) {
@@ -493,6 +542,7 @@ export class WorkflowService {
       definition: definition.descriptor,
       definitionSource: definition.source,
       args: input.args,
+      ...(this.defaultActionCwd != null ? { defaultActionCwd: this.defaultActionCwd } : {}),
       now: this.clock?.nowIso() ?? new Date().toISOString(),
     });
     return runId;
@@ -501,9 +551,11 @@ export class WorkflowService {
   private runInBackground(
     runId: string,
     failureMessage: string,
-    runnerOptions: Pick<WorkflowRunnerRunOptions, "allowResumeFromInterrupted"> = {}
+    runnerOptions: Pick<WorkflowRunnerRunOptions, "allowResumeFromInterrupted"> & {
+      projectTrusted: boolean;
+    }
   ): Promise<void> {
-    const runner = this.createRunner(runId);
+    const runner = this.createRunner(runId, runnerOptions.projectTrusted);
     const runnerAbortController = new AbortController();
     let unregisterRunnerAbort: () => void = () => undefined;
     let startedSettled = false;
@@ -586,11 +638,16 @@ export class WorkflowService {
     }
   }
 
-  private createRunner(runId: string): WorkflowRunner {
+  private createRunner(runId: string, projectTrusted: boolean): WorkflowRunner {
     return new WorkflowRunner({
       runStore: this.runStore,
       runtimeFactory: this.runtimeFactory,
       taskAdapter: this.taskAdapterFactory?.(runId) ?? this.requireTaskAdapter(),
+      actionRegistry: this.actionRegistry,
+      actionRunner: this.actionRunner,
+      getProjectTrusted: () => this.resolveCurrentProjectTrust(projectTrusted),
+      projectTrusted,
+      defaultActionCwd: this.defaultActionCwd,
       runnerId: generateWorkflowRunnerOwnerId(this.runnerId, runId),
       ...(this.clock != null ? { clock: this.clock } : {}),
     });

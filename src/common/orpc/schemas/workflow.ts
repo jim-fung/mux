@@ -24,7 +24,7 @@ export const WorkflowRunStatusSchema = z.enum([
 ]);
 
 const IsoDateTimeSchema = z.string().datetime({ offset: true });
-const JsonValueSchema: z.ZodType<unknown> = z.lazy(() =>
+export const JsonValueSchema: z.ZodType<unknown> = z.lazy(() =>
   z.union([
     z.string(),
     z.number(),
@@ -34,6 +34,43 @@ const JsonValueSchema: z.ZodType<unknown> = z.lazy(() =>
     z.record(z.string(), JsonValueSchema),
   ])
 );
+
+export const WorkflowActionScopeSchema = z.enum(["project", "global", "built-in"]);
+
+export const WorkflowActionEffectSchema = z.enum(["read", "workspace", "external"]);
+
+export const WorkflowActionMetadataSchema = z.object({
+  version: z.union([z.number().int().positive(), z.string().min(1)]),
+  description: z.string().min(1).max(1024),
+  effect: WorkflowActionEffectSchema,
+  inputSchema: JsonValueSchema.optional(),
+  outputSchema: JsonValueSchema.optional(),
+  permissions: JsonValueSchema.optional(),
+  timeoutMs: z
+    .number()
+    .int()
+    .positive()
+    .max(24 * 60 * 60 * 1000)
+    .optional(),
+});
+
+const WorkflowActionDescriptorBaseSchema = z.object({
+  name: z.string().min(1),
+  scope: WorkflowActionScopeSchema,
+  sourcePath: z.string().min(1),
+});
+
+export const WorkflowActionDescriptorSchema = z.discriminatedUnion("executable", [
+  WorkflowActionDescriptorBaseSchema.extend({
+    executable: z.literal(true),
+    metadata: WorkflowActionMetadataSchema,
+    hasReconcile: z.boolean(),
+  }).strict(),
+  WorkflowActionDescriptorBaseSchema.extend({
+    executable: z.literal(false),
+    blockedReason: z.string().min(1),
+  }).strict(),
+]);
 
 export const WorkflowDefinitionDescriptorSchema = z
   .object({
@@ -97,6 +134,18 @@ export const WorkflowRunEventSchema = z.discriminatedUnion("type", [
     stepId: z.string().min(1),
     sourceTaskId: z.string().min(1),
     status: z.enum(["started", "applied", "conflict", "failed"]),
+    details: JsonValueSchema.optional(),
+  }),
+  z.object({
+    sequence: z.number().int().positive(),
+    type: z.literal("action"),
+    at: IsoDateTimeSchema,
+    stepId: z.string().min(1),
+    name: z.string().min(1),
+    status: z.enum(["started", "completed", "failed", "cached", "reconciled"]),
+    effect: WorkflowActionEffectSchema,
+    sourcePath: z.string().min(1).optional(),
+    sourceHash: z.string().min(1).optional(),
     details: JsonValueSchema.optional(),
   }),
   z.object({
@@ -179,6 +228,7 @@ export const WorkflowRunRecordSchema = z.object({
   definitionSource: z.string().min(1),
   definitionHash: z.string().min(1),
   args: JsonValueSchema,
+  defaultActionCwd: z.string().min(1).optional(),
   status: WorkflowRunStatusSchema,
   createdAt: IsoDateTimeSchema,
   updatedAt: IsoDateTimeSchema,
