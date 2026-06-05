@@ -3,10 +3,10 @@ import { execFile } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { promisify } from "node:util";
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
+import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import { ForegroundWaitBackgroundedError } from "@/node/services/taskService";
 import { DisposableTempDir } from "@/node/services/tempDir";
-import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import { WorkflowActionRegistry } from "./WorkflowActionRegistry";
 import { WorkflowRunStore } from "./WorkflowRunStore";
 import {
@@ -66,6 +66,16 @@ function createRunner(store: WorkflowRunStore, taskAdapter: WorkflowTaskAdapter)
       nowMs: () => 1_000,
     },
   });
+}
+
+function createDeferred() {
+  let resolve!: () => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<void>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { promise, resolve, reject };
 }
 
 describe("WorkflowRunner", () => {
@@ -853,6 +863,96 @@ describe("WorkflowRunner", () => {
     expect(run.steps.map((step) => step.stepId).sort()).toEqual(["source-a", "source-b"]);
   });
 
+  test("records completed parallelAgents results before slower siblings finish", async () => {
+    using tmp = new DisposableTempDir("workflow-runner-parallel-incremental");
+    const store = new WorkflowRunStore({
+      sessionDir: tmp.path,
+      staleLeaseMs: WORKFLOW_RUNNER_TEST_STALE_LEASE_MS,
+    });
+    await store.createRun({
+      id: "wfr_parallel_incremental",
+      workspaceId: "workspace-1",
+      definition,
+      definitionSource: `export default function workflow({ parallelAgents }) {
+        const results = parallelAgents([
+          { id: "source-a", prompt: "Read source A" },
+          { id: "source-b", prompt: "Read source B" },
+        ]);
+        return { reportMarkdown: results.map((result) => result.reportMarkdown).join(" + ") };
+      }`,
+      args: {},
+      now: "2026-05-29T00:00:00.000Z",
+    });
+    let releaseSourceB!: () => void;
+    const sourceBBlocked = new Promise<void>((resolve) => {
+      releaseSourceB = resolve;
+    });
+    let sourceAReturned!: () => void;
+    const sourceAReturnedPromise = new Promise<void>((resolve) => {
+      sourceAReturned = resolve;
+    });
+    const sourceARecorded = createDeferred();
+    const recordCompleted = store.recordStepCompletedAndAppendTaskEvent.bind(store);
+    spyOn(store, "recordStepCompletedAndAppendTaskEvent").mockImplementation(
+      async (runId, input, options) => {
+        try {
+          await recordCompleted(runId, input, options);
+        } catch (error) {
+          if (input.stepId === "source-a") {
+            sourceARecorded.reject(error);
+          }
+          throw error;
+        }
+        if (input.stepId === "source-a") {
+          sourceARecorded.resolve();
+        }
+      }
+    );
+    const runner = createRunner(store, {
+      async runAgent(spec, lifecycle) {
+        await lifecycle?.onTaskCreated?.(`task_${spec.id}`);
+        if (spec.id === "source-a") {
+          sourceAReturned();
+          return { taskId: "task_source-a", reportMarkdown: "source-a" };
+        }
+        await sourceBBlocked;
+        return { taskId: "task_source-b", reportMarkdown: "source-b" };
+      },
+    });
+
+    const runPromise = runner.run("wfr_parallel_incremental");
+    await sourceAReturnedPromise;
+    await sourceARecorded.promise;
+    const runDuringSlowSibling = await store.getRun("wfr_parallel_incremental");
+
+    const sourceAStep = runDuringSlowSibling.steps.find((step) => step.stepId === "source-a");
+    expect(sourceAStep).toMatchObject({
+      stepId: "source-a",
+      status: "completed",
+      taskId: "task_source-a",
+    });
+    expect(sourceAStep?.result).toMatchObject({
+      reportMarkdown: "source-a",
+      taskId: "task_source-a",
+    });
+    expect(runDuringSlowSibling.events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "task",
+          stepId: "source-a",
+          taskId: "task_source-a",
+          status: "completed",
+        }),
+      ])
+    );
+    expect(runDuringSlowSibling.steps).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ stepId: "source-b", status: "completed" })])
+    );
+
+    releaseSourceB();
+    await expect(runPromise).resolves.toEqual({ reportMarkdown: "source-a + source-b" });
+  });
+
   test("interrupts sibling parallelAgents when one child task fails", async () => {
     using tmp = new DisposableTempDir("workflow-runner");
     const store = new WorkflowRunStore({
@@ -952,6 +1052,114 @@ describe("WorkflowRunner", () => {
 
     expect(sourceBStarted).toBe(true);
     expect(interruptRunCalls).toBe(0);
+  });
+
+  test("records parallelAgents validation failures before slower siblings finish", async () => {
+    using tmp = new DisposableTempDir("workflow-runner-parallel-validation-incremental");
+    const store = new WorkflowRunStore({
+      sessionDir: tmp.path,
+      staleLeaseMs: WORKFLOW_RUNNER_TEST_STALE_LEASE_MS,
+    });
+    await store.createRun({
+      id: "wfr_parallel_validation_incremental",
+      workspaceId: "workspace-1",
+      definition,
+      definitionSource: `export default function workflow({ parallelAgents }) {
+        const results = parallelAgents([
+          {
+            id: "source-a",
+            prompt: "Summarize A",
+            outputSchema: { type: "object", required: ["summary"], properties: { summary: { type: "string" } } },
+          },
+          {
+            id: "source-b",
+            prompt: "Summarize B",
+            outputSchema: { type: "object", required: ["summary"], properties: { summary: { type: "string" } } },
+          },
+        ]);
+        return { reportMarkdown: results.map((result) => result.structuredOutput.summary).join(" + ") };
+      }`,
+      args: {},
+      now: "2026-05-29T00:00:00.000Z",
+    });
+    let releaseSourceA!: () => void;
+    const sourceABlocked = new Promise<void>((resolve) => {
+      releaseSourceA = resolve;
+    });
+    const calls: string[] = [];
+    const sourceBFailureRecorded = createDeferred();
+    const recordFailed = store.recordStepFailedAndAppendTaskEvent.bind(store);
+    spyOn(store, "recordStepFailedAndAppendTaskEvent").mockImplementation(
+      async (runId, input, options) => {
+        try {
+          await recordFailed(runId, input, options);
+        } catch (error) {
+          if (input.stepId === "source-b" && input.taskId === "task_source-b_bad") {
+            sourceBFailureRecorded.reject(error);
+          }
+          throw error;
+        }
+        if (input.stepId === "source-b" && input.taskId === "task_source-b_bad") {
+          sourceBFailureRecorded.resolve();
+        }
+      }
+    );
+    const runner = createRunner(store, {
+      async runAgent(spec) {
+        calls.push(spec.id);
+        if (spec.id === "source-a") {
+          await sourceABlocked;
+          return {
+            taskId: `task_${spec.id}`,
+            reportMarkdown: spec.id,
+            structuredOutput: { summary: spec.id },
+          };
+        }
+        if (calls.filter((id) => id === "source-b").length === 1) {
+          return { taskId: "task_source-b_bad", reportMarkdown: "bad" };
+        }
+        return {
+          taskId: "task_source-b_retry",
+          reportMarkdown: "source-b",
+          structuredOutput: { summary: "source-b" },
+        };
+      },
+    });
+
+    const runPromise = runner.run("wfr_parallel_validation_incremental");
+    await sourceBFailureRecorded.promise;
+    const runDuringSlowSibling = await store.getRun("wfr_parallel_validation_incremental");
+
+    const validationEvent = runDuringSlowSibling.events.find(
+      (event) => event.type === "validation" && event.stepId === "source-b"
+    );
+    expect(validationEvent).toMatchObject({
+      type: "validation",
+      stepId: "source-b",
+      success: false,
+    });
+    const failedTaskEvent = runDuringSlowSibling.events.find(
+      (event) =>
+        event.type === "task" &&
+        event.stepId === "source-b" &&
+        event.taskId === "task_source-b_bad" &&
+        event.status === "failed"
+    );
+    expect(failedTaskEvent).toMatchObject({
+      type: "task",
+      stepId: "source-b",
+      taskId: "task_source-b_bad",
+      status: "failed",
+    });
+    expect(
+      runDuringSlowSibling.steps.some(
+        (step) => step.stepId === "source-b" && step.status === "completed"
+      )
+    ).toBe(false);
+
+    releaseSourceA();
+    await expect(runPromise).resolves.toEqual({ reportMarkdown: "source-a + source-b" });
+    expect(calls).toEqual(["source-a", "source-b", "source-b"]);
   });
 
   test("retries only failed parallelAgents steps after structured output validation errors", async () => {
