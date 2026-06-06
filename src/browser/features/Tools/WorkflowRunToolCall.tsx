@@ -368,6 +368,14 @@ function getTaskReportMarkdown(
     : null;
 }
 
+function getTaskStructuredOutput(
+  event: WorkflowRunEvent,
+  steps: readonly WorkflowStepRecord[]
+): unknown {
+  const step = findTaskStepForEvent(event, steps);
+  return step?.result?.structuredOutput;
+}
+
 function WorkflowEventTooltip(props: {
   event: WorkflowRunEvent;
   displayIndex: number;
@@ -487,14 +495,33 @@ function WorkflowTaskRow(props: {
   steps: readonly WorkflowStepRecord[];
   onNavigate: (taskId: string) => void;
   onOpenReport: () => void;
+  onInspectStructuredOutput: () => void;
 }) {
   const [reportDialogOpen, setReportDialogOpen] = useState(false);
+  const [structuredOutputExpanded, setStructuredOutputExpanded] = useState(false);
   const event = props.row.latestEvent;
   const label = getWorkflowEventLabel(event);
   const taskReportMarkdown = getTaskReportMarkdown(event, props.steps);
+  const taskStructuredOutput = getTaskStructuredOutput(event, props.steps);
+  // Completed task rows inspect structured output inline; keep workspace navigation as a separate action.
+  const canExpandStructuredOutput =
+    event.status === "completed" && taskStructuredOutput !== undefined;
+  const showWorkspaceAction = canExpandStructuredOutput;
   const showOpenAffordance =
-    taskReportMarkdown == null && shouldShowWorkflowTaskOpenAffordance(event);
-  const activateTaskRow = () => props.onNavigate(event.taskId);
+    taskReportMarkdown == null &&
+    !canExpandStructuredOutput &&
+    shouldShowWorkflowTaskOpenAffordance(event);
+  const toggleStructuredOutput = () => {
+    props.onInspectStructuredOutput();
+    setStructuredOutputExpanded((isExpanded) => !isExpanded);
+  };
+  const activateTaskRow = () => {
+    if (canExpandStructuredOutput) {
+      toggleStructuredOutput();
+      return;
+    }
+    props.onNavigate(event.taskId);
+  };
   const handleReportDialogOpenChange = (isOpen: boolean) => {
     if (isOpen) {
       props.onOpenReport();
@@ -508,6 +535,9 @@ function WorkflowTaskRow(props: {
     keyboardEvent.preventDefault();
     activateTaskRow();
   };
+  const taskRowAriaLabel = canExpandStructuredOutput
+    ? `${structuredOutputExpanded ? "Collapse" : "Expand"} structured output for workflow task ${event.taskId}`
+    : `Open workflow task ${event.taskId}`;
 
   const taskRow = (
     <div
@@ -518,7 +548,8 @@ function WorkflowTaskRow(props: {
       }`}
       role="button"
       tabIndex={0}
-      aria-label={`Open workflow task ${event.taskId}`}
+      aria-expanded={canExpandStructuredOutput ? structuredOutputExpanded : undefined}
+      aria-label={taskRowAriaLabel}
       onClick={activateTaskRow}
       onKeyDown={onKeyDown}
     >
@@ -554,16 +585,34 @@ function WorkflowTaskRow(props: {
     </div>
   );
 
+  const workspaceAction = showWorkspaceAction ? (
+    <button
+      type="button"
+      className={`${WORKFLOW_ACTION_BUTTON_CLASS} inline-flex items-center px-1.5 py-0.5 text-[10px] whitespace-nowrap`}
+      aria-label={`Open task workspace for ${event.taskId}`}
+      onClick={() => props.onNavigate(event.taskId)}
+    >
+      Workspace
+    </button>
+  ) : null;
+
   return (
     <li className="hover:bg-background/50">
       {taskReportMarkdown != null ? (
         <Dialog open={reportDialogOpen} onOpenChange={handleReportDialogOpenChange}>
-          <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center">
+          <div
+            className={`grid ${
+              showWorkspaceAction
+                ? "grid-cols-[minmax(0,1fr)_auto_auto]"
+                : "grid-cols-[minmax(0,1fr)_auto]"
+            } items-center gap-1 pr-2`}
+          >
             {taskRow}
+            {workspaceAction}
             <DialogTrigger asChild>
               <button
                 type="button"
-                className={`${WORKFLOW_ACTION_BUTTON_CLASS} mr-2 inline-flex items-center px-1.5 py-0.5 text-[10px] whitespace-nowrap`}
+                className={`${WORKFLOW_ACTION_BUTTON_CLASS} inline-flex items-center px-1.5 py-0.5 text-[10px] whitespace-nowrap`}
                 aria-label={`Open report for ${event.taskId}`}
               >
                 Report
@@ -576,9 +625,25 @@ function WorkflowTaskRow(props: {
             reportMarkdown={taskReportMarkdown}
           />
         </Dialog>
+      ) : showWorkspaceAction ? (
+        <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-1 pr-2">
+          {taskRow}
+          {workspaceAction}
+        </div>
       ) : (
         taskRow
       )}
+      {canExpandStructuredOutput && structuredOutputExpanded ? (
+        <div className="mx-2 mb-2 space-y-1">
+          <div className="text-muted text-[10px] tracking-wide uppercase">Structured output</div>
+          {/* The inline JSON is height-capped, so name/focus its own scroll region for keyboard users. */}
+          <WorkflowJsonBlock
+            value={taskStructuredOutput}
+            className="max-h-[180px]"
+            ariaLabel={`Structured output for workflow task ${event.taskId}`}
+          />
+        </div>
+      ) : null}
     </li>
   );
 }
@@ -1214,6 +1279,9 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
                         steps={run?.steps ?? []}
                         onNavigate={(taskId) => workspaceStore.navigateToWorkspace(taskId)}
                         onOpenReport={() => {
+                          userToggledExpansionRef.current = true;
+                        }}
+                        onInspectStructuredOutput={() => {
                           userToggledExpansionRef.current = true;
                         }}
                       />
