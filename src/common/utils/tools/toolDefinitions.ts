@@ -2333,6 +2333,19 @@ export function getToolSchemas(): Record<string, ToolSchema> {
 }
 
 /**
+ * Google's mixed built-in + function tool path is currently supported for Gemini 3.
+ * Keep native Google tools gated here so the prompt allowlist matches the actual toolset.
+ */
+export function supportsGoogleNativeToolsWithFunctionTools(modelId: string): boolean {
+  const bareModelId = modelId.split("/").pop() ?? modelId;
+  const match = /^gemini-(\d+)(?:[.-]|$)/.exec(bareModelId);
+  if (!match) return false;
+  const major = Number.parseInt(match[1], 10);
+  // The installed @ai-sdk/google mixed native/function serialization path is Gemini 3-only.
+  return major === 3;
+}
+
+/**
  * Get which tools are available for a given model
  * @param modelString The model string (e.g., "anthropic:claude-opus-4-1")
  * @returns Array of tool names available for the model
@@ -2348,7 +2361,7 @@ export function getAvailableTools(
     enableMuxGlobalAgentsTools?: boolean;
   }
 ): string[] {
-  const [provider] = modelString.split(":");
+  const [provider, modelId = ""] = modelString.split(":");
   const enableAgentReport = options?.enableAgentReport ?? true;
   const enableAnalyticsQuery = options?.enableAnalyticsQuery ?? true;
   const enableAdvisor = options?.enableAdvisor ?? false;
@@ -2416,7 +2429,10 @@ export function getAvailableTools(
       }
       return baseTools;
     case "google":
-      return [...baseTools, "google_search"];
+      if (supportsGoogleNativeToolsWithFunctionTools(modelId)) {
+        return [...baseTools, "google_search", "url_context"];
+      }
+      return baseTools;
     default:
       return baseTools;
   }
