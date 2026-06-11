@@ -1,4 +1,9 @@
-import { AgentSideConnection, PROTOCOL_VERSION, ndJsonStream } from "@agentclientprotocol/sdk";
+import {
+  AgentSideConnection,
+  ClientSideConnection,
+  PROTOCOL_VERSION,
+  ndJsonStream,
+} from "@agentclientprotocol/sdk";
 import type { ProjectConfig } from "../../src/common/types/project";
 import type { OnChatMode, WorkspaceChatMessage } from "../../src/common/orpc/types";
 import { MuxAgent } from "../../src/node/acp/agent";
@@ -71,7 +76,16 @@ function createWorkspaceInfo(overrides?: Partial<WorkspaceInfo>): WorkspaceInfo 
   };
 }
 
-function createHarness(options?: HarnessOptions): Harness {
+interface MockServer {
+  server: ServerConnection;
+  onChatCalls: Array<{ workspaceId: string; mode?: OnChatMode }>;
+  setTrustCalls: Array<{ projectPath: string; trusted: boolean }>;
+  createCalls: WorkspaceCreateInput[];
+  forkCalls: WorkspaceForkInput[];
+  listCalls: Array<{ archived?: boolean } | undefined>;
+}
+
+function createMockServer(options?: HarnessOptions): MockServer {
   const activeWorkspaces = options?.activeWorkspaces ?? [createWorkspaceInfo()];
   const archivedWorkspaces = options?.archivedWorkspaces ?? [];
   const workspaceActivity = options?.workspaceActivity ?? {};
@@ -196,12 +210,18 @@ function createHarness(options?: HarnessOptions): Harness {
     close: async () => undefined,
   };
 
+  return { server, onChatCalls, setTrustCalls, createCalls, forkCalls, listCalls };
+}
+
+function createHarness(options?: HarnessOptions): Harness {
+  const mockServer = createMockServer(options);
+
   let agentInstance: MuxAgent | null = null;
   // Use a real ACP connection instead of casting a hand-rolled stub to
   // AgentSideConnection. This keeps the test harness type-safe and exercises
   // the same connection surface MuxAgent uses in production.
   const _connection = new AgentSideConnection((connectionToAgent) => {
-    const createdAgent = new MuxAgent(connectionToAgent, server, options?.agentOptions);
+    const createdAgent = new MuxAgent(connectionToAgent, mockServer.server, options?.agentOptions);
     agentInstance = createdAgent;
     return createdAgent;
   }, createInMemoryAcpStream());
@@ -213,12 +233,48 @@ function createHarness(options?: HarnessOptions): Harness {
 
   return {
     agent: agentInstance,
-    onChatCalls,
-    setTrustCalls,
-    createCalls,
-    forkCalls,
-    listCalls,
+    onChatCalls: mockServer.onChatCalls,
+    setTrustCalls: mockServer.setTrustCalls,
+    createCalls: mockServer.createCalls,
+    forkCalls: mockServer.forkCalls,
+    listCalls: mockServer.listCalls,
   };
+}
+
+// Cross-wired in-memory pipes so a real ClientSideConnection talks to the real
+// AgentSideConnection over JSON-RPC. Unlike createHarness (which invokes MuxAgent
+// methods directly and therefore renames in lockstep with the implementation),
+// this exercises the SDK's wire dispatch: a missed Agent-interface rename (the
+// SDK declares listSessions/resumeSession as optional, e.g. unstable_listSessions
+// -> listSessions in SDK 0.16/0.20) still typechecks but fails here with
+// METHOD_NOT_FOUND.
+function createWireHarness(options?: HarnessOptions): { client: ClientSideConnection } {
+  const mockServer = createMockServer(options);
+  const clientToAgent = new TransformStream<Uint8Array, Uint8Array>();
+  const agentToClient = new TransformStream<Uint8Array, Uint8Array>();
+
+  const _agentConnection = new AgentSideConnection(
+    (connectionToAgent) =>
+      new MuxAgent(connectionToAgent, mockServer.server, options?.agentOptions),
+    ndJsonStream(agentToClient.writable, clientToAgent.readable)
+  );
+  void _agentConnection;
+
+  const client = new ClientSideConnection(
+    () => ({
+      requestPermission: async (params) => {
+        const firstOption = params.options[0];
+        if (firstOption == null) {
+          throw new Error("createWireHarness: requestPermission expected at least one option");
+        }
+        return { outcome: { outcome: "selected" as const, optionId: firstOption.optionId } };
+      },
+      sessionUpdate: async () => undefined,
+    }),
+    ndJsonStream(clientToAgent.writable, agentToClient.readable)
+  );
+
+  return { client };
 }
 
 async function* createChatStream(
@@ -246,8 +302,8 @@ function createNeverEndingChatStream(
     },
   };
 }
-describe("ACP unstable session support", () => {
-  it("advertises unstable list/fork/resume session capabilities", async () => {
+describe("ACP session list/resume/fork support", () => {
+  it("advertises list/resume and unstable fork session capabilities", async () => {
     const harness = createHarness();
 
     const response = await harness.agent.initialize({
@@ -315,7 +371,7 @@ describe("ACP unstable session support", () => {
 
     await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
 
-    const firstPage = await harness.agent.unstable_listSessions({
+    const firstPage = await harness.agent.listSessions({
       cwd: "/repo/a/",
     });
 
@@ -327,7 +383,7 @@ describe("ACP unstable session support", () => {
       new Date(repoAArchivedRecency).toISOString(),
     ]);
 
-    const secondPage = await harness.agent.unstable_listSessions({
+    const secondPage = await harness.agent.listSessions({
       cwd: "/repo/a/",
       cursor: "1",
     });
@@ -351,7 +407,7 @@ describe("ACP unstable session support", () => {
 
     await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
 
-    const listResponse = await harness.agent.unstable_listSessions({
+    const listResponse = await harness.agent.listSessions({
       cwd: "/repo/monorepo/packages/api",
     });
     expect(listResponse.sessions.map((session) => session.sessionId)).toEqual(["ws-sub-project"]);
@@ -373,16 +429,47 @@ describe("ACP unstable session support", () => {
     await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
 
     await expect(
-      harness.agent.unstable_listSessions({
+      harness.agent.listSessions({
         cursor: "not-a-number",
       })
     ).rejects.toThrow("invalid cursor");
 
     await expect(
-      harness.agent.unstable_listSessions({
+      harness.agent.listSessions({
         cursor: "1abc",
       })
     ).rejects.toThrow("invalid cursor");
+  });
+
+  it("rejects boolean config option values with an invalid-params error", async () => {
+    const workspace = createWorkspaceInfo({
+      id: "ws-bool-config",
+      projectPath: "/repo/boolcfg",
+      namedWorkspacePath: "/repo/boolcfg/.mux/ws-bool-config",
+    });
+
+    const harness = createHarness({
+      activeWorkspaces: [workspace],
+      onChatEvents: [{ type: "caught-up" } as WorkspaceChatMessage],
+    });
+
+    await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
+    await harness.agent.resumeSession({
+      sessionId: "ws-bool-config",
+      cwd: "/repo/boolcfg",
+      mcpServers: [],
+    });
+
+    // SDK 0.25 schemas permit {type:"boolean"} config values, but mux only
+    // exposes select options; the agent must reject rather than forward them.
+    await expect(
+      harness.agent.setSessionConfigOption({
+        sessionId: "ws-bool-config",
+        configId: "model",
+        type: "boolean",
+        value: true,
+      })
+    ).rejects.toThrow("expects a select value");
   });
 
   it("rejects resume when session does not belong to requested cwd", async () => {
@@ -400,7 +487,7 @@ describe("ACP unstable session support", () => {
     await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
 
     await expect(
-      harness.agent.unstable_resumeSession({
+      harness.agent.resumeSession({
         sessionId: "ws-cwd-check",
         cwd: "/repo/wrong",
         mcpServers: [],
@@ -422,7 +509,7 @@ describe("ACP unstable session support", () => {
 
     await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
 
-    const response = await harness.agent.unstable_resumeSession({
+    const response = await harness.agent.resumeSession({
       sessionId: "ws-resume",
       cwd: "/repo/resume/",
       mcpServers: [],
@@ -449,7 +536,7 @@ describe("ACP unstable session support", () => {
 
     await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
 
-    await harness.agent.unstable_resumeSession({
+    await harness.agent.resumeSession({
       sessionId: "ws-live-to-full",
       cwd: "/repo/resume",
       mcpServers: [],
@@ -600,17 +687,17 @@ describe("ACP unstable session support", () => {
 
     await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
 
-    await harness.agent.unstable_resumeSession({
+    await harness.agent.resumeSession({
       sessionId: "ws-a",
       cwd: "/repo/lru",
       mcpServers: [],
     });
-    await harness.agent.unstable_resumeSession({
+    await harness.agent.resumeSession({
       sessionId: "ws-b",
       cwd: "/repo/lru",
       mcpServers: [],
     });
-    await harness.agent.unstable_resumeSession({
+    await harness.agent.resumeSession({
       sessionId: "ws-c",
       cwd: "/repo/lru",
       mcpServers: [],
@@ -626,5 +713,54 @@ describe("ACP unstable session support", () => {
     expect(sessionStateMap.has("ws-b")).toBe(true);
     expect(sessionStateMap.has("ws-c")).toBe(true);
     expect(harness.onChatCalls).toHaveLength(3);
+  });
+});
+
+describe("ACP wire-level session dispatch", () => {
+  // Regression guard for SDK upgrades: Agent-interface methods are optional in
+  // the SDK, so a missed stabilization rename would typecheck and pass the
+  // direct-call tests above while the wire dispatch silently answers
+  // METHOD_NOT_FOUND. This round-trip pins the JSON-RPC routing itself.
+  it("routes session/list, session/resume, and session/set_config_option", async () => {
+    const workspace = createWorkspaceInfo({
+      id: "ws-wire",
+      projectPath: "/repo/wire",
+      namedWorkspacePath: "/repo/wire/.mux/ws-wire",
+    });
+
+    const wire = createWireHarness({
+      activeWorkspaces: [workspace],
+      onChatEvents: [{ type: "caught-up" } as WorkspaceChatMessage],
+    });
+
+    const initResponse = await wire.client.initialize({
+      protocolVersion: PROTOCOL_VERSION,
+    });
+    expect(initResponse.agentCapabilities?.sessionCapabilities?.list).toEqual({});
+
+    const listResponse = await wire.client.listSessions({ cwd: "/repo/wire" });
+    expect(listResponse.sessions.map((session) => session.sessionId)).toEqual(["ws-wire"]);
+
+    const resumeResponse = await wire.client.resumeSession({
+      sessionId: "ws-wire",
+      cwd: "/repo/wire",
+      mcpServers: [],
+    });
+    expect(resumeResponse?.configOptions?.length).toBeGreaterThan(0);
+
+    // Boolean config values pass SDK schema validation but must surface a
+    // JSON-RPC invalid-params error (not a crash or hang).
+    await expect(
+      wire.client.setSessionConfigOption({
+        sessionId: "ws-wire",
+        configId: "model",
+        type: "boolean",
+        value: true,
+      })
+    ).rejects.toThrow("expects a select value");
+
+    // The connection must survive the rejected request.
+    const listAfterError = await wire.client.listSessions({ cwd: "/repo/wire" });
+    expect(listAfterError.sessions).toHaveLength(1);
   });
 });
