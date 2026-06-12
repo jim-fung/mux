@@ -1381,6 +1381,8 @@ describeIntegration("Runtime integration tests", () => {
         );
         expect(beforeCheck.stdout.trim()).toBe("worktree");
 
+        await execSSH(runtime, `git --git-dir="${baseRepoPath}" symbolic-ref HEAD refs/heads/main`);
+
         // Delete the workspace.
         const deleteResult = await runtime.deleteWorkspace(
           projectPath,
@@ -1400,6 +1402,72 @@ describeIntegration("Runtime integration tests", () => {
         // Verify worktree metadata is cleaned up in the base repo.
         const worktreeList = await execSSH(runtime, `git -C "${baseRepoPath}" worktree list`);
         expect(worktreeList.stdout).not.toContain(workspaceName);
+
+        const deletedBranchRef = await execSSH(
+          runtime,
+          `git --git-dir="${baseRepoPath}" show-ref --verify --quiet refs/heads/${workspaceName}`
+        );
+        expect(deletedBranchRef.exitCode).toBe(1);
+      } finally {
+        await execSSH(runtime, `rm -rf "${layout.projectRoot}"`);
+      }
+    }, 60000);
+
+    test("deleteWorkspace leaves an unmanaged source checkout's HEAD untouched", async () => {
+      const runtime = createSSHRuntime();
+      const projectName = `wt-del-unmanaged-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+      const projectPath = `/some/path/${projectName}`;
+      const layout = getLayout(projectPath);
+      const sourceCheckoutPath = `${layout.projectRoot}/unmanaged-src`;
+      const workspaceName = "doomed-wt";
+      const workspacePath = getRemoteWorkspacePath(layout, workspaceName);
+
+      try {
+        // A real (non-Mux) checkout whose worktree happens to live at the
+        // canonical workspace path. resolveWorktreeBaseRepoPath() resolves the
+        // workspace's git-common-dir to this checkout's .git, so deletion
+        // cleanup must not rewrite the checkout's HEAD.
+        await execSSH(
+          runtime,
+          [
+            `mkdir -p "${sourceCheckoutPath}"`,
+            `cd "${sourceCheckoutPath}"`,
+            `git init -b main`,
+            `git config user.email "test@test.com"`,
+            `git config user.name "Test"`,
+            `echo "x" > x.txt && git add x.txt && git commit -m "init"`,
+            `git worktree add "${workspacePath}" -b ${workspaceName}`,
+          ].join(" && ")
+        );
+
+        const headCommitBefore = await execSSH(
+          runtime,
+          `git -C "${sourceCheckoutPath}" rev-parse HEAD`
+        );
+
+        const deleteResult = await runtime.deleteWorkspace(projectPath, workspaceName, true);
+        expect(deleteResult.success).toBe(true);
+
+        const afterCheck = await execSSH(
+          runtime,
+          `test -d "${workspacePath}" && echo "exists" || echo "missing"`
+        );
+        expect(afterCheck.stdout.trim()).toBe("missing");
+
+        // The source checkout must still be on its own branch with a
+        // resolvable HEAD — not stranded on Mux's unborn internal branch.
+        const headRefAfter = await execSSH(
+          runtime,
+          `git -C "${sourceCheckoutPath}" symbolic-ref HEAD`
+        );
+        expect(headRefAfter.stdout.trim()).toBe("refs/heads/main");
+
+        const headCommitAfter = await execSSH(
+          runtime,
+          `git -C "${sourceCheckoutPath}" rev-parse --verify HEAD`
+        );
+        expect(headCommitAfter.exitCode).toBe(0);
+        expect(headCommitAfter.stdout.trim()).toBe(headCommitBefore.stdout.trim());
       } finally {
         await execSSH(runtime, `rm -rf "${layout.projectRoot}"`);
       }
@@ -1674,6 +1742,13 @@ describeIntegration("Runtime integration tests", () => {
     const createSSHRuntime = (): SSHRuntime =>
       createTestRuntime("ssh", srcBaseDir, sshConfig) as SSHRuntime;
 
+    const createCapturingInitLogger = (steps: string[]) => ({
+      ...noopInitLogger,
+      logStep(step: string) {
+        steps.push(step);
+      },
+    });
+
     test("initWorkspace does not populate refs/remotes/origin in the base repo from the bundle", async () => {
       const runtime = createSSHRuntime();
 
@@ -1762,13 +1837,6 @@ describeIntegration("Runtime integration tests", () => {
       const secondWorkspacePath = getRemoteWorkspacePath(layout, "tags-b");
       const thirdWorkspacePath = getRemoteWorkspacePath(layout, "tags-c");
       const baseRepoPath = layout.baseRepoPath;
-
-      const createCapturingInitLogger = (steps: string[]) => ({
-        ...noopInitLogger,
-        logStep(step: string) {
-          steps.push(step);
-        },
-      });
 
       const { execSync } = await import("child_process");
       try {
@@ -1940,6 +2008,256 @@ describeIntegration("Runtime integration tests", () => {
           `git -C "${workspacePath}" config --get core.bare`
         );
         expect(workspaceCoreBareCheck.exitCode).toBe(1);
+      } finally {
+        execSync(`rm -rf "${localProjectPath}"`);
+        await execSSH(runtime, `rm -rf "${layout.projectRoot}"`);
+      }
+    }, 120000);
+
+    test("initWorkspace strips shared core.worktree from pre-existing base repos before checkout", async () => {
+      const runtime = createSSHRuntime();
+
+      const projectName = `sync-heal-worktree-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+      const tmpDir = await import("os").then((os) => os.tmpdir());
+      const localProjectPath = `${tmpDir}/${projectName}`;
+      const layout = buildRemoteProjectLayout(srcBaseDir, localProjectPath);
+      const branchName = "worktree-heal";
+      const workspacePath = getRemoteWorkspacePath(layout, branchName);
+      const baseRepoPath = layout.baseRepoPath;
+      const bogusWorktreePath = `${layout.projectRoot}/.bogus-worktree`;
+
+      const { execSync } = await import("child_process");
+      try {
+        execSync(
+          [
+            `mkdir -p "${localProjectPath}"`,
+            `cd "${localProjectPath}"`,
+            `git init -b main`,
+            `git config user.email "test@test.com"`,
+            `git config user.name "Test"`,
+            `echo "content" > file.txt`,
+            `git add file.txt`,
+            `git commit -m "initial"`,
+          ].join(" && "),
+          { stdio: "pipe" }
+        );
+
+        await execSSH(
+          runtime,
+          [
+            `mkdir -p "${layout.projectRoot}"`,
+            `git init --bare "${baseRepoPath}"`,
+            `git --git-dir="${baseRepoPath}" config --local core.worktree "${bogusWorktreePath}"`,
+          ].join(" && ")
+        );
+
+        const beforeCheck = await execSSH(
+          runtime,
+          `git --git-dir="${baseRepoPath}" config --get core.worktree`
+        );
+        expect(beforeCheck.stdout.trim()).toBe(bogusWorktreePath);
+
+        const initResult = await runtime.initWorkspace({
+          projectPath: localProjectPath,
+          branchName,
+          trunkBranch: "main",
+          workspacePath,
+          initLogger: noopInitLogger,
+        });
+        if (!initResult.success) {
+          throw new Error(`initWorkspace failed: ${initResult.error}`);
+        }
+
+        const baseRepoCoreWorktreeCheck = await execSSH(
+          runtime,
+          `git --git-dir="${baseRepoPath}" config --get core.worktree`
+        );
+        expect(baseRepoCoreWorktreeCheck.exitCode).toBe(1);
+
+        const insideWorkTreeCheck = await execSSH(
+          runtime,
+          `git -C "${workspacePath}" rev-parse --is-inside-work-tree`
+        );
+        expect(insideWorkTreeCheck.stdout.trim()).toBe("true");
+
+        const workspaceTopLevelCheck = await execSSH(
+          runtime,
+          `git -C "${workspacePath}" rev-parse --show-toplevel`
+        );
+        expect(workspaceTopLevelCheck.stdout.trim()).toBe(workspacePath);
+      } finally {
+        execSync(`rm -rf "${localProjectPath}"`);
+        await execSSH(runtime, `rm -rf "${layout.projectRoot}"`);
+      }
+    }, 120000);
+
+    test("initWorkspace keeps base-repo HEAD detached from user branches", async () => {
+      const runtime = createSSHRuntime();
+
+      const projectName = `sync-neutral-head-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+      const tmpDir = await import("os").then((os) => os.tmpdir());
+      const localProjectPath = `${tmpDir}/${projectName}`;
+      const layout = buildRemoteProjectLayout(srcBaseDir, localProjectPath);
+      const branchName = "neutral-head";
+      const workspacePath = getRemoteWorkspacePath(layout, branchName);
+      const baseRepoPath = layout.baseRepoPath;
+
+      const { execSync } = await import("child_process");
+      try {
+        execSync(
+          [
+            `mkdir -p "${localProjectPath}"`,
+            `cd "${localProjectPath}"`,
+            `git init -b main`,
+            `git config user.email "test@test.com"`,
+            `git config user.name "Test"`,
+            `echo "content" > file.txt`,
+            `git add file.txt`,
+            `git commit -m "initial"`,
+          ].join(" && "),
+          { stdio: "pipe" }
+        );
+
+        const initResult = await runtime.initWorkspace({
+          projectPath: localProjectPath,
+          branchName,
+          trunkBranch: "main",
+          workspacePath,
+          initLogger: noopInitLogger,
+        });
+        if (!initResult.success) {
+          throw new Error(`initWorkspace failed: ${initResult.error}`);
+        }
+
+        const baseHeadSymbolicCheck = await execSSH(
+          runtime,
+          `git --git-dir="${baseRepoPath}" symbolic-ref -q HEAD`
+        );
+        expect(baseHeadSymbolicCheck.exitCode).toBe(1);
+
+        const baseHeadCommit = await execSSH(
+          runtime,
+          `git --git-dir="${baseRepoPath}" rev-parse --verify HEAD`
+        );
+        const workspaceCommit = await execSSH(runtime, `git -C "${workspacePath}" rev-parse HEAD`);
+        expect(baseHeadCommit.stdout.trim()).toBe(workspaceCommit.stdout.trim());
+
+        const baseRepoBareCheck = await execSSH(
+          runtime,
+          `git -C "${baseRepoPath}" rev-parse --is-bare-repository`
+        );
+        expect(baseRepoBareCheck.stdout.trim()).toBe("true");
+
+        const baseWorktreeEntry = await execSSH(
+          runtime,
+          `git -C "${baseRepoPath}" worktree list --porcelain | sed -n '1,/^$/p'`
+        );
+        expect(baseWorktreeEntry.stdout).toContain(`worktree ${baseRepoPath}`);
+        expect(baseWorktreeEntry.stdout).toContain("bare");
+        expect(baseWorktreeEntry.stdout).not.toContain("branch ");
+      } finally {
+        execSync(`rm -rf "${localProjectPath}"`);
+        await execSSH(runtime, `rm -rf "${layout.projectRoot}"`);
+      }
+    }, 120000);
+
+    test("warm fast-path heals poisoned base repo before materializing workspace", async () => {
+      const runtime = createSSHRuntime();
+
+      const projectName = `sync-warm-heal-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+      const tmpDir = await import("os").then((os) => os.tmpdir());
+      const localProjectPath = `${tmpDir}/${projectName}`;
+      const layout = buildRemoteProjectLayout(srcBaseDir, localProjectPath);
+      const firstWorkspacePath = getRemoteWorkspacePath(layout, "warm-heal-a");
+      const secondWorkspacePath = getRemoteWorkspacePath(layout, "warm-heal-b");
+      const baseRepoPath = layout.baseRepoPath;
+      const bogusWorktreePath = `${layout.projectRoot}/.mux-base-worktree`;
+
+      const { execSync } = await import("child_process");
+      try {
+        execSync(
+          [
+            `mkdir -p "${localProjectPath}"`,
+            `cd "${localProjectPath}"`,
+            `git init -b main`,
+            `git config user.email "test@test.com"`,
+            `git config user.name "Test"`,
+            `echo "content" > file.txt`,
+            `git add file.txt`,
+            `git commit -m "initial"`,
+          ].join(" && "),
+          { stdio: "pipe" }
+        );
+
+        const firstInit = await runtime.initWorkspace({
+          projectPath: localProjectPath,
+          branchName: "warm-heal-a",
+          trunkBranch: "main",
+          workspacePath: firstWorkspacePath,
+          initLogger: noopInitLogger,
+        });
+        if (!firstInit.success) {
+          throw new Error(`first initWorkspace failed: ${firstInit.error}`);
+        }
+
+        const poisonResult = await execSSH(
+          runtime,
+          [
+            `git --git-dir="${baseRepoPath}" config --local core.bare true`,
+            `git --git-dir="${baseRepoPath}" config --local core.worktree "${bogusWorktreePath}"`,
+            `git --git-dir="${baseRepoPath}" symbolic-ref HEAD refs/heads/main`,
+          ].join(" && ")
+        );
+        expect(poisonResult.exitCode).toBe(0);
+
+        const reuseSteps: string[] = [];
+        const secondInit = await runtime.initWorkspace({
+          projectPath: localProjectPath,
+          branchName: "warm-heal-b",
+          trunkBranch: "main",
+          workspacePath: secondWorkspacePath,
+          initLogger: createCapturingInitLogger(reuseSteps),
+        });
+        if (!secondInit.success) {
+          throw new Error(`second initWorkspace failed: ${secondInit.error}`);
+        }
+        expect(
+          reuseSteps.some((step) => step.includes("Materialized workspace via warm fast-path"))
+        ).toBe(true);
+
+        const insideWorkTreeCheck = await execSSH(
+          runtime,
+          `git -C "${secondWorkspacePath}" rev-parse --is-inside-work-tree`
+        );
+        expect(insideWorkTreeCheck.stdout.trim()).toBe("true");
+
+        const baseRepoCoreBareCheck = await execSSH(
+          runtime,
+          `git --git-dir="${baseRepoPath}" config --get core.bare`
+        );
+        expect(baseRepoCoreBareCheck.exitCode).toBe(1);
+
+        const baseRepoCoreWorktreeCheck = await execSSH(
+          runtime,
+          `git --git-dir="${baseRepoPath}" config --get core.worktree`
+        );
+        expect(baseRepoCoreWorktreeCheck.exitCode).toBe(1);
+
+        const baseHeadSymbolicCheck = await execSSH(
+          runtime,
+          `git --git-dir="${baseRepoPath}" symbolic-ref -q HEAD`
+        );
+        expect(baseHeadSymbolicCheck.exitCode).toBe(1);
+
+        const baseHeadCommit = await execSSH(
+          runtime,
+          `git --git-dir="${baseRepoPath}" rev-parse --verify HEAD`
+        );
+        const secondWorkspaceCommit = await execSSH(
+          runtime,
+          `git -C "${secondWorkspacePath}" rev-parse HEAD`
+        );
+        expect(baseHeadCommit.stdout.trim()).toBe(secondWorkspaceCommit.stdout.trim());
       } finally {
         execSync(`rm -rf "${localProjectPath}"`);
         await execSSH(runtime, `rm -rf "${layout.projectRoot}"`);
