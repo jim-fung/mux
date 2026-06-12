@@ -34,12 +34,13 @@ import * as os from "os";
 import * as path from "path";
 
 import {
-  chooseSeedMuxRoot,
+  chooseSeedSources,
   copyConfigClearingProjectsIfExists,
   copyFileIfExists,
   forwardSignalsToChildProcesses,
   getFreePort,
   parseOptionalPort,
+  sanitizeSandboxProviderEnv,
 } from "./sandboxUtils";
 
 type SandboxCliFlags = {
@@ -97,7 +98,7 @@ async function main(): Promise<number> {
   // Do any validation that might throw *before* creating the temp root so we
   // don't leave behind stale `mux-dev-server-*` directories for simple mistakes.
   const shouldSeed = !(cleanProviders && cleanProjects);
-  const seedMuxRoot = shouldSeed ? chooseSeedMuxRoot() : null;
+  const seedSources = shouldSeed ? chooseSeedSources() : { providersPath: null, configPath: null };
 
   const backendPortOverride = parseOptionalPort(process.env.BACKEND_PORT);
   const vitePortOverride = parseOptionalPort(process.env.VITE_PORT);
@@ -136,9 +137,8 @@ async function main(): Promise<number> {
   const muxRoot = fs.mkdtempSync(path.join(os.tmpdir(), "mux-dev-server-"));
 
   try {
-    const seedProvidersPath =
-      seedMuxRoot && !cleanProviders ? path.join(seedMuxRoot, "providers.jsonc") : null;
-    const seedConfigPath = seedMuxRoot ? path.join(seedMuxRoot, "config.json") : null;
+    const seedProvidersPath = !cleanProviders ? seedSources.providersPath : null;
+    const seedConfigPath = seedSources.configPath;
 
     const sandboxProvidersPath = path.join(muxRoot, "providers.jsonc");
     const sandboxConfigPath = path.join(muxRoot, "config.json");
@@ -154,13 +154,10 @@ async function main(): Promise<number> {
 
     console.log("\nStarting mux dev-server sandbox...");
     console.log(`  MUX_ROOT:        ${muxRoot}`);
-    if (seedMuxRoot) {
-      console.log(`  Seeded from:     ${seedMuxRoot}`);
-      console.log(`  Copied config:   ${copiedConfig ? "yes" : "no"}`);
-      console.log(`  Copied providers: ${copiedProviders ? "yes" : "no"}`);
-    } else {
-      console.log("  Seeded from:     (none)");
-    }
+    console.log(`  Seed config:     ${copiedConfig && seedConfigPath ? seedConfigPath : "(none)"}`);
+    console.log(
+      `  Seed providers:  ${copiedProviders && seedProvidersPath ? seedProvidersPath : "(none)"}`
+    );
     if (cleanProviders || cleanProjects) {
       console.log(`  Clean providers: ${cleanProviders ? "yes" : "no"}`);
       console.log(`  Clean projects:  ${cleanProjects ? "yes" : "no"}`);
@@ -171,12 +168,20 @@ async function main(): Promise<number> {
       console.log("  KEEP_SANDBOX=1 (temp root will not be deleted)");
     }
 
+    // Guard against provider env-var fallback: strip all provider env vars on
+    // --clean-providers, strip the seeded providers' env vars when a
+    // providers.jsonc was copied, and warn when env fallback would apply.
+    const childEnv = sanitizeSandboxProviderEnv({
+      cleanProviders,
+      seededProvidersPath: copiedProviders ? sandboxProvidersPath : null,
+    });
+
     let child: ReturnType<typeof spawn>;
     try {
       child = spawn(makeCmd, ["dev-server"], {
         stdio: "inherit",
         env: {
-          ...process.env,
+          ...childEnv,
 
           // Allow access via reverse proxies / port-forwarding domains.
           // This sets the Makefile's `VITE_ALLOWED_HOSTS`, which is forwarded to

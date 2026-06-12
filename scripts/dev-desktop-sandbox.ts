@@ -38,12 +38,13 @@ import * as os from "os";
 import * as path from "path";
 
 import {
-  chooseSeedMuxRoot,
+  chooseSeedSources,
   copyConfigClearingProjectsIfExists,
   copyFileIfExists,
   forwardSignalsToChildProcesses,
   getFreePort,
   parseOptionalPort,
+  sanitizeSandboxProviderEnv,
   waitForHttpReady,
 } from "./sandboxUtils";
 
@@ -158,7 +159,7 @@ async function main(): Promise<number> {
   // Do any validation that might throw *before* creating the temp root so we
   // don't leave behind stale `mux-desktop-*` directories for simple mistakes.
   const shouldSeed = !(cleanProviders && cleanProjects);
-  const seedMuxRoot = shouldSeed ? chooseSeedMuxRoot() : null;
+  const seedSources = shouldSeed ? chooseSeedSources() : { providersPath: null, configPath: null };
 
   const vitePortOverride = parseOptionalPort(process.env.VITE_PORT);
   const debugPortConfig = parseElectronDebugPort(process.env.ELECTRON_DEBUG_PORT);
@@ -191,9 +192,8 @@ async function main(): Promise<number> {
   let electronProc: ReturnType<typeof spawn> | null = null;
 
   try {
-    const seedProvidersPath =
-      seedMuxRoot && !cleanProviders ? path.join(seedMuxRoot, "providers.jsonc") : null;
-    const seedConfigPath = seedMuxRoot ? path.join(seedMuxRoot, "config.json") : null;
+    const seedProvidersPath = !cleanProviders ? seedSources.providersPath : null;
+    const seedConfigPath = seedSources.configPath;
 
     const sandboxProvidersPath = path.join(muxRoot, "providers.jsonc");
     const sandboxConfigPath = path.join(muxRoot, "config.json");
@@ -209,13 +209,10 @@ async function main(): Promise<number> {
 
     console.log("\nStarting mux desktop sandbox...");
     console.log(`  MUX_ROOT:        ${muxRoot}`);
-    if (seedMuxRoot) {
-      console.log(`  Seeded from:     ${seedMuxRoot}`);
-      console.log(`  Copied config:   ${copiedConfig ? "yes" : "no"}`);
-      console.log(`  Copied providers: ${copiedProviders ? "yes" : "no"}`);
-    } else {
-      console.log("  Seeded from:     (none)");
-    }
+    console.log(`  Seed config:     ${copiedConfig && seedConfigPath ? seedConfigPath : "(none)"}`);
+    console.log(
+      `  Seed providers:  ${copiedProviders && seedProvidersPath ? seedProvidersPath : "(none)"}`
+    );
     if (cleanProviders || cleanProjects) {
       console.log(`  Clean providers: ${cleanProviders ? "yes" : "no"}`);
       console.log(`  Clean projects:  ${cleanProjects ? "yes" : "no"}`);
@@ -230,10 +227,18 @@ async function main(): Promise<number> {
       console.log("  KEEP_SANDBOX=1 (temp root will not be deleted)");
     }
 
+    // Guard against provider env-var fallback: strip all provider env vars on
+    // --clean-providers, strip the seeded providers' env vars when a
+    // providers.jsonc was copied, and warn when env fallback would apply.
+    const childEnv = sanitizeSandboxProviderEnv({
+      cleanProviders,
+      seededProvidersPath: copiedProviders ? sandboxProvidersPath : null,
+    });
+
     devProc = spawn(makeCmd, ["dev"], {
       stdio: "inherit",
       env: {
-        ...process.env,
+        ...childEnv,
         NODE_ENV: "development",
         MUX_ROOT: muxRoot,
         MUX_VITE_PORT: String(vitePort),
@@ -294,7 +299,7 @@ async function main(): Promise<number> {
     electronProc = spawn("bunx", electronArgs, {
       stdio: "inherit",
       env: {
-        ...process.env,
+        ...childEnv,
         NODE_ENV: "development",
         // Keep sandboxed desktop dev launches profile-ready too; callers can set
         // MUX_PROFILE_REACT=0 to compare against an uninstrumented renderer.

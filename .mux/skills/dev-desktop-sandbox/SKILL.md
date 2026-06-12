@@ -21,6 +21,16 @@ make dev-desktop-sandbox
 - Copies these files into the sandbox if present (unless disabled by flags):
   - `providers.jsonc` (provider config)
   - `config.json` (project list)
+  - Each file is seeded independently from the first root that has it
+    (`$MUX_ROOT`, then `~/.mux-dev`, then `~/.mux`), so a root with only
+    `config.json` doesn't drop provider config
+- Provider credential env vars are stripped from the child processes' env when
+  they could silently override or mismatch the intended setup: all of them with
+  `--clean-providers` (including Bedrock's `AWS_REGION` and
+  `AWS_BEARER_TOKEN_BEDROCK`; shared AWS credentials like `AWS_PROFILE` are
+  kept); otherwise only `*_BASE_URL` env vars that would shadow a seeded
+  `providers.jsonc` entry that has an `apiKey` but no explicit `baseUrl`
+  (API key env vars are always kept so env-key fallback still works)
 - Picks free ports:
   - Vite devserver port (used by the renderer)
   - Electron remote debugging port (optional)
@@ -48,7 +58,7 @@ make dev-desktop-sandbox DEV_DESKTOP_SANDBOX_ARGS="--clean-providers"
 # Clear projects from config.json (preserves other config)
 make dev-desktop-sandbox DEV_DESKTOP_SANDBOX_ARGS="--clean-projects"
 
-# Use a specific root to seed from (defaults to $MUX_ROOT then ~/.mux-dev then ~/.mux)
+# Use a specific root to seed from (default: per-file from $MUX_ROOT, ~/.mux-dev, ~/.mux)
 SEED_MUX_ROOT=~/.mux-dev make dev-desktop-sandbox
 
 # Keep the sandbox root directory after exit (useful for debugging)

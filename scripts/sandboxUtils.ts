@@ -4,6 +4,14 @@ import * as net from "net";
 import * as os from "os";
 import * as path from "path";
 
+import * as jsonc from "jsonc-parser";
+
+import {
+  AZURE_OPENAI_ENV_VARS,
+  BEDROCK_AUTH_ENV_VARS,
+  PROVIDER_ENV_VARS,
+} from "../src/node/utils/providerRequirements";
+
 function dirExists(dirPath: string): boolean {
   try {
     return fs.statSync(dirPath).isDirectory();
@@ -27,35 +35,198 @@ export function expandTilde(input: string): string {
   return input;
 }
 
-export function chooseSeedMuxRoot(): string | null {
+export type SeedSources = {
+  providersPath: string | null;
+  configPath: string | null;
+};
+
+/**
+ * Pick seed files for a sandbox MUX_ROOT.
+ *
+ * providers.jsonc and config.json are chosen *independently* from the first
+ * candidate root that has each file. A root like ~/.mux-dev often has only
+ * config.json while provider credentials live in ~/.mux/providers.jsonc;
+ * picking a single root would silently drop provider config and push the
+ * sandboxed server onto env-var credential fallback, which can pair a real
+ * API key with an unrelated *_BASE_URL proxy (e.g. Coder AI bridge) and fail
+ * auth. See sanitizeSandboxProviderEnv for the env-side guard.
+ */
+export function chooseSeedSources(): SeedSources {
+  const findFirstFile = (roots: string[], fileName: string): string | null => {
+    for (const root of roots) {
+      const candidate = path.join(root, fileName);
+      if (fileExists(candidate)) return candidate;
+    }
+    return null;
+  };
+
   if (process.env.SEED_MUX_ROOT) {
     const explicit = expandTilde(process.env.SEED_MUX_ROOT);
     if (!dirExists(explicit)) {
       throw new Error(`SEED_MUX_ROOT does not exist or is not a directory: ${explicit}`);
     }
-    return explicit;
+    // Explicit seed root: only look there.
+    return {
+      providersPath: findFirstFile([explicit], "providers.jsonc"),
+      configPath: findFirstFile([explicit], "config.json"),
+    };
   }
 
   const candidates = [
     process.env.MUX_ROOT ? expandTilde(process.env.MUX_ROOT) : null,
     path.join(os.homedir(), ".mux-dev"),
     path.join(os.homedir(), ".mux"),
-  ].filter(Boolean) as string[];
+  ].filter((value): value is string => Boolean(value));
 
-  for (const candidate of candidates) {
-    if (!dirExists(candidate)) continue;
+  return {
+    providersPath: findFirstFile(candidates, "providers.jsonc"),
+    configPath: findFirstFile(candidates, "config.json"),
+  };
+}
 
-    const hasProviders = fileExists(path.join(candidate, "providers.jsonc"));
-    const hasConfig = fileExists(path.join(candidate, "config.json"));
+/**
+ * Env vars that mux's provider-credential resolution reads as fallback
+ * (API keys / auth tokens, base URLs, org IDs, Azure OpenAI vars).
+ *
+ * Intentionally excludes Bedrock's region vars (AWS_REGION etc.): those are
+ * shared with unrelated AWS tooling, and Bedrock has no key+baseUrl pairing
+ * mismatch risk. They are stripped only in --clean-providers mode (see
+ * BEDROCK_CLEAN_ENV_VARS).
+ */
+function providerCredentialEnvVarNames(): string[] {
+  const names = new Set<string>();
+  for (const mapping of Object.values(PROVIDER_ENV_VARS)) {
+    for (const key of [
+      ...(mapping.apiKey ?? []),
+      ...(mapping.baseUrl ?? []),
+      ...(mapping.organization ?? []),
+    ]) {
+      names.add(key);
+    }
+  }
+  for (const key of Object.values(AZURE_OPENAI_ENV_VARS)) {
+    names.add(key);
+  }
+  return [...names];
+}
 
-    if (hasProviders || hasConfig) return candidate;
+/**
+ * Extra env vars stripped only with --clean-providers: Bedrock counts as
+ * "configured" from a region env var alone (credentials flow via the AWS SDK
+ * chain), so a truly clean sandbox must drop the region + bedrock bearer
+ * token too. Shared AWS credentials (AWS_PROFILE, AWS_ACCESS_KEY_ID, ...)
+ * are kept so unrelated AWS tooling inside the sandbox keeps working —
+ * without a region, mux reports Bedrock unconfigured regardless.
+ */
+const BEDROCK_CLEAN_ENV_VARS: string[] = [
+  ...(PROVIDER_ENV_VARS.bedrock?.region ?? []),
+  BEDROCK_AUTH_ENV_VARS.bearerToken,
+];
+
+/**
+ * Base-URL env vars shadowed by a seeded providers.jsonc.
+ *
+ * mux resolves apiKey and baseUrl independently (config -> file -> env each),
+ * so the dangerous combination is: the seeded config supplies the key while a
+ * *_BASE_URL env var supplies the URL (e.g. a Coder AI-bridge proxy that the
+ * config key cannot authenticate against). Only that combination is stripped:
+ * - entry has apiKey/apiKeyFile but no baseUrl -> strip that provider's
+ *   base-URL env vars so the key pairs with the provider default.
+ * - entry without a key keeps all env vars (env-key fallback for option-only
+ *   stubs like `{ "openai": { "models": [...] } }` is a supported pattern).
+ * - entry with an explicit baseUrl needs nothing (config wins both axes).
+ */
+function shadowedBaseUrlEnvVarNames(providersJsoncPath: string): string[] {
+  let parsed: unknown;
+  try {
+    parsed = jsonc.parse(fs.readFileSync(providersJsoncPath, "utf-8"));
+  } catch (err) {
+    console.warn(`Failed to read providers.jsonc at ${providersJsoncPath}:`, err);
+    return [];
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return [];
   }
 
-  for (const candidate of candidates) {
-    if (dirExists(candidate)) return candidate;
+  const hasString = (entry: Record<string, unknown>, key: string): boolean => {
+    const value = entry[key];
+    return typeof value === "string" && value.trim() !== "";
+  };
+
+  const names = new Set<string>();
+  for (const [provider, mapping] of Object.entries(PROVIDER_ENV_VARS)) {
+    if (!mapping.baseUrl) continue;
+    const entry = (parsed as Record<string, unknown>)[provider];
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) continue;
+    const record = entry as Record<string, unknown>;
+    const hasKey = hasString(record, "apiKey") || hasString(record, "apiKeyFile");
+    const hasBaseUrl = hasString(record, "baseUrl") || hasString(record, "baseURL");
+    if (hasKey && !hasBaseUrl) {
+      for (const name of mapping.baseUrl) {
+        names.add(name);
+      }
+    }
+  }
+  return [...names];
+}
+
+/**
+ * Build the child env for a sandboxed mux instance, guarding against provider
+ * env-var fallback surprises. mux resolves apiKey and baseUrl *independently*
+ * (config -> file -> env each), so a *_BASE_URL env var pointing at a proxy
+ * (e.g. Coder AI bridge) can get paired with an unrelated API key and fail
+ * auth. Guards:
+ *
+ * - `--clean-providers`: strip all provider credential env vars so the sandbox
+ *   is actually clean (no silent env fallback).
+ * - providers.jsonc seeded: strip only the base-URL env vars that would shadow
+ *   a config-supplied key (see shadowedBaseUrlEnvVarNames). API key env vars
+ *   are always kept so option-only config stubs still resolve env keys.
+ * - providers.jsonc not seeded (none found): keep env vars (env-only setups
+ *   are legitimate) but warn loudly about the fallback + base-URL pairing risk.
+ */
+export function sanitizeSandboxProviderEnv(options: {
+  cleanProviders: boolean;
+  /** Path of the seeded sandbox providers.jsonc, or null when not seeded. */
+  seededProvidersPath: string | null;
+}): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  const presentVars = (names: string[]): string[] =>
+    names.filter((name) => (env[name] ?? "").trim() !== "").sort();
+
+  if (options.cleanProviders) {
+    const present = presentVars([...providerCredentialEnvVarNames(), ...BEDROCK_CLEAN_ENV_VARS]);
+    for (const name of present) {
+      delete env[name];
+    }
+    if (present.length > 0) {
+      console.log(`  Stripped provider env vars (--clean-providers): ${present.join(", ")}`);
+    }
+    return env;
   }
 
-  return null;
+  if (options.seededProvidersPath !== null) {
+    const present = presentVars(shadowedBaseUrlEnvVarNames(options.seededProvidersPath));
+    for (const name of present) {
+      delete env[name];
+    }
+    if (present.length > 0) {
+      console.log(
+        `  Stripped base-URL env vars shadowing seeded providers.jsonc keys: ${present.join(", ")}`
+      );
+    }
+    return env;
+  }
+
+  const present = presentVars(providerCredentialEnvVarNames());
+  if (present.length > 0) {
+    console.warn(
+      `\nWARNING: no providers.jsonc was seeded into the sandbox; the server will fall back to provider env vars: ${present.join(", ")}.\n` +
+        "If a *_BASE_URL env var points at a proxy (e.g. Coder AI bridge), the env API key may not match it and provider auth will fail.\n"
+    );
+  }
+
+  return env;
 }
 
 export function copyConfigClearingProjectsIfExists(sourcePath: string, destPath: string): boolean {
