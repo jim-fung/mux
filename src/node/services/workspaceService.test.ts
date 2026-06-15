@@ -4787,6 +4787,225 @@ describe("WorkspaceService remove timing rollup", () => {
   });
 });
 
+describe("WorkspaceService remove shared-workspace guard", () => {
+  const projectPath = "/tmp/proj-shared";
+  const workspaceId = "child-shared";
+  const sharedPath = path.join(projectPath, "parent-ws");
+  const runtimeConfig = { type: "worktree" as const, srcBaseDir: "/tmp/src" };
+
+  function buildConfig(taskIsolation?: "none" | "fork"): Partial<Config> {
+    return {
+      srcDir: "/tmp/src",
+      getSessionDir: mock((id: string) => path.join(tmpdir(), "mux-shared-guard", id)),
+      removeWorkspace: mock(() => Promise.resolve()),
+      findWorkspace: mock(() => ({ workspacePath: sharedPath, projectPath })),
+      loadConfigOrDefault: mock(() => ({
+        projects: new Map([
+          [
+            projectPath,
+            {
+              trusted: true,
+              workspaces: [
+                {
+                  id: workspaceId,
+                  name: "agent_explore_child",
+                  path: sharedPath,
+                  runtimeConfig,
+                  taskIsolation,
+                },
+              ],
+            },
+          ],
+        ]),
+      })),
+    } as unknown as Partial<Config>;
+  }
+
+  function buildAiService(): AIService {
+    class FakeAIService extends EventEmitter {
+      isStreaming = mock(() => false);
+      stopStream = mock(() => Promise.resolve({ success: true as const, data: undefined }));
+      getWorkspaceMetadata = mock(() =>
+        Promise.resolve({
+          success: true as const,
+          data: {
+            id: workspaceId,
+            name: "agent_explore_child",
+            projectPath,
+            runtimeConfig,
+          },
+        })
+      );
+    }
+    return new FakeAIService() as unknown as AIService;
+  }
+
+  test("does not delete the shared parent checkout for isolation: none tasks", async () => {
+    const deleteWorkspace = mock(() =>
+      Promise.resolve({ success: true as const, deletedPath: sharedPath })
+    );
+    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      deleteWorkspace,
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+    try {
+      const workspaceService = createWorkspaceServiceForTest({
+        config: buildConfig("none"),
+        aiService: buildAiService(),
+      });
+
+      const result = await workspaceService.remove(workspaceId, true);
+      expect(result.success).toBe(true);
+      // The parent's checkout must never be physically deleted on behalf of a shared task.
+      expect(deleteWorkspace).not.toHaveBeenCalled();
+    } finally {
+      createRuntimeSpy.mockRestore();
+    }
+  });
+
+  test("deletes the workspace for normal (forked) tasks", async () => {
+    const deleteWorkspace = mock(() =>
+      Promise.resolve({ success: true as const, deletedPath: sharedPath })
+    );
+    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      deleteWorkspace,
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+    try {
+      const workspaceService = createWorkspaceServiceForTest({
+        config: buildConfig(undefined),
+        aiService: buildAiService(),
+      });
+
+      const result = await workspaceService.remove(workspaceId, true);
+      expect(result.success).toBe(true);
+      expect(deleteWorkspace).toHaveBeenCalledTimes(1);
+    } finally {
+      createRuntimeSpy.mockRestore();
+    }
+  });
+
+  // Inverse direction: removing the PARENT while a live shared child points at its checkout.
+  function buildParentConfig(childTaskStatus: string): Partial<Config> {
+    return {
+      srcDir: "/tmp/src",
+      getSessionDir: mock((id: string) => path.join(tmpdir(), "mux-shared-guard", id)),
+      removeWorkspace: mock(() => Promise.resolve()),
+      findWorkspace: mock(() => ({ workspacePath: sharedPath, projectPath })),
+      loadConfigOrDefault: mock(() => ({
+        projects: new Map([
+          [
+            projectPath,
+            {
+              trusted: true,
+              workspaces: [
+                {
+                  id: "parent-ws-id",
+                  name: "parent-ws",
+                  path: sharedPath,
+                  runtimeConfig,
+                },
+                {
+                  id: workspaceId,
+                  name: "agent_explore_child",
+                  path: sharedPath,
+                  runtimeConfig,
+                  parentWorkspaceId: "parent-ws-id",
+                  taskIsolation: "none",
+                  taskStatus: childTaskStatus,
+                },
+              ],
+            },
+          ],
+        ]),
+      })),
+    } as unknown as Partial<Config>;
+  }
+
+  function buildParentAiService(): AIService {
+    class FakeAIService extends EventEmitter {
+      isStreaming = mock(() => false);
+      stopStream = mock(() => Promise.resolve({ success: true as const, data: undefined }));
+      getWorkspaceMetadata = mock(() =>
+        Promise.resolve({
+          success: true as const,
+          data: {
+            id: "parent-ws-id",
+            name: "parent-ws",
+            projectPath,
+            runtimeConfig,
+          },
+        })
+      );
+    }
+    return new FakeAIService() as unknown as AIService;
+  }
+
+  test("does not delete a parent checkout shared by an active isolation: none child", async () => {
+    const deleteWorkspace = mock(() =>
+      Promise.resolve({ success: true as const, deletedPath: sharedPath })
+    );
+    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      deleteWorkspace,
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+    try {
+      const workspaceService = createWorkspaceServiceForTest({
+        config: buildParentConfig("running"),
+        aiService: buildParentAiService(),
+      });
+
+      const result = await workspaceService.remove("parent-ws-id", true);
+      expect(result.success).toBe(true);
+      // The running shared child still uses this checkout as its cwd.
+      expect(deleteWorkspace).not.toHaveBeenCalled();
+    } finally {
+      createRuntimeSpy.mockRestore();
+    }
+  });
+
+  test("deletes a parent checkout when its shared child is only queued (fails fast at dequeue like forked tasks)", async () => {
+    const deleteWorkspace = mock(() =>
+      Promise.resolve({ success: true as const, deletedPath: sharedPath })
+    );
+    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      deleteWorkspace,
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+    try {
+      const workspaceService = createWorkspaceServiceForTest({
+        config: buildParentConfig("queued"),
+        aiService: buildParentAiService(),
+      });
+
+      const result = await workspaceService.remove("parent-ws-id", true);
+      expect(result.success).toBe(true);
+      // Queued children require the parent config entry to launch regardless of isolation, so
+      // they fail fast at dequeue either way — preserving the checkout would only leak it.
+      expect(deleteWorkspace).toHaveBeenCalledTimes(1);
+    } finally {
+      createRuntimeSpy.mockRestore();
+    }
+  });
+
+  test("deletes a parent checkout when its shared child already reported", async () => {
+    const deleteWorkspace = mock(() =>
+      Promise.resolve({ success: true as const, deletedPath: sharedPath })
+    );
+    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      deleteWorkspace,
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+    try {
+      const workspaceService = createWorkspaceServiceForTest({
+        config: buildParentConfig("reported"),
+        aiService: buildParentAiService(),
+      });
+
+      const result = await workspaceService.remove("parent-ws-id", true);
+      expect(result.success).toBe(true);
+      expect(deleteWorkspace).toHaveBeenCalledTimes(1);
+    } finally {
+      createRuntimeSpy.mockRestore();
+    }
+  });
+});
+
 describe("WorkspaceService remove desktop session cleanup", () => {
   const workspaceId = "ws-remove-desktop";
 

@@ -58,8 +58,9 @@ import {
 import { defaultModel, normalizeToCanonical } from "@/common/utils/ai/models";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
-import type { RuntimeConfig } from "@/common/types/runtime";
-import type { WorkspaceMetadata } from "@/common/types/workspace";
+import { runtimeModeSupportsSharedTaskWorkspace, type RuntimeConfig } from "@/common/types/runtime";
+import type { ProjectRef, WorkspaceMetadata } from "@/common/types/workspace";
+import { getRuntimeType } from "@/node/runtime/initHook";
 import { AgentIdSchema } from "@/common/orpc/schemas";
 import {
   normalizeAgentId,
@@ -84,6 +85,7 @@ import {
   AgentReportSubmittedReportSchema,
   TaskToolResultSchema,
   TaskToolArgsSchema,
+  type TaskIsolation,
 } from "@/common/utils/tools/toolDefinitions";
 import { isPlanLikeInResolvedChain } from "@/common/utils/agentTools";
 import { formatSendMessageError } from "@/node/services/utils/sendMessageError";
@@ -153,6 +155,12 @@ export interface TaskCreateArgs {
    * in resolveTaskAISettings, mirroring the UI's `/model+level` semantics.
    */
   thinkingLevel?: ParsedThinkingInput;
+  /**
+   * Workspace isolation for this task. "none" runs the sub-agent directly in the parent
+   * workspace's checkout (shared working tree, no fork) on runtimes that support it; defaults to
+   * "fork" (isolated copy) when omitted. Ignored (treated as "fork") on unsupported runtimes.
+   */
+  isolation?: TaskIsolation;
   parentRuntimeAiSettings?: { modelString?: string; thinkingLevel?: ThinkingLevel };
   /**
    * Model-refusal policy persisted on the child workspace. "fail" opts the task
@@ -1629,7 +1637,11 @@ export class TaskService {
       return Ok([]);
     }
 
-    const plans: Array<TaskLaunchPlan & { status: "queued" | "starting" }> = [];
+    // sharedWorkspacePath is set for honored isolation: "none" plans; the entry is persisted
+    // pointing at the parent's checkout and startReservedAgentTask reuses it without fork/init.
+    const plans: Array<
+      TaskLaunchPlan & { status: "queued" | "starting"; sharedWorkspacePath?: string }
+    > = [];
     const results: TaskCreateResult[] = [];
 
     await using _lock = await this.mutex.acquire();
@@ -1737,15 +1749,45 @@ export class TaskService {
 
       const parentRuntimeConfig = parentMeta.runtimeConfig;
       const taskRuntimeConfig: RuntimeConfig = parentRuntimeConfig;
+      // Supply the parent's persisted path so override-aware runtimes (worktree/SSH) resolve the
+      // parent's REAL checkout when the parent is itself an isolation: "none" task (see create()).
       const runtime = createRuntimeForWorkspace({
         runtimeConfig: taskRuntimeConfig,
         projectPath: parentMeta.projectPath,
         name: parentMeta.name,
+        namedWorkspacePath: coerceNonEmptyString(parentEntry?.workspace.path),
       });
+      // Prefer the parent's persisted checkout path over the name-derived one: when the parent is
+      // itself an isolation: "none" task, its name is synthetic and the derived path does not
+      // exist — its real checkout is the persisted (shared) path.
       const isInPlace = parentMeta.projectPath === parentMeta.name;
       const parentWorkspacePath = isInPlace
         ? parentMeta.projectPath
-        : runtime.getWorkspacePath(parentMeta.projectPath, parentMeta.name);
+        : (coerceNonEmptyString(parentEntry?.workspace.path) ??
+          runtime.getWorkspacePath(parentMeta.projectPath, parentMeta.name));
+
+      // isolation: "none" — same gating as create(): only worktree/SSH single-project parents
+      // share the parent checkout; everything else falls back to the normal fork path.
+      const taskRuntimeMode = getRuntimeType(taskRuntimeConfig);
+      const parentIsMultiProject = (parentMeta.projects?.length ?? 0) > 1;
+      const useSharedWorkspace =
+        args.isolation === "none" &&
+        runtimeModeSupportsSharedTaskWorkspace(taskRuntimeMode) &&
+        !parentIsMultiProject;
+      const sharedWorkspacePath = useSharedWorkspace ? parentWorkspacePath : undefined;
+      // Branch actually checked out in the parent's checkout (see create() for rationale).
+      const parentIsSharedTask = parentEntry?.workspace.taskIsolation === "none";
+      const parentBranchName = parentIsSharedTask
+        ? (coerceNonEmptyString(parentEntry?.workspace.taskTrunkBranch) ??
+          coerceNonEmptyString(parentMeta.name))
+        : coerceNonEmptyString(parentMeta.name);
+      if (args.isolation === "none" && !useSharedWorkspace) {
+        log.debug("Task.createMany: isolation=none not honored; falling back to fork", {
+          taskId,
+          runtimeMode: taskRuntimeMode,
+          parentIsMultiProject,
+        });
+      }
 
       const getRunnableHint = async (): Promise<string> => {
         try {
@@ -1827,6 +1869,14 @@ export class TaskService {
         experiments: args.experiments,
         onRefusal: args.onRefusal,
         status,
+        ...(sharedWorkspacePath != null ? { sharedWorkspacePath } : {}),
+        // Real branch checked out in the parent's checkout: persisted as taskTrunkBranch and used
+        // by orchestrateFork's create-fallback when the fork cannot detect a source branch
+        // (a shared parent's synthetic name never names a real branch). Gated to shared parents
+        // to keep the existing branch-discovery fallback otherwise.
+        ...(parentIsSharedTask && parentBranchName != null
+          ? { preferredTrunkBranch: parentBranchName }
+          : {}),
       });
       results.push({ taskId, kind: "agent", status });
     }
@@ -1845,11 +1895,12 @@ export class TaskService {
           projectPath: plan.parentMeta.projectPath,
           name: plan.parentMeta.name,
         });
-        const workspacePath = runtime.getWorkspacePath(
-          plan.parentMeta.projectPath,
-          plan.workspaceName
-        );
-        const trunkBranch = coerceNonEmptyString(plan.parentMeta.name);
+        const workspacePath =
+          plan.sharedWorkspacePath ??
+          runtime.getWorkspacePath(plan.parentMeta.projectPath, plan.workspaceName);
+        const trunkBranch =
+          coerceNonEmptyString(plan.preferredTrunkBranch) ??
+          coerceNonEmptyString(plan.parentMeta.name);
         if (!trunkBranch) {
           throw new Error("Task.createMany: parent workspace name missing");
         }
@@ -1881,6 +1932,7 @@ export class TaskService {
           taskThinkingLevel: plan.effectiveThinkingLevel,
           taskOnRefusal: plan.onRefusal,
           taskExperiments: plan.experiments,
+          taskIsolation: plan.sharedWorkspacePath != null ? "none" : undefined,
           projects: plan.parentMeta.projects,
         });
       }
@@ -1906,25 +1958,38 @@ export class TaskService {
     runtime: Runtime,
     projectPath: string,
     workspaceName: string,
-    taskId: string
+    taskId: string,
+    options?: {
+      /**
+       * Skip physical workspace deletion. Required for isolation: "none" tasks whose runtime
+       * resolves this task's name to the shared parent checkout (e.g. SSHRuntime.deleteWorkspace
+       * goes through the persisted-path override) — deleting it would destroy the parent's
+       * working tree. Session/config cleanup still runs.
+       */
+      preservePhysicalWorkspace?: boolean;
+    }
   ): Promise<void> {
     assert(projectPath.length > 0, "cleanupMaterializedTaskWorkspace requires projectPath");
     assert(workspaceName.length > 0, "cleanupMaterializedTaskWorkspace requires workspaceName");
     assert(taskId.length > 0, "cleanupMaterializedTaskWorkspace requires taskId");
 
-    try {
-      const deleteResult = await runtime.deleteWorkspace(projectPath, workspaceName, true);
-      if (!deleteResult.success) {
-        log.error("Task launch cleanup: failed to delete materialized workspace", {
+    if (options?.preservePhysicalWorkspace) {
+      log.debug("Task launch cleanup: preserving shared parent checkout", { taskId });
+    } else {
+      try {
+        const deleteResult = await runtime.deleteWorkspace(projectPath, workspaceName, true);
+        if (!deleteResult.success) {
+          log.error("Task launch cleanup: failed to delete materialized workspace", {
+            taskId,
+            error: deleteResult.error,
+          });
+        }
+      } catch (error: unknown) {
+        log.error("Task launch cleanup: runtime.deleteWorkspace threw", {
           taskId,
-          error: deleteResult.error,
+          error: getErrorMessage(error),
         });
       }
-    } catch (error: unknown) {
-      log.error("Task launch cleanup: runtime.deleteWorkspace threw", {
-        taskId,
-        error: getErrorMessage(error),
-      });
     }
 
     try {
@@ -2103,11 +2168,26 @@ export class TaskService {
       return;
     }
 
+    // isolation: "none" tasks were queued pointing at the parent's checkout. When that checkout
+    // still exists, materialization reuses it (no fork); if it disappeared, materialization falls
+    // back to forking a real workspace and the shared flag must be cleared below.
+    const taskWasShared = entryAtStart.workspace.taskIsolation === "none";
+    const persistedSharedPath = taskWasShared
+      ? coerceNonEmptyString(entryAtStart.workspace.path)
+      : undefined;
+
     const initLogger = this.startWorkspaceInit(plan.taskId, plan.parentMeta.projectPath);
+    // Supply the parent's persisted path so override-aware runtimes (worktree/SSH) fork from the
+    // parent's REAL checkout when the parent is itself an isolation: "none" task (see create()).
+    const parentEntryForLaunch = findWorkspaceEntry(
+      this.config.loadConfigOrDefault(),
+      plan.parentWorkspaceId
+    );
     const runtime = createRuntimeForWorkspace({
       runtimeConfig: plan.taskRuntimeConfig,
       projectPath: plan.parentMeta.projectPath,
       name: plan.parentMeta.name,
+      namedWorkspacePath: coerceNonEmptyString(parentEntryForLaunch?.workspace.path),
     });
 
     let materialized: MaterializedTaskLaunch | null;
@@ -2122,6 +2202,11 @@ export class TaskService {
       return;
     }
 
+    // Reuse of the persisted shared path means the task still runs in the parent's checkout;
+    // any other materialized path means the fork fallback created a real (deletable) workspace.
+    const sharesParentCheckout =
+      taskWasShared && materialized.workspacePath === persistedSharedPath;
+
     const entryAfterMaterialize = findWorkspaceEntry(
       this.config.loadConfigOrDefault(),
       plan.taskId
@@ -2132,7 +2217,8 @@ export class TaskService {
         materialized.runtimeForTaskWorkspace,
         plan.parentMeta.projectPath,
         plan.workspaceName,
-        plan.taskId
+        plan.taskId,
+        { preservePhysicalWorkspace: sharesParentCheckout }
       );
       return;
     }
@@ -2181,6 +2267,11 @@ export class TaskService {
         ws.taskBaseCommitSha = taskBaseCommitSha ?? undefined;
         ws.taskBaseCommitShaByProjectPath = taskBaseCommitShaByProjectPath;
         ws.projects = inheritedProjects;
+        // The shared parent checkout was gone, so this task had to fork a real workspace.
+        // Clear the shared flag so removal cleans up the new worktree.
+        if (taskWasShared && !sharesParentCheckout) {
+          ws.taskIsolation = undefined;
+        }
       },
       { allowMissing: true }
     );
@@ -2193,7 +2284,8 @@ export class TaskService {
         runtimeForTaskWorkspace,
         plan.parentMeta.projectPath,
         plan.workspaceName,
-        plan.taskId
+        plan.taskId,
+        { preservePhysicalWorkspace: sharesParentCheckout }
       );
       return;
     }
@@ -2202,27 +2294,34 @@ export class TaskService {
       return;
     }
 
-    const secrets = await secretsToRecord(
-      this.config.getEffectiveSecrets(plan.parentMeta.projectPath),
-      this.opResolver
-    );
-    runBackgroundInit(
-      runtimeForTaskWorkspace,
-      {
-        projectPath: plan.parentMeta.projectPath,
-        branchName: plan.workspaceName,
-        trunkBranch,
-        workspacePath,
-        initLogger,
-        env: secrets,
-        skipInitHook: plan.skipInitHook,
-        trusted:
-          this.config
-            .loadConfigOrDefault()
-            .projects.get(stripTrailingSlashes(plan.parentMeta.projectPath))?.trusted ?? false,
-      },
-      plan.taskId
-    );
+    if (sharesParentCheckout) {
+      // The parent's checkout is already initialized and live; re-running init would redundantly
+      // (and possibly disruptively) mutate it. Skip init entirely.
+      initLogger.logStep("Sharing parent workspace (isolation: none) — skipping fork and init");
+      initLogger.logComplete(0);
+    } else {
+      const secrets = await secretsToRecord(
+        this.config.getEffectiveSecrets(plan.parentMeta.projectPath),
+        this.opResolver
+      );
+      runBackgroundInit(
+        runtimeForTaskWorkspace,
+        {
+          projectPath: plan.parentMeta.projectPath,
+          branchName: plan.workspaceName,
+          trunkBranch,
+          workspacePath,
+          initLogger,
+          env: secrets,
+          skipInitHook: plan.skipInitHook,
+          trusted:
+            this.config
+              .loadConfigOrDefault()
+              .projects.get(stripTrailingSlashes(plan.parentMeta.projectPath))?.trusted ?? false,
+        },
+        plan.taskId
+      );
+    }
 
     const startOptions = {
       model: plan.taskModelString,
@@ -2249,7 +2348,8 @@ export class TaskService {
         runtimeForTaskWorkspace,
         plan.parentMeta.projectPath,
         plan.workspaceName,
-        plan.taskId
+        plan.taskId,
+        { preservePhysicalWorkspace: sharesParentCheckout }
       );
       throw new Error(message);
     }
@@ -2385,17 +2485,52 @@ export class TaskService {
     const parentRuntimeConfig = parentMeta.runtimeConfig;
     const taskRuntimeConfig: RuntimeConfig = parentRuntimeConfig;
 
+    // Supply the parent's persisted path so override-aware runtimes (worktree/SSH) resolve the
+    // parent's REAL checkout — critical when the parent is itself an isolation: "none" task whose
+    // synthetic name has no derived checkout (agent discovery + fork source both depend on it).
     const runtime = createRuntimeForWorkspace({
       runtimeConfig: taskRuntimeConfig,
       projectPath: parentMeta.projectPath,
       name: parentMeta.name,
+      namedWorkspacePath: coerceNonEmptyString(parentEntry?.workspace.path),
     });
 
     // Validate the agent definition exists and is runnable as a sub-agent.
+    // Prefer the parent's persisted checkout path over the name-derived one: when the parent is
+    // itself an isolation: "none" task, its name is synthetic and the derived path does not exist —
+    // its real checkout is the persisted (shared) path. Persisted paths are canonical elsewhere too
+    // (see runtimeHelpers.resolveWorkspaceRootPath).
     const isInPlace = parentMeta.projectPath === parentMeta.name;
     const parentWorkspacePath = isInPlace
       ? parentMeta.projectPath
-      : runtime.getWorkspacePath(parentMeta.projectPath, parentMeta.name);
+      : (coerceNonEmptyString(parentEntry?.workspace.path) ??
+        runtime.getWorkspacePath(parentMeta.projectPath, parentMeta.name));
+
+    // isolation: "none" — run the sub-agent directly in the parent workspace's checkout instead of
+    // forking a new one. Only honored on runtimes where the fork creates a separate checkout we can
+    // safely bypass (worktree/SSH) and for single-project parents; otherwise fall back to forking.
+    const taskRuntimeMode = getRuntimeType(taskRuntimeConfig);
+    const parentIsMultiProject = (parentMeta.projects?.length ?? 0) > 1;
+    const useSharedWorkspace =
+      args.isolation === "none" &&
+      runtimeModeSupportsSharedTaskWorkspace(taskRuntimeMode) &&
+      !parentIsMultiProject;
+    // The branch actually checked out in the parent's checkout. When the parent is itself an
+    // isolation: "none" task, parentMeta.name is a synthetic agent workspace name with no real
+    // branch — the shared checkout sits on the parent's own persisted taskTrunkBranch. Persisting
+    // the real branch keeps dequeue fork-fallbacks (preferredTrunkBranch) on an existing base.
+    const parentIsSharedTask = parentEntry?.workspace.taskIsolation === "none";
+    const parentBranchName = parentIsSharedTask
+      ? (coerceNonEmptyString(parentEntry?.workspace.taskTrunkBranch) ??
+        coerceNonEmptyString(parentMeta.name))
+      : coerceNonEmptyString(parentMeta.name);
+    if (args.isolation === "none" && !useSharedWorkspace) {
+      log.debug("Task.create: isolation=none not honored; falling back to fork", {
+        taskId,
+        runtimeMode: taskRuntimeMode,
+        parentIsMultiProject,
+      });
+    }
 
     // Helper to build error hint with all available runnable agents.
     // NOTE: This resolves frontmatter inheritance so same-name overrides (e.g. project exec.md
@@ -2485,7 +2620,7 @@ export class TaskService {
     });
 
     if (shouldQueue) {
-      const trunkBranch = coerceNonEmptyString(parentMeta.name);
+      const trunkBranch = parentBranchName;
       if (!trunkBranch) {
         return Err("Task.create: parent workspace name missing (cannot queue task)");
       }
@@ -2493,7 +2628,11 @@ export class TaskService {
       // NOTE: Queued tasks are persisted immediately, but their workspace is created later
       // when a parallel slot is available. This ensures queued tasks don't create worktrees
       // or run init hooks until they actually start.
-      const workspacePath = runtime.getWorkspacePath(parentMeta.projectPath, workspaceName);
+      // Shared-workspace (isolation: "none") tasks point at the parent's existing checkout, so the
+      // dequeue path sees the directory already exists and skips fork + init.
+      const workspacePath = useSharedWorkspace
+        ? parentWorkspacePath
+        : runtime.getWorkspacePath(parentMeta.projectPath, workspaceName);
 
       taskQueueDebug("TaskService.create queued (persist-only)", {
         taskId,
@@ -2530,6 +2669,7 @@ export class TaskService {
           taskThinkingLevel: effectiveThinkingLevel,
           taskOnRefusal: args.onRefusal,
           taskExperiments: args.experiments,
+          taskIsolation: useSharedWorkspace ? "none" : undefined,
           projects: parentMeta.projects,
         });
         return config;
@@ -2554,49 +2694,88 @@ export class TaskService {
 
     const initLogger = this.startWorkspaceInit(taskId, parentMeta.projectPath);
 
-    // Note: Local project-dir runtimes share the same directory (unsafe by design).
-    // For worktree/ssh runtimes we attempt a fork first; otherwise fall back to createWorkspace.
+    let workspacePath: string;
+    let trunkBranch: string;
+    let forkedRuntimeConfig: RuntimeConfig;
+    let runtimeForTaskWorkspace: Runtime;
+    let forkedFromSource: boolean;
+    let inheritedProjects: ProjectRef[] | undefined;
 
-    const forkResult = await orchestrateFork({
-      sourceRuntime: runtime,
-      projectPath: parentMeta.projectPath,
-      sourceWorkspaceName: parentMeta.name,
-      newWorkspaceName: workspaceName,
-      initLogger,
-      config: this.config,
-      sourceWorkspaceId: parentWorkspaceId,
-      sourceRuntimeConfig: parentRuntimeConfig,
-      parentMetadata: parentMeta,
-      allowCreateFallback: true,
-      trusted:
-        this.config.loadConfigOrDefault().projects.get(stripTrailingSlashes(parentMeta.projectPath))
-          ?.trusted ?? false,
-      multiProjectExperimentEnabled: this.workspaceService.isExperimentEnabled(
-        EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES
-      ),
-    });
-
-    if (forkResult.success && forkResult.data.sourceRuntimeConfigUpdate) {
-      await this.config.updateWorkspaceMetadata(parentWorkspaceId, {
-        runtimeConfig: forkResult.data.sourceRuntimeConfigUpdate,
+    if (useSharedWorkspace) {
+      // isolation: "none" — run the sub-agent directly in the parent workspace's checkout instead
+      // of forking. Mirrors local-runtime semantics for worktree/SSH so read-only analysis (or
+      // prompt-isolated work) skips the fork + init overhead and sees the parent's uncommitted work.
+      //
+      // SAFETY: the task still gets a unique workspace name, and workspace deletion is keyed on that
+      // name (runtime.deleteWorkspace(projectPath, name)), so removing this task never deletes the
+      // shared parent checkout. workspaceService.remove additionally skips physical deletion for
+      // tasks persisted with taskIsolation === "none".
+      workspacePath = parentWorkspacePath;
+      trunkBranch = parentBranchName ?? "main";
+      forkedRuntimeConfig = parentRuntimeConfig;
+      forkedFromSource = false;
+      inheritedProjects = parentMeta.projects;
+      // Build the runtime with the child's identity but the parent's checkout path. Worktree/SSH
+      // runtimes honor this persisted path override (see *Runtime.getWorkspacePath), so cwd
+      // resolution and ensureReady land in the shared parent checkout instead of a name-derived
+      // directory that was never created. This mirrors the runtime rebuilt from the persisted entry.
+      runtimeForTaskWorkspace = createRuntimeForWorkspace({
+        runtimeConfig: parentRuntimeConfig,
+        projectPath: parentMeta.projectPath,
+        name: workspaceName,
+        namedWorkspacePath: parentWorkspacePath,
       });
-      // Ensure UI gets the updated runtimeConfig for the parent workspace.
-      await this.emitWorkspaceMetadata(parentWorkspaceId);
-    }
+      initLogger.logStep("Sharing parent workspace (isolation: none) — skipping fork and init");
+      initLogger.logComplete(0);
+    } else {
+      // Note: Local project-dir runtimes share the same directory (unsafe by design).
+      // For worktree/ssh runtimes we attempt a fork first; otherwise fall back to createWorkspace.
+      const forkResult = await orchestrateFork({
+        sourceRuntime: runtime,
+        projectPath: parentMeta.projectPath,
+        sourceWorkspaceName: parentMeta.name,
+        newWorkspaceName: workspaceName,
+        initLogger,
+        config: this.config,
+        sourceWorkspaceId: parentWorkspaceId,
+        sourceRuntimeConfig: parentRuntimeConfig,
+        parentMetadata: parentMeta,
+        allowCreateFallback: true,
+        // Create-fallback base when the fork cannot detect a source branch — a shared parent's
+        // synthetic name never names a real branch, so supply the actual checked-out branch.
+        // Gated to shared parents to keep the existing branch-discovery fallback otherwise.
+        ...(parentIsSharedTask && parentBranchName != null
+          ? { preferredTrunkBranch: parentBranchName }
+          : {}),
+        trusted:
+          this.config
+            .loadConfigOrDefault()
+            .projects.get(stripTrailingSlashes(parentMeta.projectPath))?.trusted ?? false,
+        multiProjectExperimentEnabled: this.workspaceService.isExperimentEnabled(
+          EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES
+        ),
+      });
 
-    if (!forkResult.success) {
-      initLogger.logComplete(-1);
-      return Err(`Task fork failed: ${forkResult.error}`);
-    }
+      if (forkResult.success && forkResult.data.sourceRuntimeConfigUpdate) {
+        await this.config.updateWorkspaceMetadata(parentWorkspaceId, {
+          runtimeConfig: forkResult.data.sourceRuntimeConfigUpdate,
+        });
+        // Ensure UI gets the updated runtimeConfig for the parent workspace.
+        await this.emitWorkspaceMetadata(parentWorkspaceId);
+      }
 
-    const {
-      workspacePath,
-      trunkBranch,
-      forkedRuntimeConfig,
-      targetRuntime: runtimeForTaskWorkspace,
-      forkedFromSource,
-      projects: inheritedProjects,
-    } = forkResult.data;
+      if (!forkResult.success) {
+        initLogger.logComplete(-1);
+        return Err(`Task fork failed: ${forkResult.error}`);
+      }
+
+      workspacePath = forkResult.data.workspacePath;
+      trunkBranch = forkResult.data.trunkBranch;
+      forkedRuntimeConfig = forkResult.data.forkedRuntimeConfig;
+      runtimeForTaskWorkspace = forkResult.data.targetRuntime;
+      forkedFromSource = forkResult.data.forkedFromSource;
+      inheritedProjects = forkResult.data.projects;
+    }
 
     // Multi-project forks need per-project secrets for each runtime's init hook.
     this.configureMultiProjectRuntimeEnvResolver(runtimeForTaskWorkspace);
@@ -2650,6 +2829,7 @@ export class TaskService {
         taskThinkingLevel: effectiveThinkingLevel,
         taskOnRefusal: args.onRefusal,
         taskExperiments: args.experiments,
+        taskIsolation: useSharedWorkspace ? "none" : undefined,
         projects: inheritedProjects,
       });
       return config;
@@ -2658,28 +2838,32 @@ export class TaskService {
     // Emit metadata update so the UI sees the workspace immediately.
     await this.emitWorkspaceMetadata(taskId);
 
-    // Kick init (best-effort, async).
-    const secrets = await secretsToRecord(
-      this.config.getEffectiveSecrets(parentMeta.projectPath),
-      this.opResolver
-    );
-    runBackgroundInit(
-      runtimeForTaskWorkspace,
-      {
-        projectPath: parentMeta.projectPath,
-        branchName: workspaceName,
-        trunkBranch,
-        workspacePath,
-        initLogger,
-        env: secrets,
-        skipInitHook,
-        trusted:
-          this.config
-            .loadConfigOrDefault()
-            .projects.get(stripTrailingSlashes(parentMeta.projectPath))?.trusted ?? false,
-      },
-      taskId
-    );
+    // Kick init (best-effort, async). Shared-workspace (isolation: "none") tasks reuse the parent's
+    // already-initialized checkout, so re-running init would redundantly (and possibly disruptively)
+    // mutate the live parent workspace — skip it entirely.
+    if (!useSharedWorkspace) {
+      const secrets = await secretsToRecord(
+        this.config.getEffectiveSecrets(parentMeta.projectPath),
+        this.opResolver
+      );
+      runBackgroundInit(
+        runtimeForTaskWorkspace,
+        {
+          projectPath: parentMeta.projectPath,
+          branchName: workspaceName,
+          trunkBranch,
+          workspacePath,
+          initLogger,
+          env: secrets,
+          skipInitHook,
+          trusted:
+            this.config
+              .loadConfigOrDefault()
+              .projects.get(stripTrailingSlashes(parentMeta.projectPath))?.trusted ?? false,
+        },
+        taskId
+      );
+    }
 
     // Start immediately (counts towards parallel limit).
     const sendResult = await this.workspaceService.sendMessage(
@@ -2702,7 +2886,8 @@ export class TaskService {
         runtimeForTaskWorkspace,
         parentMeta.projectPath,
         workspaceName,
-        taskId
+        taskId,
+        { preservePhysicalWorkspace: useSharedWorkspace }
       );
       return Err(message);
     }
@@ -2987,7 +3172,16 @@ export class TaskService {
     runtime: Runtime,
     projectPath: string,
     workspaceName: string,
-    taskId: string
+    taskId: string,
+    options?: {
+      /**
+       * Skip physical workspace deletion. Required for isolation: "none" tasks whose runtime
+       * resolves this task's name to the shared parent checkout (e.g. SSHRuntime.deleteWorkspace
+       * goes through the persisted-path override) — deleting it would destroy the parent's
+       * working tree. Session/config cleanup still runs.
+       */
+      preservePhysicalWorkspace?: boolean;
+    }
   ): Promise<void> {
     try {
       await this.config.removeWorkspace(taskId);
@@ -3000,19 +3194,23 @@ export class TaskService {
 
     this.workspaceService.emit("metadata", { workspaceId: taskId, metadata: null });
 
-    try {
-      const deleteResult = await runtime.deleteWorkspace(projectPath, workspaceName, true);
-      if (!deleteResult.success) {
-        log.error("Task.create rollback: failed to delete workspace", {
+    if (options?.preservePhysicalWorkspace) {
+      log.debug("Task.create rollback: preserving shared parent checkout", { taskId });
+    } else {
+      try {
+        const deleteResult = await runtime.deleteWorkspace(projectPath, workspaceName, true);
+        if (!deleteResult.success) {
+          log.error("Task.create rollback: failed to delete workspace", {
+            taskId,
+            error: deleteResult.error,
+          });
+        }
+      } catch (error: unknown) {
+        log.error("Task.create rollback: runtime.deleteWorkspace threw", {
           taskId,
-          error: deleteResult.error,
+          error: getErrorMessage(error),
         });
       }
-    } catch (error: unknown) {
-      log.error("Task.create rollback: runtime.deleteWorkspace threw", {
-        taskId,
-        error: getErrorMessage(error),
-      });
     }
 
     try {

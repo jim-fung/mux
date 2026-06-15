@@ -1258,6 +1258,336 @@ describe("TaskService", () => {
     }
   }, 20_000);
 
+  test("isolation: none shares the parent worktree without forking or re-initializing", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = await createTestProject(rootDir);
+
+    const runtimeConfig = { type: "worktree" as const, srcBaseDir: config.srcDir };
+    const runtime = createRuntime(runtimeConfig, { projectPath });
+    const initLogger = createNullInitLogger();
+
+    const parentName = "parent";
+    await runtime.createWorkspace({
+      projectPath,
+      branchName: parentName,
+      trunkBranch: "main",
+      directoryName: parentName,
+      initLogger,
+    });
+    const parentPath = runtime.getWorkspacePath(projectPath, parentName);
+
+    const parentId = "1111111111";
+    const childTaskId = "2222222222";
+    stubStableIds(config, [childTaskId]);
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        {
+          path: parentPath,
+          id: parentId,
+          name: parentName,
+          createdAt: new Date().toISOString(),
+          runtimeConfig,
+        },
+      ],
+      testTaskSettings()
+    );
+
+    // orchestrateFork must NOT be called for isolation: "none"; runBackgroundInit is stubbed only
+    // so a stray call would be observable (it should not be invoked either).
+    const forkSpy = spyOn(forkOrchestrator, "orchestrateFork");
+    const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(
+      () => undefined
+    );
+    try {
+      const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+      const result = await createAgentTask(taskService, parentId, "read-only analysis", {
+        isolation: "none",
+      });
+
+      expect(result.success).toBe(true);
+      assert(result.success, "Expected shared-workspace task to be created");
+      expect(result.data.status).toBe("running");
+      expect(result.data.taskId).toBe(childTaskId);
+
+      // No fork and no init: the sub-agent reuses the parent's live checkout.
+      expect(forkSpy).not.toHaveBeenCalled();
+      expect(runBackgroundInitSpy).not.toHaveBeenCalled();
+
+      // The persisted child entry points at the parent's checkout and is flagged shared.
+      const childEntry = findWorkspaceInConfig(config, childTaskId);
+      assert(childEntry, "Expected child task workspace to be persisted");
+      expect(childEntry.path).toBe(parentPath);
+      expect(childEntry.taskIsolation).toBe("none");
+      expect(childEntry.runtimeConfig?.type).toBe("worktree");
+
+      expect(sendMessage).toHaveBeenCalledWith(
+        childTaskId,
+        "read-only analysis",
+        expect.anything(),
+        expect.objectContaining({ agentInitiated: true })
+      );
+    } finally {
+      runBackgroundInitSpy.mockRestore();
+      forkSpy.mockRestore();
+    }
+  }, 20_000);
+
+  test("dequeued isolation: none task reuses the parent checkout without forking or init", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = await createTestProject(rootDir);
+
+    const runtimeConfig = { type: "worktree" as const, srcBaseDir: config.srcDir };
+    const runtime = createRuntime(runtimeConfig, { projectPath });
+    const initLogger = createNullInitLogger();
+
+    const parentName = "parent";
+    await runtime.createWorkspace({
+      projectPath,
+      branchName: parentName,
+      trunkBranch: "main",
+      directoryName: parentName,
+      initLogger,
+    });
+    const parentPath = runtime.getWorkspacePath(projectPath, parentName);
+
+    const parentId = "1111111111";
+    const queuedTaskId = "task-shared-queued";
+    const queuedWorkspaceName = "agent_explore_task-shared-queued";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        {
+          path: parentPath,
+          id: parentId,
+          name: parentName,
+          createdAt: new Date().toISOString(),
+          runtimeConfig,
+        },
+        {
+          // Shared queued tasks persist the parent's checkout path (see TaskService.create).
+          path: parentPath,
+          id: queuedTaskId,
+          name: queuedWorkspaceName,
+          title: "Shared queued task",
+          createdAt: new Date().toISOString(),
+          runtimeConfig,
+          parentWorkspaceId: parentId,
+          agentId: "explore",
+          agentType: "explore",
+          taskStatus: "queued",
+          taskPrompt: "queued shared analysis",
+          taskModelString: defaultModel,
+          taskTrunkBranch: parentName,
+          taskIsolation: "none",
+        },
+      ],
+      testTaskSettings()
+    );
+
+    const forkSpy = spyOn(forkOrchestrator, "orchestrateFork");
+    const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(
+      () => undefined
+    );
+    try {
+      const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+      await taskService.initialize();
+      await waitForWorkspaceTaskStatus(config, queuedTaskId, "running");
+
+      // Dequeue must reuse the existing shared checkout: no fork, no init.
+      expect(forkSpy).not.toHaveBeenCalled();
+      expect(runBackgroundInitSpy).not.toHaveBeenCalled();
+
+      const entry = findWorkspaceInConfig(config, queuedTaskId);
+      assert(entry, "Expected queued shared task to remain persisted");
+      expect(entry.path).toBe(parentPath);
+      expect(entry.taskIsolation).toBe("none");
+
+      expect(sendMessage).toHaveBeenCalledWith(
+        queuedTaskId,
+        "queued shared analysis",
+        expect.anything(),
+        expect.objectContaining({ agentInitiated: true })
+      );
+    } finally {
+      runBackgroundInitSpy.mockRestore();
+      forkSpy.mockRestore();
+    }
+  }, 20_000);
+
+  test("nested isolation: none task inherits the shared parent's real branch and checkout", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = await createTestProject(rootDir);
+
+    const runtimeConfig = { type: "worktree" as const, srcBaseDir: config.srcDir };
+    const runtime = createRuntime(runtimeConfig, { projectPath });
+    const initLogger = createNullInitLogger();
+
+    const grandparentName = "parent";
+    await runtime.createWorkspace({
+      projectPath,
+      branchName: grandparentName,
+      trunkBranch: "main",
+      directoryName: grandparentName,
+      initLogger,
+    });
+    const checkoutPath = runtime.getWorkspacePath(projectPath, grandparentName);
+
+    const grandparentId = "1111111111";
+    const sharedParentId = "2222222222";
+    const nestedChildId = "4444444444";
+    stubStableIds(config, [nestedChildId]);
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        {
+          path: checkoutPath,
+          id: grandparentId,
+          name: grandparentName,
+          createdAt: new Date().toISOString(),
+          runtimeConfig,
+        },
+        {
+          // The parent is itself a shared task: synthetic name, path = grandparent's checkout,
+          // and taskTrunkBranch names the real branch checked out there.
+          path: checkoutPath,
+          id: sharedParentId,
+          name: "agent_explore_shared-parent",
+          createdAt: new Date().toISOString(),
+          runtimeConfig,
+          parentWorkspaceId: grandparentId,
+          agentId: "explore",
+          agentType: "explore",
+          taskStatus: "running",
+          taskModelString: defaultModel,
+          taskTrunkBranch: grandparentName,
+          taskIsolation: "none",
+        },
+      ],
+      testTaskSettings()
+    );
+
+    const forkSpy = spyOn(forkOrchestrator, "orchestrateFork");
+    const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(
+      () => undefined
+    );
+    try {
+      const { workspaceService } = createWorkspaceServiceMocks();
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+      const result = await createAgentTask(taskService, sharedParentId, "nested analysis", {
+        isolation: "none",
+      });
+
+      expect(result.success).toBe(true);
+      assert(result.success, "Expected nested shared task to be created");
+      expect(forkSpy).not.toHaveBeenCalled();
+
+      const childEntry = findWorkspaceInConfig(config, nestedChildId);
+      assert(childEntry, "Expected nested shared task to be persisted");
+      // Path resolves through the parent's persisted (shared) checkout, not its synthetic name.
+      expect(childEntry.path).toBe(checkoutPath);
+      // The persisted trunk branch is the REAL branch in the shared checkout (the grandparent's),
+      // not the parent's synthetic agent workspace name — fork fallbacks depend on it existing.
+      expect(childEntry.taskTrunkBranch).toBe(grandparentName);
+      expect(childEntry.taskIsolation).toBe("none");
+    } finally {
+      runBackgroundInitSpy.mockRestore();
+      forkSpy.mockRestore();
+    }
+  }, 20_000);
+
+  test("createMany honors isolation: none by reusing the parent checkout", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = await createTestProject(rootDir);
+
+    const runtimeConfig = { type: "worktree" as const, srcBaseDir: config.srcDir };
+    const runtime = createRuntime(runtimeConfig, { projectPath });
+    const initLogger = createNullInitLogger();
+
+    const parentName = "parent";
+    await runtime.createWorkspace({
+      projectPath,
+      branchName: parentName,
+      trunkBranch: "main",
+      directoryName: parentName,
+      initLogger,
+    });
+    const parentPath = runtime.getWorkspacePath(projectPath, parentName);
+
+    const parentId = "1111111111";
+    const childTaskId = "3333333333";
+    stubStableIds(config, [childTaskId]);
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        {
+          path: parentPath,
+          id: parentId,
+          name: parentName,
+          createdAt: new Date().toISOString(),
+          runtimeConfig,
+        },
+      ],
+      testTaskSettings()
+    );
+
+    const forkSpy = spyOn(forkOrchestrator, "orchestrateFork");
+    const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(
+      () => undefined
+    );
+    try {
+      const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+      const result = await taskService.createMany([
+        {
+          parentWorkspaceId: parentId,
+          kind: "agent" as const,
+          agentId: "explore",
+          prompt: "batched shared analysis",
+          title: "Batched shared task",
+          isolation: "none" as const,
+        },
+      ]);
+
+      expect(result.success).toBe(true);
+      assert(result.success, "Expected createMany to succeed");
+      expect(result.data[0]?.status).toBe("starting");
+
+      // The reserved entry must point at the parent's checkout and carry the shared flag so
+      // the reservation launch path reuses it (no fork, no init) and removal preserves it.
+      const entry = findWorkspaceInConfig(config, childTaskId);
+      assert(entry, "Expected batched shared task to be persisted");
+      expect(entry.path).toBe(parentPath);
+      expect(entry.taskIsolation).toBe("none");
+
+      await waitForWorkspaceTaskStatus(config, childTaskId, "running");
+      expect(forkSpy).not.toHaveBeenCalled();
+      expect(runBackgroundInitSpy).not.toHaveBeenCalled();
+      expect(sendMessage).toHaveBeenCalledWith(
+        childTaskId,
+        "batched shared analysis",
+        expect.anything(),
+        expect.objectContaining({ agentInitiated: true })
+      );
+    } finally {
+      runBackgroundInitSpy.mockRestore();
+      forkSpy.mockRestore();
+    }
+  }, 20_000);
+
   test("interrupts queued tasks when the primary project loses trust before dequeue", async () => {
     const config = await createTestConfig(rootDir);
 
