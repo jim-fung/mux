@@ -10,7 +10,7 @@ import { useWorkspaceFallbackModel } from "@/browser/hooks/useWorkspaceFallbackM
 import { useWorkspaceUnread } from "@/browser/hooks/useWorkspaceUnread";
 import { useRuntimeStatus } from "@/browser/stores/RuntimeStatusStore";
 import { useWorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
-import { stopKeyboardPropagation } from "@/browser/utils/events";
+import { isEventFromDialogPortal, stopKeyboardPropagation } from "@/browser/utils/events";
 import {
   isRunningOrStartingTaskStatus,
   type AgentRowRenderMeta,
@@ -755,13 +755,14 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
           isSelected && !isDisabled && "bg-surface-secondary"
         )}
         style={{ paddingLeft }}
-        onClick={() => {
+        onClick={(event) => {
           if (isDisabled) return;
+          if (isEventFromDialogPortal(event.target)) return;
           if (ctxMenu.suppressClickIfLongPress()) return;
           onSelectWorkspace(workspaceSelection);
         }}
         onDoubleClick={(event) => {
-          if (isDisabled || isEditing) {
+          if (isDisabled || isEditing || isEventFromDialogPortal(event.target)) {
             return;
           }
           const doubleClickTarget =
@@ -776,7 +777,18 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
           startEditing();
           event.stopPropagation();
         }}
-        {...ctxMenu.touchHandlers}
+        onTouchStart={(event) => {
+          if (isEventFromDialogPortal(event.target)) return;
+          ctxMenu.touchHandlers.onTouchStart(event);
+        }}
+        onTouchMove={(event) => {
+          if (isEventFromDialogPortal(event.target)) return;
+          ctxMenu.touchHandlers.onTouchMove(event);
+        }}
+        onTouchEnd={(event) => {
+          if (isEventFromDialogPortal(event.target)) return;
+          ctxMenu.touchHandlers.onTouchEnd();
+        }}
         onKeyDown={(e) => {
           if (isDisabled || isEditing) return;
           // Only treat these shortcuts as row-level controls when the row itself is
@@ -805,7 +817,10 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
             onSelectWorkspace(workspaceSelection);
           }
         }}
-        onContextMenu={ctxMenu.onContextMenu}
+        onContextMenu={(event) => {
+          if (isEventFromDialogPortal(event.target)) return;
+          ctxMenu.onContextMenu(event);
+        }}
         role="button"
         tabIndex={isDisabled ? -1 : 0}
         aria-current={isSelected ? "true" : undefined}
