@@ -463,6 +463,9 @@ function hasIncompleteToolCallPart(parts: CompletedMessagePart[]): boolean {
   return parts.some((part) => part.type === "dynamic-tool" && part.state !== "output-available");
 }
 
+type DynamicToolCompletedMessagePart = Extract<CompletedMessagePart, { type: "dynamic-tool" }>;
+type WorkflowRunToolAttachment = NonNullable<DynamicToolCompletedMessagePart["workflowRun"]>;
+
 // Comprehensive stream info
 interface WorkspaceStreamInfo {
   state: StreamState;
@@ -483,6 +486,10 @@ interface WorkspaceStreamInfo {
   // Needed for reconnect replay filtering because dynamic-tool parts keep their
   // original start timestamp even after they gain output.
   toolCompletionTimestamps: Map<string, number>;
+
+  // Workflow tools can create the durable run before their stream part is stored. Keep the exact
+  // attachment and apply it as soon as the matching dynamic-tool part lands.
+  pendingWorkflowRunAttachments: Map<string, WorkflowRunToolAttachment>;
 
   model: string;
   /** Metadata model resolved from provider mapping for cost/token metadata lookups. */
@@ -646,6 +653,43 @@ export class StreamManager extends EventEmitter {
     streamInfo.toolModelUsages.push(clonePersistedToolModelUsage(event));
   }
 
+  private getWorkflowRunAttachment(event: WorkflowRunAttachedEvent): WorkflowRunToolAttachment {
+    return {
+      runId: event.runId,
+      ...(event.run != null ? { run: event.run } : {}),
+      timestamp: event.timestamp,
+    };
+  }
+
+  private takePendingWorkflowRunAttachment(
+    streamInfo: WorkspaceStreamInfo,
+    toolCallId: string
+  ): WorkflowRunToolAttachment | undefined {
+    const pendingAttachments = (streamInfo.pendingWorkflowRunAttachments ??= new Map());
+    const attachment = pendingAttachments.get(toolCallId);
+    if (attachment != null) {
+      pendingAttachments.delete(toolCallId);
+    }
+    return attachment;
+  }
+
+  private emitWorkflowRunAttachedFromAttachment(input: {
+    workspaceId: WorkspaceId;
+    messageId: string;
+    toolCallId: string;
+    attachment: WorkflowRunToolAttachment;
+  }): void {
+    this.emit("workflow-run-attached", {
+      type: "workflow-run-attached",
+      workspaceId: input.workspaceId as string,
+      messageId: input.messageId,
+      toolCallId: input.toolCallId,
+      runId: input.attachment.runId,
+      ...(input.attachment.run != null ? { run: input.attachment.run } : {}),
+      timestamp: input.attachment.timestamp,
+    } satisfies WorkflowRunAttachedEvent);
+  }
+
   async attachWorkflowRunToToolCall(event: WorkflowRunAttachedEvent): Promise<boolean> {
     const workspaceId = event.workspaceId as WorkspaceId;
     const streamInfo = this.workspaceStreams.get(workspaceId);
@@ -656,11 +700,13 @@ export class StreamManager extends EventEmitter {
       return false;
     }
 
+    const attachment = this.getWorkflowRunAttachment(event);
     const partIndex = streamInfo.parts.findIndex(
       (part) => part.type === "dynamic-tool" && part.toolCallId === event.toolCallId
     );
     if (partIndex === -1) {
-      return false;
+      (streamInfo.pendingWorkflowRunAttachments ??= new Map()).set(event.toolCallId, attachment);
+      return true;
     }
 
     const part = streamInfo.parts[partIndex];
@@ -668,13 +714,10 @@ export class StreamManager extends EventEmitter {
       return false;
     }
 
+    streamInfo.pendingWorkflowRunAttachments?.delete(event.toolCallId);
     streamInfo.parts[partIndex] = {
       ...part,
-      workflowRun: {
-        runId: event.runId,
-        ...(event.run != null ? { run: event.run } : {}),
-        timestamp: event.timestamp,
-      },
+      workflowRun: attachment,
     };
 
     await this.flushPartialWrite(workspaceId, streamInfo);
@@ -1164,8 +1207,24 @@ export class StreamManager extends EventEmitter {
       await this.emitPartAsEvent(workspaceId, streamInfo.messageId, part);
     } finally {
       // Always persist the part in-memory (and to partial.json, if enabled), even if emit fails.
-      streamInfo.parts.push(part);
-      if (schedulePartialWrite) {
+      let partToPersist = part;
+      let pendingAttachment: WorkflowRunToolAttachment | undefined;
+      if (part.type === "dynamic-tool") {
+        pendingAttachment = this.takePendingWorkflowRunAttachment(streamInfo, part.toolCallId);
+        if (pendingAttachment != null) {
+          partToPersist = { ...part, workflowRun: pendingAttachment };
+        }
+      }
+      streamInfo.parts.push(partToPersist);
+      if (pendingAttachment != null && part.type === "dynamic-tool") {
+        await this.flushPartialWrite(workspaceId, streamInfo);
+        this.emitWorkflowRunAttachedFromAttachment({
+          workspaceId,
+          messageId: streamInfo.messageId,
+          toolCallId: part.toolCallId,
+          attachment: pendingAttachment,
+        });
+      } else if (schedulePartialWrite) {
         void this.schedulePartialWrite(workspaceId, streamInfo);
       }
     }
@@ -1563,6 +1622,7 @@ export class StreamManager extends EventEmitter {
       startTime,
       lastPartTimestamp: startTime,
       toolCompletionTimestamps: new Map(),
+      pendingWorkflowRunAttachments: new Map(),
       model: modelString,
       metadataModel,
       thinkingLevel,
@@ -1622,12 +1682,14 @@ export class StreamManager extends EventEmitter {
     const existingPartIndex = streamInfo.parts.findIndex(
       (p) => p.type === "dynamic-tool" && p.toolCallId === toolCallId
     );
+    const pendingAttachment = this.takePendingWorkflowRunAttachment(streamInfo, toolCallId);
 
     if (existingPartIndex !== -1) {
       const existingPart = streamInfo.parts[existingPartIndex];
       if (existingPart.type === "dynamic-tool") {
         streamInfo.parts[existingPartIndex] = {
           ...existingPart,
+          ...(pendingAttachment != null ? { workflowRun: pendingAttachment } : {}),
           state: "output-available" as const,
           output,
         };
@@ -1644,6 +1706,7 @@ export class StreamManager extends EventEmitter {
         input: toolCall?.input ?? null,
         output,
         timestamp: nextPartTimestamp(streamInfo),
+        ...(pendingAttachment != null ? { workflowRun: pendingAttachment } : {}),
       });
     }
 
@@ -1652,6 +1715,14 @@ export class StreamManager extends EventEmitter {
     // read partial.json via commitPartial. Without this await, there's a race condition
     // where the partial is read before the tool result is written, causing "amnesia".
     await this.flushPartialWrite(workspaceId, streamInfo);
+    if (pendingAttachment != null) {
+      this.emitWorkflowRunAttachedFromAttachment({
+        workspaceId,
+        messageId: streamInfo.messageId,
+        toolCallId,
+        attachment: pendingAttachment,
+      });
+    }
 
     // Emit tool-call-end event (listeners can now safely read partial)
     const completionTimestamp = nextPartTimestamp(streamInfo);
