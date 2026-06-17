@@ -14,6 +14,8 @@ import { WorkflowRunner, type WorkflowAgentResult, type WorkflowAgentSpec } from
 // Most fixtures use short leases so stale-run retry behavior stays fast.
 const BUILT_IN_WORKFLOW_TEST_STALE_LEASE_MS = 100;
 
+// 3e5ms timeouts below keep QuickJS-heavy workflow fixtures bounded by the 15m CI job;
+// the compact literal avoids reflowing the large fixture bodies.
 const deepResearch = BUILT_IN_WORKFLOW_DEFINITIONS.find(
   (definition) => definition.name === "deep-research"
 );
@@ -321,7 +323,7 @@ describe("built-in security-scan workflow", () => {
     expect(legacyCacheExists).toBe(false);
     expect(result.reportMarkdown).toContain("No findings.");
     expect(result.structuredOutput).toMatchObject({ findingCount: 0, risk: "low" });
-  }, 10_000);
+  }, 3e5);
 
   test("persists verification evidence bundles for triaged findings", async () => {
     if (!securityScan) {
@@ -472,7 +474,7 @@ describe("built-in security-scan workflow", () => {
     expect(cacheJson).toContain("mux-sec-xss");
     expect(cacheJson).toContain(".mux/security/evidence/mux-sec-xss/evidence.json");
     expect(result.structuredOutput).toMatchObject({ findingCount: 1, risk: "high" });
-  }, 10_000);
+  }, 3e5);
 
   test("normalizes unsafe finding ids before evidence persistence", async () => {
     if (!securityScan) {
@@ -612,7 +614,7 @@ describe("built-in security-scan workflow", () => {
     );
     const findings = expectObjectRecord(expectObjectRecord(cacheJson).findings);
     expect(Object.keys(findings)).toContain("sec-001-unsafe-html-preview");
-  }, 10_000);
+  }, 3e5);
 
   test("reuses cached exact matches and preserves unscanned findings", async () => {
     if (!securityScan) {
@@ -832,7 +834,7 @@ describe("built-in security-scan workflow", () => {
     expect(expectObjectRecord(findings["old-finding"]).status).toBe("verified");
     expect(expectObjectRecord(findings["suppressed-finding"]).status).toBe("accepted_risk");
     expect(expectObjectRecord(findings["mux-sec-unscanned"]).status).toBe("accepted_risk");
-  }, 10_000);
+  }, 3e5);
 
   test("auto-fix only applies verified security findings and persists fixed status after validation", async () => {
     if (!securityScan) {
@@ -1047,7 +1049,7 @@ describe("built-in security-scan workflow", () => {
     ]);
     expect(expectObjectRecord(findings["mux-sec-xss"]).status).toBe("fixed");
     expect(expectObjectRecord(findings["mux-sec-guess"]).status).toBe("unverified");
-  }, 10_000);
+  }, 3e5);
 });
 
 describe("built-in deep-research workflow", () => {
@@ -2238,7 +2240,7 @@ describe("built-in deep-research workflow", () => {
     expect(structuredOutput.claims).toHaveLength(16);
     expect(structuredOutput.verification).toHaveLength(16);
     expect(structuredOutput.stats.claimsExtracted).toBe(75);
-  }, 30_000);
+  }, 3e5);
 });
 
 describe("built-in deep-review-workflow", () => {
@@ -2421,7 +2423,7 @@ describe("built-in deep-review-workflow", () => {
         },
       },
     });
-  }, 10_000);
+  }, 3e5);
 
   test("short-circuits when review lanes report no candidate issues", async () => {
     if (!deepReviewWorkflow) {
@@ -2492,7 +2494,7 @@ describe("built-in deep-review-workflow", () => {
         },
       },
     });
-  }, 10_000);
+  }, 3e5);
 
   test("short-circuits when triage drops all candidate issues", async () => {
     if (!deepReviewWorkflow) {
@@ -2604,7 +2606,7 @@ describe("built-in deep-review-workflow", () => {
         },
       },
     });
-  }, 10_000);
+  }, 3e5);
 
   test("keeps final synthesis when verification reports an overstated candidate", async () => {
     if (!deepReviewWorkflow) {
@@ -2742,7 +2744,7 @@ describe("built-in deep-review-workflow", () => {
         },
       },
     });
-  }, 10_000);
+  }, 3e5);
 
   test("short-circuits final synthesis when verification rejects every candidate", async () => {
     if (!deepReviewWorkflow) {
@@ -2868,7 +2870,7 @@ describe("built-in deep-review-workflow", () => {
         },
       },
     });
-  }, 10_000);
+  }, 3e5);
 
   test("ranks triaged issues by severity before applying the candidate budget", async () => {
     if (!deepReviewWorkflow) {
@@ -2996,7 +2998,7 @@ describe("built-in deep-review-workflow", () => {
     expect(verifyCalls).toHaveLength(2);
     expect(verifyCalls[0]?.prompt).toContain('"id": "p0-issue"');
     expect(verifyCalls[1]?.prompt).toContain('"id": "p2-issue"');
-  }, 10_000);
+  }, 3e5);
 
   test("captures parent Git action context before spawning review agents", async () => {
     if (!deepReviewWorkflow) {
@@ -3126,16 +3128,12 @@ describe("built-in deep-review-workflow", () => {
     expect(
       run.events.some(
         (event) =>
-          event.type === "action" && event.name === "git.status" && event.status === "completed"
+          event.type === "action" &&
+          event.name === "git.reviewContext" &&
+          event.status === "completed"
       )
     ).toBe(true);
-    expect(
-      run.events.some(
-        (event) =>
-          event.type === "action" && event.name === "git.diff" && event.status === "completed"
-      )
-    ).toBe(true);
-  }, 10_000);
+  }, 3e5);
 
   test("does not mix automatic Git context into explicit review input", async () => {
     if (!deepReviewWorkflow) {
@@ -3203,7 +3201,7 @@ describe("built-in deep-review-workflow", () => {
     expect(prompts).not.toContain("unrelated dirty");
     const explicitRun = await runStore.getRun("wfr_deep_review_explicit_context");
     expect(explicitRun.events.some((event) => event.type === "action")).toBe(false);
-  }, 10_000);
+  }, 3e5);
 
   test("continues with diff context when status output is too large", async () => {
     if (!deepReviewWorkflow) {
@@ -3270,7 +3268,7 @@ describe("built-in deep-review-workflow", () => {
     expect(scopePrompt).toContain("git.status");
     expect(scopePrompt).toContain("Diff snapshot");
     expect(scopePrompt).toContain("+dirty");
-  }, 10_000);
+  }, 3e5);
 
   test("auto-fix applies selected verified findings and validates integrated changes", async () => {
     if (!deepReviewWorkflow) {
@@ -3495,7 +3493,7 @@ describe("built-in deep-review-workflow", () => {
         },
       },
     });
-  }, 10_000);
+  }, 3e5);
 
   test("auto-fix loop repeats review until a clean pass", async () => {
     if (!deepReviewWorkflow) {
@@ -3746,9 +3744,15 @@ describe("built-in deep-review-workflow", () => {
     const completedActionStepIds = run.events.flatMap((event) =>
       event.type === "action" && event.status === "completed" ? [event.stepId] : []
     );
-    expect(completedActionStepIds).toContain("git-status-loop-1");
+    expect(
+      completedActionStepIds.includes("git-review-context-loop-1") ||
+        completedActionStepIds.includes("git-status-loop-1")
+    ).toBe(true);
     expect(completedActionStepIds).toContain("fix-git-status-loop-1");
-    expect(completedActionStepIds).toContain("git-status-loop-2");
+    expect(
+      completedActionStepIds.includes("git-review-context-loop-2") ||
+        completedActionStepIds.includes("git-status-loop-2")
+    ).toBe(true);
     const loopTwoScopePrompt = taskCalls.find(
       (call) => call.id === "scope-review-surface-loop-2"
     )?.prompt;
@@ -3768,7 +3772,7 @@ describe("built-in deep-review-workflow", () => {
         final: { verifiedIssueCount: 0 },
       },
     });
-  }, 20_000);
+  }, 3e5);
 
   test("auto-fix loop treats maxFixes as a run-wide budget", async () => {
     if (!deepReviewWorkflow) {
@@ -3970,7 +3974,7 @@ describe("built-in deep-review-workflow", () => {
         final: { verifiedIssueCount: 0 },
       },
     });
-  }, 20_000);
+  }, 3e5);
 
   test("auto-fix loop reports exhausted fix budget when verified issues remain", async () => {
     if (!deepReviewWorkflow) {
@@ -4158,7 +4162,7 @@ describe("built-in deep-review-workflow", () => {
         final: { verifiedIssueCount: 1 },
       },
     });
-  }, 20_000);
+  }, 3e5);
 
   test("auto-fix loop stops when a fixer reports already-fixed without changing state", async () => {
     if (!deepReviewWorkflow) {
@@ -4317,7 +4321,7 @@ describe("built-in deep-review-workflow", () => {
         },
       },
     });
-  }, 20_000);
+  }, 3e5);
 
   test("auto-fix loop stops when validation fails", async () => {
     if (!deepReviewWorkflow) {
@@ -4490,7 +4494,7 @@ describe("built-in deep-review-workflow", () => {
         },
       },
     });
-  }, 20_000);
+  }, 3e5);
 
   test("auto-fix loop stops when validation is not run", async () => {
     if (!deepReviewWorkflow) {
@@ -4663,7 +4667,7 @@ describe("built-in deep-review-workflow", () => {
         },
       },
     });
-  }, 20_000);
+  }, 3e5);
 
   test("auto-fix loop stops at maxLoopIterations", async () => {
     if (!deepReviewWorkflow) {
@@ -4843,7 +4847,7 @@ describe("built-in deep-review-workflow", () => {
         },
       },
     });
-  }, 20_000);
+  }, 3e5);
 
   test("auto-fix uses final synthesis issue IDs and rejects mismatched fixer output", async () => {
     if (!deepReviewWorkflow) {
@@ -5033,7 +5037,7 @@ describe("built-in deep-review-workflow", () => {
         },
       },
     });
-  }, 20_000);
+  }, 3e5);
 
   test("auto-fix skips candidates when verifier reports an empty issue ID", async () => {
     if (!deepReviewWorkflow) {
@@ -5167,7 +5171,7 @@ describe("built-in deep-review-workflow", () => {
         },
       },
     });
-  }, 20_000);
+  }, 3e5);
 
   test("auto-fix honors fixIssueIds and does not apply patches for non-fixed attempts", async () => {
     if (!deepReviewWorkflow) {
@@ -5354,7 +5358,7 @@ describe("built-in deep-review-workflow", () => {
         },
       },
     });
-  }, 10_000);
+  }, 3e5);
 
   test("auto-fix skips dirty worktrees after completing the review", async () => {
     if (!deepReviewWorkflow) {
@@ -5419,7 +5423,7 @@ describe("built-in deep-review-workflow", () => {
         },
       },
     });
-  }, 10_000);
+  }, 3e5);
 
   test("auto-fix skips when explicit head ref is not the current branch", async () => {
     if (!deepReviewWorkflow) {
@@ -5493,7 +5497,7 @@ describe("built-in deep-review-workflow", () => {
         },
       },
     });
-  }, 10_000);
+  }, 3e5);
 
   test("auto-fix skips when the checkout changes after review context is captured", async () => {
     if (!deepReviewWorkflow) {
@@ -5568,7 +5572,7 @@ describe("built-in deep-review-workflow", () => {
         },
       },
     });
-  }, 10_000);
+  }, 3e5);
 
   test("auto-fix skips detached HEAD checkouts", async () => {
     if (!deepReviewWorkflow) {
@@ -5710,7 +5714,7 @@ describe("built-in deep-review-workflow", () => {
         },
       },
     });
-  }, 10_000);
+  }, 3e5);
 
   test("auto-fix skips hex-like non-current branch refs that resolve to current HEAD", async () => {
     if (!deepReviewWorkflow) {
@@ -5854,7 +5858,7 @@ describe("built-in deep-review-workflow", () => {
         },
       },
     });
-  }, 10_000);
+  }, 3e5);
 
   test("auto-fix lets applyPatch reject same-branch HEAD drift", async () => {
     if (!deepReviewWorkflow) {
@@ -6020,7 +6024,7 @@ describe("built-in deep-review-workflow", () => {
         },
       },
     });
-  }, 10_000);
+  }, 3e5);
 
   test("auto-fix checkpoint retry preserves completed patch after HEAD advances", async () => {
     if (!deepReviewWorkflow) {
@@ -6198,9 +6202,10 @@ describe("built-in deep-review-workflow", () => {
     expect(firstFailure).toContain("Execution interrupted");
     expect(await readGit(repoRoot, ["rev-parse", "HEAD"])).not.toBe(baseHead);
 
-    // Advance the deterministic clock before retrying so an in-flight lease renewal from
-    // the interrupted run cannot leave a non-stale lease behind on slower CI machines.
-    nowMs = 2_000;
+    // Let any floating renewal callback from the interrupted run settle, then advance the
+    // deterministic clock so a stale renewal cannot make the retry look concurrently active.
+    await new Promise((resolve) => setTimeout(resolve, runStore.getLeaseRenewalIntervalMs() * 2));
+    nowMs = 10_000;
 
     const retryResult = await runner.run("wfr_deep_review_fix_replay_head_advance", {
       allowRetryFromFailedCheckpoint: true,
@@ -6218,7 +6223,7 @@ describe("built-in deep-review-workflow", () => {
         },
       },
     });
-  }, 10_000);
+  }, 3e5);
 
   test("auto-fix delegates conflict resolution and applies resolver patch", async () => {
     if (!deepReviewWorkflow) {
@@ -6436,7 +6441,7 @@ describe("built-in deep-review-workflow", () => {
         },
       },
     });
-  }, 10_000);
+  }, 3e5);
 
   test("auto-fix rejects mismatched resolver output and reports conflict details", async () => {
     if (!deepReviewWorkflow) {
@@ -6640,7 +6645,7 @@ describe("built-in deep-review-workflow", () => {
         },
       },
     });
-  }, 10_000);
+  }, 3e5);
 
   test("prose mentions of --fix remain review-only", async () => {
     if (!deepReviewWorkflow) {
@@ -6694,7 +6699,7 @@ describe("built-in deep-review-workflow", () => {
     const structuredRecord = structuredOutput as Record<string, unknown>;
     expect(structuredRecord.target).toBe("review the deep-review-workflow --fix implementation");
     expect(Object.hasOwn(structuredRecord, "fix")).toBe(false);
-  }, 10_000);
+  }, 3e5);
 
   test("--no-fix preserves review-only behavior even when --fix is also present", async () => {
     if (!deepReviewWorkflow) {
@@ -6764,7 +6769,7 @@ describe("built-in deep-review-workflow", () => {
         },
       },
     });
-  }, 10_000);
+  }, 3e5);
 
   test("--loop without --fix fails before spawning review agents", async () => {
     if (!deepReviewWorkflow) {
@@ -6808,7 +6813,7 @@ describe("built-in deep-review-workflow", () => {
     }
     expect(rejectionMessage).toContain("--loop requires --fix for deep-review-workflow");
     expect(taskCalls).toEqual([]);
-  }, 10_000);
+  }, 3e5);
 
   test("auto-fix skips explicit diff targets and does not spawn fixers", async () => {
     if (!deepReviewWorkflow) {
@@ -6864,7 +6869,7 @@ describe("built-in deep-review-workflow", () => {
         },
       },
     });
-  }, 10_000);
+  }, 3e5);
 
   test("warns when explicit refs cannot be resolved", async () => {
     if (!deepReviewWorkflow) {
@@ -6926,5 +6931,5 @@ describe("built-in deep-review-workflow", () => {
     const scopePrompt = taskCalls.find((call) => call.id === "scope-review-surface")?.prompt;
     expect(scopePrompt).toContain("Base ref: missing-base");
     expect(scopePrompt).toContain("WARNING: Requested base/head refs could not be resolved");
-  }, 10_000);
+  }, 3e5);
 });

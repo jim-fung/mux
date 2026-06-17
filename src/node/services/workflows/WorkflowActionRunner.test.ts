@@ -66,12 +66,23 @@ describe("WorkflowActionRunner", () => {
     using tmp = new DisposableTempDir("workflow-action-runner");
     const sourcePath = path.join(tmp.path, "action.js");
     const source = `
+      const s = mux.schema;
       export const metadata = {
         version: 1,
         description: "Echo input",
         effect: "read",
-        inputSchema: { type: "object", required: ["name"], properties: { name: { type: "string" } } },
-        outputSchema: { type: "object", required: ["greeting"], properties: { greeting: { type: "string" } } },
+        inputSchema: s.object(
+          {
+            name: s.string(),
+            title: s.optional(s.string()),
+            priority: s.optional(s.nullable(s.enum(["low", "high"]))),
+          },
+          { additionalProperties: false }
+        ),
+        outputSchema: s.object(
+          { greeting: s.string(), nickname: s.optional(s.nullable(s.string())) },
+          { additionalProperties: false }
+        ),
       };
       export async function execute(input, ctx) {
         console.log("running " + input.name);
@@ -87,6 +98,22 @@ describe("WorkflowActionRunner", () => {
     expect(description.metadata.description).toBe("Echo input");
     expect(description.metadata.effect).toBe("read");
     expect(description.hasReconcile).toBe(false);
+    expect(description.metadata.inputSchema).toEqual({
+      type: "object",
+      required: ["name"],
+      properties: {
+        name: { type: "string" },
+        title: { type: "string" },
+        priority: { type: ["string", "null"], enum: ["low", "high", null] },
+      },
+      additionalProperties: false,
+    });
+    expect(description.metadata.outputSchema).toEqual({
+      type: "object",
+      required: ["greeting"],
+      properties: { greeting: { type: "string" }, nickname: { type: ["string", "null"] } },
+      additionalProperties: false,
+    });
     const result = await runner.execute(action, {
       input: { name: "Ada" },
       cwd: tmp.path,
@@ -104,6 +131,97 @@ describe("WorkflowActionRunner", () => {
       "utf-8"
     );
     expect(artifactContent).toContain("Ada");
+  });
+
+  test("rejects schema aliases declared after action metadata", async () => {
+    using tmp = new DisposableTempDir("workflow-action-late-alias");
+    const runner = new WorkflowActionRunner();
+    const sources = [
+      `export const metadata = {
+  version: 1,
+  description: "Late alias",
+  effect: "read",
+  inputSchema: s.object({ name: s.string() }),
+};
+const s = mux.schema;
+export async function execute() { return {}; }
+`,
+      `module.exports.metadata = {
+  version: 1,
+  description: "Late alias",
+  effect: "read",
+  inputSchema: s.object({ name: s.string() }),
+};
+const s = mux.schema;
+module.exports.execute = async function () { return {}; };
+`,
+    ];
+
+    for (const [index, source] of sources.entries()) {
+      const sourcePath = path.join(tmp.path, `late-${index}.js`);
+      await fs.writeFile(sourcePath, source, "utf-8");
+      await expectRejects(runner.describe(createAction(sourcePath, source)), /Workflow metadata/);
+    }
+  });
+
+  test("rejects mutable schema aliases", async () => {
+    using tmp = new DisposableTempDir("workflow-action-mutable-alias");
+    const runner = new WorkflowActionRunner();
+    const sources = [
+      `let s = mux.schema;
+export const metadata = { version: 1, description: "Mutable", effect: "read", inputSchema: s.object({ name: s.string() }) };
+export async function execute() { return {}; }
+`,
+      `var s = mux.schema;
+module.exports.metadata = { version: 1, description: "Mutable", effect: "read", inputSchema: s.object({ name: s.string() }) };
+module.exports.execute = async function () { return {}; };
+`,
+    ];
+
+    for (const [index, source] of sources.entries()) {
+      const sourcePath = path.join(tmp.path, `mutable-${index}.js`);
+      await fs.writeFile(sourcePath, source, "utf-8");
+      await expectRejects(runner.describe(createAction(sourcePath, source)), /Workflow metadata/);
+    }
+  });
+
+  test("rejects interpolated template literal metadata", async () => {
+    using tmp = new DisposableTempDir("workflow-action-interpolated-metadata");
+    const sourcePath = path.join(tmp.path, "interpolated.js");
+    const source =
+      'const branch = "main";\nexport const metadata = { version: 1, description: `Review ${branch}`, effect: "read" };\nexport async function execute() { return {}; }\n';
+    await fs.writeFile(sourcePath, source, "utf-8");
+
+    await expectRejects(
+      new WorkflowActionRunner().describe(createAction(sourcePath, source)),
+      /Workflow metadata/
+    );
+  });
+
+  test("executes actions with regex literals before exports", async () => {
+    using tmp = new DisposableTempDir("workflow-action-regex-before-export");
+    const sourcePath = path.join(tmp.path, "regex.js");
+    const source = `
+      const objectStart = /\\{/;
+      export const metadata = { version: 1, description: "Regex before export", effect: "read" };
+      export async function execute() {
+        return { ok: objectStart.test("{") };
+      }
+    `;
+    await fs.writeFile(sourcePath, source, "utf-8");
+    const runner = new WorkflowActionRunner();
+    const action = createAction(sourcePath, source);
+
+    const description = await runner.describe(action);
+    const result = await runner.execute(action, {
+      input: null,
+      cwd: tmp.path,
+      timeoutMs: 10_000,
+      artifactDir: path.join(tmp.path, "artifacts"),
+    });
+
+    expect(description.hasReconcile).toBe(false);
+    expect(result.output).toEqual({ ok: true });
   });
 
   test("uses the configured cwd for the action process", async () => {
@@ -278,6 +396,42 @@ describe("WorkflowActionRunner", () => {
     expect(result.stderr).toBe("");
   });
 
+  test("provides action SDK helpers for checked exec, JSON exec, and temporary JSON", async () => {
+    using tmp = new DisposableTempDir("workflow-action-sdk-helpers");
+    const sourcePath = path.join(tmp.path, "sdk.js");
+    const source = `
+      export const metadata = { version: 1, description: "SDK helpers", effect: "read" };
+      export async function execute(_input, ctx) {
+        const checked = await ctx.execChecked(process.execPath, ["-e", "process.stdout.write('ok')"]);
+        const parsed = await ctx.execJson(process.execPath, ["-e", "process.stdout.write(JSON.stringify({ value: 42 }))"]);
+        const temp = await ctx.writeTempJson({ hello: "world" });
+        const tempContent = JSON.parse(await require("node:fs/promises").readFile(temp.path, "utf-8"));
+        return { checked: checked.stdout, parsed, tempContent, tempPath: temp.path };
+      }
+    `;
+    await fs.writeFile(sourcePath, source, "utf-8");
+    const runner = new WorkflowActionRunner();
+
+    const result = await runner.execute(createAction(sourcePath, source), {
+      input: null,
+      cwd: tmp.path,
+      timeoutMs: 10_000,
+      artifactDir: path.join(tmp.path, "artifacts"),
+    });
+    const output = expectObjectRecord(result.output);
+
+    expect(output.checked).toBe("ok");
+    expect(output.parsed).toEqual({ value: 42 });
+    expect(output.tempContent).toEqual({ hello: "world" });
+    let tempStatError: unknown = null;
+    try {
+      await fs.stat(String(output.tempPath));
+    } catch (error) {
+      tempStatError = error;
+    }
+    expect(tempStatError).toBeInstanceOf(Error);
+  });
+
   test("built-in git actions reject truncated command output", async () => {
     using tmp = new DisposableTempDir("workflow-action-git-truncated");
     const repoRoot = path.join(tmp.path, "repo");
@@ -306,6 +460,164 @@ describe("WorkflowActionRunner", () => {
       }),
       /capture limit/
     );
+  });
+
+  test("built-in git reviewContext and preflight summarize dirty worktrees", async () => {
+    using tmp = new DisposableTempDir("workflow-action-git-review-context");
+    const repoRoot = path.join(tmp.path, "repo");
+    await fs.mkdir(repoRoot, { recursive: true });
+    await execFileAsync("git", ["init", "-b", "main"], { cwd: repoRoot });
+    await execFileAsync("git", ["config", "user.email", "mux@example.com"], { cwd: repoRoot });
+    await execFileAsync("git", ["config", "user.name", "Mux"], { cwd: repoRoot });
+    await fs.writeFile(path.join(repoRoot, "tracked.txt"), "initial\n", "utf-8");
+    await execFileAsync("git", ["add", "tracked.txt"], { cwd: repoRoot });
+    await execFileAsync("git", ["commit", "-m", "initial"], { cwd: repoRoot });
+    await fs.writeFile(path.join(repoRoot, "tracked.txt"), "changed\n", "utf-8");
+    await fs.writeFile(path.join(repoRoot, "untracked.txt"), "new\n", "utf-8");
+    const registry = new WorkflowActionRegistry({
+      projectRoot: path.join(tmp.path, "project-actions"),
+      globalRoot: path.join(tmp.path, "global-actions"),
+    });
+    const runner = new WorkflowActionRunner();
+    const reviewContextAction = await registry.resolveAction("git.reviewContext", {
+      projectTrusted: false,
+    });
+
+    const reviewContext = await runner.execute(reviewContextAction, {
+      input: { includeCommits: true, diffCharBudget: 10_000 },
+      cwd: repoRoot,
+      timeoutMs: 30_000,
+      artifactDir: path.join(tmp.path, "artifacts-review"),
+    });
+    const output = expectObjectRecord(reviewContext.output);
+    const flags = expectObjectRecord(output.flags);
+    const changedFiles = expectObjectRecord(output.changedFiles);
+    const rendered = expectObjectRecord(output.rendered);
+
+    expect(flags.hasUncommittedChanges).toBe(true);
+    expect(flags.hasUntrackedChanges).toBe(true);
+    expect(changedFiles.all).toEqual(expect.arrayContaining(["tracked.txt", "untracked.txt"]));
+    expect(rendered.snapshotMarkdown).toContain("Repository status");
+
+    const metadataOnlyReviewContext = await runner.execute(reviewContextAction, {
+      input: { diffCharBudget: 0 },
+      cwd: repoRoot,
+      timeoutMs: 30_000,
+      artifactDir: path.join(tmp.path, "artifacts-review-metadata-only"),
+    });
+    const metadataOnlyOutput = expectObjectRecord(metadataOnlyReviewContext.output);
+    const metadataOnlyDiff = expectObjectRecord(metadataOnlyOutput.diff);
+    expect(metadataOnlyDiff.unstaged).toBe("");
+    expect(expectObjectRecord(metadataOnlyDiff.truncated).unstaged).toBe(true);
+    expect(expectObjectRecord(metadataOnlyOutput.changedFiles).all).toEqual(
+      expect.arrayContaining(["tracked.txt", "untracked.txt"])
+    );
+
+    const preflightAction = await registry.resolveAction("git.preflight", {
+      projectTrusted: false,
+    });
+    const preflight = await runner.execute(preflightAction, {
+      input: { requireClean: true },
+      cwd: repoRoot,
+      timeoutMs: 10_000,
+      artifactDir: path.join(tmp.path, "artifacts-preflight"),
+    });
+    const preflightOutput = expectObjectRecord(preflight.output);
+
+    expect(preflightOutput.ok).toBe(false);
+    expect(preflightOutput.reason).toContain("dirty");
+  }, 40_000);
+
+  test("built-in git.reviewContext reports failures outside a git repository", async () => {
+    using tmp = new DisposableTempDir("workflow-action-git-review-context-no-repo");
+    const registry = new WorkflowActionRegistry({
+      projectRoot: path.join(tmp.path, "project-actions"),
+      globalRoot: path.join(tmp.path, "global-actions"),
+    });
+    const action = await registry.resolveAction("git.reviewContext", { projectTrusted: false });
+    const runner = new WorkflowActionRunner();
+
+    const result = await runner.execute(action, {
+      input: null,
+      cwd: tmp.path,
+      timeoutMs: 30_000,
+      artifactDir: path.join(tmp.path, "artifacts"),
+    });
+
+    const output = expectObjectRecord(result.output);
+    const failures = output.failures;
+    expect(Array.isArray(failures)).toBe(true);
+    const failureActions = (failures as unknown[]).map(
+      (failure) => expectObjectRecord(failure).action
+    );
+    expect(failureActions).toContain("git.status");
+    expect(failureActions).toContain("git.reviewContext");
+    expect(expectObjectRecord(output.rendered).snapshotMarkdown).toContain("Git context warnings");
+  }, 40_000);
+
+  test("built-in git.status skips ignored files unless requested", async () => {
+    using tmp = new DisposableTempDir("workflow-action-git-status-ignored");
+    const repoRoot = path.join(tmp.path, "repo");
+    await fs.mkdir(path.join(repoRoot, "ignored"), { recursive: true });
+    await execFileAsync("git", ["init", "-b", "main"], { cwd: repoRoot });
+    await fs.writeFile(path.join(repoRoot, ".gitignore"), "ignored/\n", "utf-8");
+    await fs.writeFile(path.join(repoRoot, "ignored", "generated.txt"), "ignored\n", "utf-8");
+    await fs.writeFile(path.join(repoRoot, "untracked.txt"), "new\n", "utf-8");
+    const registry = new WorkflowActionRegistry({
+      projectRoot: path.join(tmp.path, "project-actions"),
+      globalRoot: path.join(tmp.path, "global-actions"),
+    });
+    const action = await registry.resolveAction("git.status", { projectTrusted: false });
+    const runner = new WorkflowActionRunner();
+
+    const defaultStatus = await runner.execute(action, {
+      input: null,
+      cwd: repoRoot,
+      timeoutMs: 10_000,
+      artifactDir: path.join(tmp.path, "artifacts-default"),
+    });
+    const statusWithIgnored = await runner.execute(action, {
+      input: { includeIgnored: true },
+      cwd: repoRoot,
+      timeoutMs: 10_000,
+      artifactDir: path.join(tmp.path, "artifacts-ignored"),
+    });
+
+    expect(expectObjectRecord(defaultStatus.output).ignored).toEqual([]);
+    expect(expectObjectRecord(defaultStatus.output).untracked).toContain("untracked.txt");
+    expect(expectObjectRecord(statusWithIgnored.output).ignored).toContain("ignored/generated.txt");
+  }, 10_000);
+
+  test("built-in git.status preserves ordinary paths containing rename arrows", async () => {
+    using tmp = new DisposableTempDir("workflow-action-git-status-arrow-path");
+    const repoRoot = path.join(tmp.path, "repo");
+    await fs.mkdir(repoRoot, { recursive: true });
+    await execFileAsync("git", ["init"], { cwd: repoRoot });
+    await execFileAsync("git", ["config", "user.email", "mux@example.com"], { cwd: repoRoot });
+    await execFileAsync("git", ["config", "user.name", "Mux"], { cwd: repoRoot });
+    await fs.writeFile(path.join(repoRoot, "a -> b"), "initial\n", "utf-8");
+    await execFileAsync("git", ["add", "a -> b"], { cwd: repoRoot });
+    await execFileAsync("git", ["commit", "-m", "base"], { cwd: repoRoot });
+    await fs.writeFile(path.join(repoRoot, "a -> b"), "changed\n", "utf-8");
+    const registry = new WorkflowActionRegistry({
+      projectRoot: path.join(tmp.path, "project-actions"),
+      globalRoot: path.join(tmp.path, "global-actions"),
+    });
+    const action = await registry.resolveAction("git.status", { projectTrusted: false });
+
+    const result = await new WorkflowActionRunner().execute(action, {
+      input: null,
+      cwd: repoRoot,
+      timeoutMs: 30_000,
+      artifactDir: path.join(tmp.path, "artifacts"),
+    });
+    const output = expectObjectRecord(result.output);
+    const unstaged = output.unstaged;
+    expect(Array.isArray(unstaged)).toBe(true);
+    const firstUnstaged = expectObjectRecord(Array.isArray(unstaged) ? unstaged[0] : null);
+
+    expect(firstUnstaged.path).toContain("a -> b");
+    expect(firstUnstaged.oldPath).toBeUndefined();
   });
 
   test("reports unsupported module syntax clearly", async () => {
@@ -431,6 +743,230 @@ describe("WorkflowActionRunner", () => {
     }
   });
 
+  test("describes reconcile aliases that point at execute", async () => {
+    using tmp = new DisposableTempDir("workflow-action-reconcile-alias");
+    const sources = [
+      `module.exports.metadata = { version: 1, description: "Alias", effect: "workspace" };
+module.exports.execute = async function (input) { return { input, reconciled: true }; };
+module.exports.reconcile = module.exports.execute;
+`,
+      `export const metadata = { version: 1, description: "Alias", effect: "workspace" };
+export async function execute(input) { return { input, reconciled: true }; }
+export const reconcile = execute;
+`,
+    ];
+    const runner = new WorkflowActionRunner();
+    for (const [index, source] of sources.entries()) {
+      const sourcePath = path.join(tmp.path, `alias-${index}.js`);
+      await fs.writeFile(sourcePath, source, "utf-8");
+      const action = createAction(sourcePath, source);
+
+      const description = await runner.describe(action);
+      const result = await runner.reconcile(action, {
+        input: { index },
+        cwd: tmp.path,
+        timeoutMs: 10_000,
+        artifactDir: path.join(tmp.path, `artifacts-${index}`),
+      });
+
+      expect(description.hasReconcile).toBe(true);
+      expect(result.output).toEqual({ input: { index }, reconciled: true });
+    }
+  });
+
+  test("built-in github.listIssues uses stdout-safe default limits", async () => {
+    using tmp = new DisposableTempDir("workflow-action-github-list-limit");
+    const binDir = path.join(tmp.path, "bin");
+    const argsPath = path.join(tmp.path, "gh-args.txt");
+    await fs.mkdir(binDir, { recursive: true });
+    const ghPath = path.join(binDir, "gh");
+    await fs.writeFile(
+      ghPath,
+      `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" > ${JSON.stringify(argsPath)}
+cat <<'JSON'
+[]
+JSON
+`,
+      "utf-8"
+    );
+    await fs.chmod(ghPath, 0o755);
+    const previousPath = process.env.PATH;
+    process.env.PATH = binDir + path.delimiter + (previousPath ?? "");
+    try {
+      const registry = new WorkflowActionRegistry({
+        projectRoot: path.join(tmp.path, "project-actions"),
+        globalRoot: path.join(tmp.path, "global-actions"),
+      });
+      const action = await registry.resolveAction("github.listIssues", { projectTrusted: false });
+
+      const result = await new WorkflowActionRunner().execute(action, {
+        input: { includeBody: true, excludeLabels: ["done", "needs triage"] },
+        cwd: tmp.path,
+        timeoutMs: 30_000,
+        artifactDir: path.join(tmp.path, "artifacts"),
+      });
+
+      const args = await fs.readFile(argsPath, "utf-8");
+      expect(expectObjectRecord(result.output).issues).toEqual([]);
+      expect(args).toContain("--limit 100");
+      expect(args).toContain("--jq");
+      expect(args).toContain("utf8bytelength");
+      expect(args).toContain("mux_truncate_utf8(240)");
+      expect(args).toContain('--search -label:"done" -label:"needs triage"');
+      expect(args).not.toContain(".[:4000]");
+    } finally {
+      process.env.PATH = previousPath;
+    }
+  });
+
+  test("built-in github.getIssueConversation reads REST comment users", async () => {
+    using tmp = new DisposableTempDir("workflow-action-github-conversation-user");
+    const binDir = path.join(tmp.path, "bin");
+    await fs.mkdir(binDir, { recursive: true });
+    const ghPath = path.join(binDir, "gh");
+    await fs.writeFile(
+      ghPath,
+      `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1 $2" == "issue view" ]]; then
+  [[ "$*" == *"--jq"* ]]
+  [[ "$*" == *"mux_truncate_utf8_with_marker(10000)"* ]]
+  cat <<'JSON'
+{"number":7,"title":"Issue title","url":"https://github.com/coder/mux/issues/7","state":"OPEN","body":"Issue body","author":{"login":"issue-author"},"labels":[]}
+JSON
+elif [[ "$1" == "api" ]]; then
+  [[ "$*" == *"per_page=5"* ]]
+  [[ "$*" == *"mux_truncate_utf8_with_marker(10000)"* ]]
+  cat <<'JSON'
+[{"body":"REST comment body","user":{"login":"rest-commenter"}}]
+JSON
+else
+  echo "unexpected gh args: $*" >&2
+  exit 1
+fi
+`,
+      "utf-8"
+    );
+    await fs.chmod(ghPath, 0o755);
+    const previousPath = process.env.PATH;
+    process.env.PATH = binDir + path.delimiter + (previousPath ?? "");
+    try {
+      const registry = new WorkflowActionRegistry({
+        projectRoot: path.join(tmp.path, "project-actions"),
+        globalRoot: path.join(tmp.path, "global-actions"),
+      });
+      const action = await registry.resolveAction("github.getIssueConversation", {
+        projectTrusted: false,
+      });
+
+      const result = await new WorkflowActionRunner().execute(action, {
+        input: { repository: "coder/mux", number: 7 },
+        cwd: tmp.path,
+        timeoutMs: 30_000,
+        artifactDir: path.join(tmp.path, "artifacts"),
+      });
+      const output = expectObjectRecord(result.output);
+
+      expect(output.conversationMarkdown).toContain("Comment by rest-commenter");
+      expect(output.conversationMarkdown).not.toContain("Comment by unknown");
+    } finally {
+      process.env.PATH = previousPath;
+    }
+  });
+
+  test("built-in github marker lookups scan past the first 100 comments", async () => {
+    using tmp = new DisposableTempDir("workflow-action-github-marker-pagination");
+    const binDir = path.join(tmp.path, "bin");
+    const argsPath = path.join(tmp.path, "gh-args.txt");
+    await fs.mkdir(binDir, { recursive: true });
+    const ghPath = path.join(binDir, "gh");
+    await fs.writeFile(
+      ghPath,
+      `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> ${JSON.stringify(argsPath)}
+if [[ "$1 $2" == "issue view" ]]; then
+  cat <<'JSON'
+{"labels":[]}
+JSON
+elif [[ "$1" == "api" && "$*" == *"comments?per_page=10&page=11"* ]]; then
+  cat <<'JSON'
+[{"id":110,"html_url":"https://github.com/coder/mux/issues/7#issuecomment-110","body":"<!-- mux-marker key=busy promptVersion=v1 status=report-posted -->"}]
+JSON
+elif [[ "$1" == "api" && "$*" == *"comments?per_page=10&page="* ]]; then
+  printf '['
+  for i in $(seq 1 10); do
+    if [[ "$i" != "1" ]]; then printf ','; fi
+    printf '{"id":%s,"html_url":"https://example.com/%s","body":"ordinary comment"}' "$i" "$i"
+  done
+  printf ']'
+elif [[ "$1" == "api" && "$*" == *"-X PATCH"* ]]; then
+  cat <<'JSON'
+{"id":110,"html_url":"https://github.com/coder/mux/issues/7#issuecomment-110"}
+JSON
+else
+  echo "unexpected gh args: $*" >&2
+  exit 1
+fi
+`,
+      "utf-8"
+    );
+    await fs.chmod(ghPath, 0o755);
+    const previousPath = process.env.PATH;
+    process.env.PATH = binDir + path.delimiter + (previousPath ?? "");
+    try {
+      const registry = new WorkflowActionRegistry({
+        projectRoot: path.join(tmp.path, "project-actions"),
+        globalRoot: path.join(tmp.path, "global-actions"),
+      });
+      const runner = new WorkflowActionRunner();
+      const automationAction = await registry.resolveAction("github.getIssueAutomationState", {
+        projectTrusted: false,
+      });
+      const upsertAction = await registry.resolveAction("github.upsertIssueComment", {
+        projectTrusted: false,
+      });
+
+      const automation = await runner.execute(automationAction, {
+        input: {
+          repository: "coder/mux",
+          number: 7,
+          marker: "mux-marker",
+          markerKey: "busy",
+        },
+        cwd: tmp.path,
+        timeoutMs: 30_000,
+        artifactDir: path.join(tmp.path, "automation-artifacts"),
+      });
+      const upsert = await runner.execute(upsertAction, {
+        input: { repository: "coder/mux", number: 7, marker: "mux-marker", body: "updated" },
+        cwd: tmp.path,
+        timeoutMs: 30_000,
+        artifactDir: path.join(tmp.path, "upsert-artifacts"),
+      });
+      const automationOutput = expectObjectRecord(automation.output);
+      const upsertOutput = expectObjectRecord(upsert.output);
+      const args = await fs.readFile(argsPath, "utf-8");
+
+      expect(automationOutput.reportPosted).toBe(true);
+      expect(automationOutput.markerComments).toEqual([
+        {
+          id: 110,
+          status: "report-posted",
+          url: "https://github.com/coder/mux/issues/7#issuecomment-110",
+        },
+      ]);
+      expect(upsertOutput).toMatchObject({ action: "updated", commentId: 110 });
+      expect(args).toContain("comments?per_page=10&page=11");
+      expect(args).toContain("-X PATCH");
+      expect(args).not.toContain("-X POST");
+    } finally {
+      process.env.PATH = previousPath;
+    }
+  }, 15_000);
+
   test("describes every built-in workflow action", async () => {
     // Built-in sources must always pass static describe validation; a failure here
     // surfaces in the UI as a "blocked" action (e.g. security.hashFiles, whose regex
@@ -449,7 +985,56 @@ describe("WorkflowActionRunner", () => {
       const resolved = await registry.resolveAction(action.name, { projectTrusted: false });
       const description = await runner.describe(resolved);
       expect(description.metadata.description).toBeTruthy();
+      if (
+        [
+          "github.getIssueAutomationState",
+          "github.getIssueConversation",
+          "github.listIssues",
+          "github.verifyIssueCommentUrl",
+        ].includes(action.name)
+      ) {
+        expect(description.metadata.effect).toBe("read");
+      }
+      if (
+        [
+          "github.ensureIssueLabels",
+          "github.upsertIssueComment",
+          "security.writeEvidenceBundle",
+          "security.writeState",
+          "security.writeThreatModel",
+        ].includes(action.name)
+      ) {
+        expect(description.hasReconcile).toBe(true);
+      }
+      if (action.name.startsWith("git.") || action.name.startsWith("github.")) {
+        const outputSchema = expectObjectRecord(description.metadata.outputSchema);
+        expect(Object.keys(expectObjectRecord(outputSchema.properties)).length).toBeGreaterThan(0);
+        const inputSchema = expectObjectRecord(description.metadata.inputSchema);
+        expect(Object.keys(expectObjectRecord(inputSchema.properties)).length).toBeGreaterThan(0);
+      }
     }
+  });
+
+  test("executes exported actions after control-header regex literals", async () => {
+    using tmp = new DisposableTempDir("workflow-action-control-regex");
+    const sourcePath = path.join(tmp.path, "control-regex.js");
+    const source = `
+      const flag = true;
+      if (flag) /\\{/.test("{");
+      export const metadata = { version: 1, description: "Control regex", effect: "read" };
+      export async function execute() { return { ok: true }; }
+    `;
+    await fs.writeFile(sourcePath, source, "utf-8");
+    const runner = new WorkflowActionRunner();
+
+    const result = await runner.execute(createAction(sourcePath, source), {
+      input: null,
+      cwd: tmp.path,
+      timeoutMs: 10_000,
+      artifactDir: path.join(tmp.path, "artifacts"),
+    });
+
+    expect(result.output).toEqual({ ok: true });
   });
 
   test("does not rewrite export syntax inside action strings", async () => {

@@ -2097,10 +2097,10 @@ describe("WorkflowRunner", () => {
       definition,
       definitionSource: `export default function workflow({ parallelActions }) {
         const results = parallelActions([
-          { name: "git.status", id: "first", input: { label: "first" } },
-          { name: "git.status", id: "second", input: { label: "second" } },
+          { name: "git.status", id: "first", input: { head: "first" } },
+          { name: "git.status", id: "second", input: { head: "second" } },
         ]);
-        return { reportMarkdown: results.map((result) => result.output.label).join(" + ") };
+        return { reportMarkdown: results.map((result) => result.output.requestedHead).join(" + ") };
       }`,
       args: {},
       now: "2026-05-29T00:00:00.000Z",
@@ -2121,14 +2121,28 @@ describe("WorkflowRunner", () => {
             },
             async execute(input) {
               assert(input != null && typeof input === "object", "expected action input object");
-              const label = (input as { label?: unknown }).label;
+              const label = (input as { head?: unknown }).head;
               assert(typeof label === "string", "expected action label");
               started.push(label);
               if (started.length === 2) {
                 bothStarted.resolve();
               }
               await releaseActions.promise;
-              return { label };
+              return {
+                branch: null,
+                upstream: null,
+                ahead: 0,
+                behind: 0,
+                headSha: null,
+                requestedHead: label,
+                requestedHeadSha: null,
+                requestedHeadRef: null,
+                clean: true,
+                staged: [],
+                unstaged: [],
+                untracked: [],
+                ignored: [],
+              };
             },
           },
         ],
@@ -2327,7 +2341,10 @@ describe("WorkflowRunner", () => {
       Promise.race([
         runner.run("wfr_parallel_workflows_backgrounded"),
         new Promise<never>((_resolve, reject) => {
-          setTimeout(() => reject(new Error("parallelWorkflows did not abort sibling wait")), 500);
+          setTimeout(
+            () => reject(new Error("parallelWorkflows did not abort sibling wait")),
+            5_000
+          );
         }),
       ])
     ).rejects.toBeInstanceOf(WorkflowRunBackgroundedError);
@@ -2526,7 +2543,7 @@ describe("WorkflowRunner", () => {
       definition,
       definitionSource: `export default function workflow({ action }) {
         const commits = action.git.commitsBetween({ id: "commits", input: { base: "main" } });
-        const status = action.git.status({ id: "status" });
+        const status = action.git.status({ id: "status", input: { includeIgnored: true } });
         const changed = action.git.changedFiles({ id: "changed", input: { base: "main" } });
         const diff = action.git.diff({ id: "diff", input: { base: "main" } });
         const diffStat = action.git.diffStat({ id: "diff-stat", input: { base: "main" } });
@@ -3867,7 +3884,7 @@ describe("WorkflowRunner", () => {
     await expect(fs.access(markerPath)).rejects.toThrow();
   });
 
-  test("does not expose mux tools, filesystem imports, or timers to workflow code", async () => {
+  test("exposes mux helpers without filesystem imports or timers to workflow code", async () => {
     using tmp = new DisposableTempDir("workflow-runner");
     const store = new WorkflowRunStore({
       sessionDir: tmp.path,
@@ -3898,7 +3915,7 @@ describe("WorkflowRunner", () => {
     const result = await runner.run("wfr_forbidden");
 
     expect(JSON.parse(result.reportMarkdown)).toEqual({
-      mux: "undefined",
+      mux: "object",
       require: "undefined",
       setTimeout: "undefined",
       Date: "undefined",

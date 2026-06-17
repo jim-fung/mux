@@ -13,8 +13,7 @@ describe("validateJsonSchemaSubset", () => {
     ).toEqual({ success: true });
 
     expect(validateJsonSchemaSubsetSchema({ type: ["string", "null"] })).toEqual({
-      success: false,
-      errors: [{ path: "$", message: "Unsupported JSON Schema type union" }],
+      success: true,
     });
   });
 
@@ -76,13 +75,21 @@ describe("validateJsonSchemaSubset", () => {
     });
   });
 
-  test("rejects JSON Schema type unions instead of skipping type validation", () => {
-    const result = validateJsonSchemaSubset({ type: ["string", "null"] }, 42);
-
-    expect(result).toEqual({
-      success: false,
-      errors: [{ path: "$", message: "Unsupported JSON Schema type union" }],
+  test("supports JSON Schema type unions", () => {
+    expect(validateJsonSchemaSubset({ type: ["string", "null"] }, null)).toEqual({
+      success: true,
     });
+
+    expect(validateJsonSchemaSubset({ type: ["string", "null"] }, 42)).toEqual({
+      success: false,
+      errors: [{ path: "$", message: "Expected string or null, got number" }],
+    });
+  });
+
+  test("accepts nulls that are included in nullable enums", () => {
+    expect(
+      validateJsonSchemaSubset({ type: ["string", "null"], enum: ["low", "high", null] }, null)
+    ).toEqual({ success: true });
   });
 
   test("rejects schema-valued additionalProperties instead of ignoring extra values", () => {

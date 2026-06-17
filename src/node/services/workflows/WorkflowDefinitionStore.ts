@@ -16,7 +16,7 @@ import {
   BUILT_IN_WORKFLOW_DEFINITIONS,
   type BuiltInWorkflowDefinition,
 } from "./builtInWorkflowDefinitions";
-import { parseWorkflowDescription, WORKFLOW_DESCRIPTION_PREFIX } from "./workflowDescription";
+import { parseWorkflowDescription, replaceWorkflowDescription } from "./workflowDescription";
 
 export interface WorkflowDefinitionStoreOptions {
   projectRoot: string;
@@ -126,7 +126,9 @@ async function scanDirectory(
 
     const description = parseWorkflowDescription(source);
     if (description == null) {
-      log.warn(`Skipping workflow '${sourcePath}' because it is missing a description header`);
+      log.warn(
+        `Skipping workflow '${sourcePath}' because it is missing workflow description metadata`
+      );
       continue;
     }
 
@@ -252,7 +254,9 @@ async function scanRuntimeDirectory(
 
     const description = parseWorkflowDescription(source);
     if (description == null) {
-      log.warn(`Skipping workflow '${sourcePath}' because it is missing a description header`);
+      log.warn(
+        `Skipping workflow '${sourcePath}' because it is missing workflow description metadata`
+      );
       continue;
     }
 
@@ -774,17 +778,11 @@ function normalizePromotionDescription(description: string): string {
   return normalized;
 }
 
-function withDescriptionHeader(source: string, description: string): string {
-  const lines = source.replace(/^\uFEFF/u, "").split("\n");
-  const firstMeaningfulIndex = lines.findIndex((line) => line.trim().length > 0);
-  if (
-    firstMeaningfulIndex >= 0 &&
-    lines[firstMeaningfulIndex]?.trim().startsWith(WORKFLOW_DESCRIPTION_PREFIX)
-  ) {
-    lines.splice(firstMeaningfulIndex, 1, `${WORKFLOW_DESCRIPTION_PREFIX} ${description}`);
-    return lines.join("\n");
-  }
-  return `${WORKFLOW_DESCRIPTION_PREFIX} ${description}\n${source}`;
+function withDescriptionMetadata(source: string, description: string): string {
+  const normalizedSource = source.replace(/^\uFEFF/u, "");
+  const metadata = `export const metadata = { description: ${JSON.stringify(description)} };`;
+  const updatedSource = replaceWorkflowDescription(normalizedSource, description);
+  return updatedSource ?? `${metadata}\n${normalizedSource}`;
 }
 
 export class WorkflowDefinitionStore {
@@ -853,7 +851,7 @@ export class WorkflowDefinitionStore {
     const root = input.location === "project" ? this.projectRoot : this.globalRoot;
     const sourcePath =
       this.projectRuntime?.normalizePath(`${name}.js`, root) ?? path.join(root, `${name}.js`);
-    const promotedSource = withDescriptionHeader(input.source, description);
+    const promotedSource = withDescriptionMetadata(input.source, description);
     if (input.location === "project" && this.projectRuntime != null) {
       assert(
         this.projectCwd != null,

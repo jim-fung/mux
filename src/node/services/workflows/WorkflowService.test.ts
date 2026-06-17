@@ -11,6 +11,7 @@ import { WorkflowDefinitionStore } from "./WorkflowDefinitionStore";
 import { WorkflowRunStore } from "./WorkflowRunStore";
 import { WorkflowService } from "./WorkflowService";
 import type { WorkflowTaskAdapter } from "./WorkflowRunner";
+import { normalizeWorkflowArgsForSource } from "./workflowArgs";
 import { hashWorkflowStepInput } from "./workflowReplayKey";
 
 async function writeWorkflow(root: string, name: string, source: string) {
@@ -226,7 +227,7 @@ describe("WorkflowService", () => {
     using tmp = new DisposableTempDir("workflow-service");
     const projectRoot = path.join(tmp.path, "project", ".mux", "workflows");
     const globalRoot = path.join(tmp.path, "mux-home", "workflows");
-    const source = `// description: Demo workflow
+    const source = `export const metadata = { description: "Demo workflow" };
 export default function workflow({ args, agent }) {
   const child = agent({ id: "summarize", prompt: "Summarize " + args.topic });
   return { reportMarkdown: "Final " + child.reportMarkdown };
@@ -270,6 +271,364 @@ export default function workflow({ args, agent }) {
     expect(run.definition.scope).toBe("global");
   });
 
+  test("normalizes workflow args from static metadata and exposes mux helpers", async () => {
+    using tmp = new DisposableTempDir("workflow-service-args-schema");
+    const projectRoot = path.join(tmp.path, "project", ".mux", "workflows");
+    const globalRoot = path.join(tmp.path, "mux-home", "workflows");
+    const source = `const s = mux.schema;
+export const metadata = {
+  description: "Args schema workflow",
+  argsSchema: s.object({
+    target: s.string({ positional: true }),
+    fix: s.optional(s.boolean({ default: true, negatedAliases: ["--review-only"] })),
+    maxFindings: s.optional(
+      s.integer({ default: 20, minimum: 1, maximum: 50, aliases: ["--max-findings"] })
+    ),
+    mode: s.optional(s.enum(["quick", "smart"], { default: "smart" })),
+  }),
+};
+export default function workflow({ args }) {
+  const schema = s.object(
+    { summary: s.string(), optionalNote: s.optional(s.string()) },
+    { additionalProperties: false }
+  );
+  return {
+    reportMarkdown: mux.utils.fencedJson(args),
+    structuredOutput: {
+      args,
+      schema,
+      list: mux.utils.stringList([" a ", "", 2, "b"]),
+      bounded: mux.utils.boundedInt("9", 0, 1, 5),
+      compacted: mux.utils.compactText("abcdef", 3),
+      patch: mux.patch.normalize({ success: true, taskId: "task_patch" }),
+    },
+  };
+}
+`;
+    await writeWorkflow(globalRoot, "args-demo", source);
+    const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
+    const service = new WorkflowService({
+      definitionStore: new WorkflowDefinitionStore({ projectRoot, globalRoot, builtIns: [] }),
+      runStore,
+      runtimeFactory: new QuickJSRuntimeFactory(),
+      taskAdapter: {
+        async runAgent() {
+          throw new Error("agent should not run");
+        },
+      },
+      generateRunId: () => "wfr_args_demo",
+      runnerId: "runner-a",
+      clock: {
+        nowIso: () => "2026-05-29T00:00:00.000Z",
+        nowMs: () => 1_000,
+      },
+    });
+
+    const result = await service.startNamedWorkflow({
+      name: "args-demo",
+      workspaceId: "workspace-1",
+      projectTrusted: true,
+      args: { input: '"src folder" --review-only --max-findings=3 --mode quick' },
+    });
+    const run = await runStore.getRun("wfr_args_demo");
+
+    expect(run.args).toEqual({ target: "src folder", fix: false, maxFindings: 3, mode: "quick" });
+    expect(result).toEqual({
+      runId: "wfr_args_demo",
+      status: "completed",
+      result: {
+        reportMarkdown:
+          '```json\n{\n  "target": "src folder",\n  "fix": false,\n  "maxFindings": 3,\n  "mode": "quick"\n}\n```',
+        structuredOutput: {
+          args: { target: "src folder", fix: false, maxFindings: 3, mode: "quick" },
+          schema: {
+            type: "object",
+            required: ["summary"],
+            properties: { summary: { type: "string" }, optionalNote: { type: "string" } },
+            additionalProperties: false,
+          },
+          list: ["a", "b"],
+          bounded: 5,
+          patch: {
+            success: true,
+            status: "applied",
+            taskId: "task_patch",
+          },
+          compacted: "abc\n[truncated by mux.utils.compactText after 3 characters]",
+        },
+      },
+    });
+  });
+
+  test("normalizes quoted Windows paths and nullable workflow args", () => {
+    const source = `const s = mux.schema;
+export const metadata = {
+  argsSchema: s.object({
+    target: s.string({ positional: true }),
+    path: s.optional(s.string({ aliases: ["--path"] })),
+    note: s.optional(s.nullable(s.string())),
+  }),
+};
+export default function workflow() { return { reportMarkdown: "ok" }; }
+`;
+
+    const result = normalizeWorkflowArgsForSource(source, {
+      input: `'C:\\Users\\Ada\\my repo' --path="D:\\Tools\\Mux Dir"`,
+      note: null,
+    });
+
+    expect(result.args).toEqual({
+      target: "C:\\Users\\Ada\\my repo",
+      path: "D:\\Tools\\Mux Dir",
+      note: null,
+    });
+  });
+
+  test("uses a declared input args field as fallback positional text", () => {
+    const source = `const s = mux.schema;
+export const metadata = {
+  argsSchema: s.object({
+    input: s.string(),
+    mode: s.optional(s.string({ default: "fast", aliases: ["--mode"] })),
+  }),
+};
+export default function workflow() { return { reportMarkdown: "ok" }; }
+`;
+
+    expect(
+      normalizeWorkflowArgsForSource(source, { input: "hello world --mode slow" }).args
+    ).toEqual({
+      input: "hello world",
+      mode: "slow",
+    });
+    expect(normalizeWorkflowArgsForSource(source, { input: "compare foo --bar" }).args).toEqual({
+      input: "compare foo --bar",
+      mode: "fast",
+    });
+    expect(normalizeWorkflowArgsForSource(source, { input: "hello --mode=--help" }).args).toEqual({
+      input: "hello",
+      mode: "--help",
+    });
+    expect(normalizeWorkflowArgsForSource(source, { input: "compare --flag=" }).args).toEqual({
+      input: "compare --flag=",
+      mode: "fast",
+    });
+    expect(normalizeWorkflowArgsForSource(source, "hello world").args).toEqual({
+      input: "hello world",
+      mode: "fast",
+    });
+  });
+
+  test("parses aliases when input accompanies an explicit positional field", () => {
+    const source = `const s = mux.schema;
+export const metadata = {
+  argsSchema: s.object({
+    topic: s.optional(s.string({ positional: true })),
+    input: s.optional(s.string()),
+    quick: s.optional(s.boolean({ default: false, aliases: ["--quick"] })),
+  }),
+};
+export default function workflow() { return { reportMarkdown: "ok" }; }
+`;
+
+    expect(normalizeWorkflowArgsForSource(source, { input: "agents --quick" }).args).toEqual({
+      topic: "agents",
+      input: "agents --quick",
+      quick: true,
+    });
+  });
+
+  test("preserves structured args over parsed transport input", () => {
+    const source = `const s = mux.schema;
+export const metadata = {
+  argsSchema: s.object({
+    topic: s.optional(s.string()),
+    input: s.optional(s.string()),
+    query: s.optional(s.string()),
+    quick: s.optional(s.boolean({ default: false, aliases: ["--quick"] })),
+  }),
+};
+export default function workflow() { return { reportMarkdown: "ok" }; }
+`;
+
+    expect(
+      normalizeWorkflowArgsForSource(source, { query: "parsed query", input: "raw topic --quick" })
+        .args
+    ).toEqual({
+      query: "parsed query",
+      input: "raw topic",
+      quick: true,
+    });
+    expect(
+      normalizeWorkflowArgsForSource(source, {
+        topic: "explicit topic",
+        input: "raw topic --quick",
+      }).args
+    ).toEqual({
+      topic: "explicit topic",
+      input: "raw topic",
+      quick: true,
+    });
+  });
+
+  test("normalizes exact short flag aliases before positional args", () => {
+    const source = `const s = mux.schema;
+export const metadata = {
+  argsSchema: s.object({
+    target: s.optional(s.string({ positional: true })),
+    help: s.optional(s.boolean({ default: false, aliases: ["--help", "-h"] })),
+  }),
+};
+export default function workflow() { return { reportMarkdown: "ok" }; }
+`;
+
+    expect(normalizeWorkflowArgsForSource(source, { input: "-h" }).args).toEqual({
+      help: true,
+    });
+  });
+
+  test("runs workflows with metadata strings that contain declaration terminator text", async () => {
+    using tmp = new DisposableTempDir("workflow-service-metadata-terminator");
+    const projectRoot = path.join(tmp.path, "project", ".mux", "workflows");
+    const globalRoot = path.join(tmp.path, "mux-home", "workflows");
+    const source = `export const metadata = { description: "desc }; suffix" };
+export default function workflow() { return { reportMarkdown: metadata.description }; }
+`;
+    await writeWorkflow(globalRoot, "terminator", source);
+    const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
+    const service = new WorkflowService({
+      definitionStore: new WorkflowDefinitionStore({ projectRoot, globalRoot, builtIns: [] }),
+      runStore,
+      runtimeFactory: new QuickJSRuntimeFactory(),
+      taskAdapter: {
+        async runAgent() {
+          throw new Error("agent should not run");
+        },
+      },
+      generateRunId: () => "wfr_terminator",
+      runnerId: "runner-a",
+      clock: {
+        nowIso: () => "2026-05-29T00:00:00.000Z",
+        nowMs: () => 1_000,
+      },
+    });
+
+    await expect(service.listDefinitions({ projectTrusted: true })).resolves.toContainEqual(
+      expect.objectContaining({ name: "terminator", description: "desc }; suffix" })
+    );
+    await expect(
+      service.startNamedWorkflow({
+        name: "terminator",
+        workspaceId: "workspace-1",
+        projectTrusted: true,
+        args: {},
+      })
+    ).resolves.toEqual({
+      runId: "wfr_terminator",
+      status: "completed",
+      result: { reportMarkdown: "desc }; suffix" },
+    });
+  });
+
+  test("runs parallel agent maps through mux.parallelMap", async () => {
+    using tmp = new DisposableTempDir("workflow-service-parallel-map");
+    const projectRoot = path.join(tmp.path, "project", ".mux", "workflows");
+    const globalRoot = path.join(tmp.path, "mux-home", "workflows");
+    await writeWorkflow(
+      globalRoot,
+      "parallel-map",
+      `export const metadata = { description: "Parallel map workflow" };
+export default function workflow() {
+  const results = mux.parallelMap({
+    id: "lane",
+    items: ["reuse", "quality"],
+    stepId: function (item) { return "review-" + item; },
+    title: function (item) { return "Review " + item; },
+    agentId: "explore",
+    prompt: function (item) { return "Review " + item; },
+    outputSchema: mux.schema.object({ summary: mux.schema.string() }),
+  });
+  return { reportMarkdown: "done", structuredOutput: { summaries: results.map(function (result) { return result.structuredOutput.summary; }) } };
+}
+`
+    );
+    const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
+    const service = new WorkflowService({
+      definitionStore: new WorkflowDefinitionStore({ projectRoot, globalRoot, builtIns: [] }),
+      runStore,
+      runtimeFactory: new QuickJSRuntimeFactory(),
+      taskAdapter: {
+        async runAgent(spec) {
+          return {
+            taskId: "task_" + spec.id,
+            reportMarkdown: "ok",
+            structuredOutput: { summary: spec.prompt },
+          };
+        },
+      },
+      generateRunId: () => "wfr_parallel_map",
+      runnerId: "runner-a",
+    });
+
+    const result = await service.startNamedWorkflow({
+      name: "parallel-map",
+      workspaceId: "workspace-1",
+      projectTrusted: true,
+      args: {},
+    });
+    const run = await runStore.getRun("wfr_parallel_map");
+
+    expect(result.result).toEqual({
+      reportMarkdown: "done",
+      structuredOutput: { summaries: ["Review reuse", "Review quality"] },
+    });
+    expect(run.steps.map((step) => step.stepId)).toEqual(["review-reuse", "review-quality"]);
+  });
+
+  test("rejects invalid workflow args before creating a run", async () => {
+    using tmp = new DisposableTempDir("workflow-service-args-schema-invalid");
+    const projectRoot = path.join(tmp.path, "project", ".mux", "workflows");
+    const globalRoot = path.join(tmp.path, "mux-home", "workflows");
+    await writeWorkflow(
+      globalRoot,
+      "args-invalid",
+      `export const metadata = {
+  description: "Args schema workflow",
+  argsSchema: {
+    type: "object",
+    properties: { maxFindings: { type: "integer", minimum: 1, aliases: ["--max-findings"] } },
+  },
+};
+export default function workflow() { return { reportMarkdown: "should not run" }; }
+`
+    );
+    const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
+    const service = new WorkflowService({
+      definitionStore: new WorkflowDefinitionStore({ projectRoot, globalRoot, builtIns: [] }),
+      runStore,
+      runtimeFactory: new QuickJSRuntimeFactory(),
+      taskAdapter: {
+        async runAgent() {
+          throw new Error("agent should not run");
+        },
+      },
+      generateRunId: () => "wfr_args_invalid",
+      runnerId: "runner-a",
+    });
+
+    await expect(
+      service.startNamedWorkflow({
+        name: "args-invalid",
+        workspaceId: "workspace-1",
+        projectTrusted: true,
+        args: { input: "--max-findings 0" },
+      })
+    ).rejects.toThrow("Workflow argument maxFindings must be >= 1");
+    await expect(runStore.getRun("wfr_args_invalid")).rejects.toThrow(
+      /ENOENT|Workflow run not found/
+    );
+  });
+
   test("runs a nested workflow through action.workflows.start and reuses the child on replay", async () => {
     using tmp = new DisposableTempDir("workflow-service-nested");
     const workspaceRoot = path.join(tmp.path, "project");
@@ -280,12 +639,12 @@ export default function workflow({ args, agent }) {
     await writeWorkflow(
       globalRoot,
       "child-simple",
-      "// description: Child workflow\nexport default function workflow({ args }) { return { reportMarkdown: 'Child: ' + args.topic }; }\n"
+      "export const metadata = { description: \"Child workflow\" };\nexport default function workflow({ args }) { return { reportMarkdown: 'Child: ' + args.topic }; }\n"
     );
     await writeWorkflow(
       globalRoot,
       "parent-simple",
-      `// description: Parent workflow
+      `export const metadata = { description: "Parent workflow" };
       export default function workflow({ args, action }) {
         const child = action.workflows.start({
           id: "child-simple",
@@ -379,9 +738,9 @@ export default function workflow({ args, agent }) {
     await writeWorkflow(
       globalRoot,
       "child-cwd",
-      "// description: Child cwd\nexport default function workflow() { return { reportMarkdown: 'child' }; }\n"
+      "export const metadata = { description: \"Child cwd\" };\nexport default function workflow() { return { reportMarkdown: 'child' }; }\n"
     );
-    const parentSource = `// description: Parent cwd
+    const parentSource = `export const metadata = { description: "Parent cwd" };
 export default function workflow({ action }) {
   return action.workflows.start({
     id: "child-cwd",
@@ -446,12 +805,12 @@ export default function workflow({ action }) {
     await writeWorkflow(
       globalRoot,
       "child-null-args",
-      "// description: Child null args\nexport default function workflow({ args }) { return { reportMarkdown: String(args === null) }; }\n"
+      'export const metadata = { description: "Child null args" };\nexport default function workflow({ args }) { return { reportMarkdown: String(args === null) }; }\n'
     );
     await writeWorkflow(
       globalRoot,
       "parent-null-args",
-      `// description: Parent null args
+      `export const metadata = { description: "Parent null args" };
 export default function workflow({ action }) {
   return action.workflows.start({
     id: "child-null-args",
@@ -496,12 +855,12 @@ export default function workflow({ action }) {
     await writeWorkflow(
       globalRoot,
       "child-fails",
-      "// description: Child fails\nexport default function workflow() { throw new Error('child boom'); }\n"
+      "export const metadata = { description: \"Child fails\" };\nexport default function workflow() { throw new Error('child boom'); }\n"
     );
     await writeWorkflow(
       globalRoot,
       "parent-catches-child-failure",
-      `// description: Parent catches child failure
+      `export const metadata = { description: "Parent catches child failure" };
 export default function workflow({ action }) {
   try {
     action.workflows.start({
@@ -564,12 +923,12 @@ export default function workflow({ action }) {
     await writeWorkflow(
       projectRoot,
       "child-project",
-      "// description: Project child\nexport default function workflow() { return { reportMarkdown: 'project child' }; }\n"
+      "export const metadata = { description: \"Project child\" };\nexport default function workflow() { return { reportMarkdown: 'project child' }; }\n"
     );
     await writeWorkflow(
       globalRoot,
       "parent-project-child",
-      `// description: Parent project child
+      `export const metadata = { description: "Parent project child" };
 export default function workflow({ action }) {
   return action.workflows.start({
     id: "child-project",
@@ -616,7 +975,7 @@ export default function workflow({ action }) {
     await writeWorkflow(
       globalRoot,
       "scheduled-scan",
-      "// description: Scheduled scan\nexport default function workflow({ agent }) { return agent({ id: 'scope', prompt: 'scope security surface' }); }\n"
+      "export const metadata = { description: \"Scheduled scan\" };\nexport default function workflow({ agent }) { return agent({ id: 'scope', prompt: 'scope security surface' }); }\n"
     );
 
     let releaseAgent: ((value: { taskId: string; reportMarkdown: string }) => void) | undefined;
@@ -711,7 +1070,7 @@ export default function workflow({ action }) {
     await writeWorkflow(
       scratchRoot,
       "scratch-research",
-      "// description: Scratch research\nexport default function workflow({ args }) { return { reportMarkdown: 'Topic: ' + args.topic }; }\n"
+      "export const metadata = { description: \"Scratch research\" };\nexport default function workflow({ args }) { return { reportMarkdown: 'Topic: ' + args.topic }; }\n"
     );
     const result = await service.startNamedWorkflow({
       name: "scratch-research",
@@ -729,7 +1088,7 @@ export default function workflow({ action }) {
     expect(run.definition.scope).toBe("scratch");
     await expect(
       fs.readFile(path.join(scratchRoot, "scratch-research.js"), "utf-8")
-    ).resolves.toContain("// description: Scratch research");
+    ).resolves.toContain('description: "Scratch research"');
     await expect(fs.readFile(path.join(scratchRoot, ".gitignore"), "utf-8")).rejects.toThrow();
   });
 
@@ -740,12 +1099,12 @@ export default function workflow({ action }) {
     await writeWorkflow(
       projectRoot,
       "demo",
-      "// description: Project workflow\nexport default function workflow() { return null; }\n"
+      'export const metadata = { description: "Project workflow" };\nexport default function workflow() { return null; }\n'
     );
     await writeWorkflow(
       globalRoot,
       "demo",
-      "// description: Global workflow\nexport default function workflow() { return null; }\n"
+      'export const metadata = { description: "Global workflow" };\nexport default function workflow() { return null; }\n'
     );
 
     const service = new WorkflowService({
@@ -835,7 +1194,7 @@ export default function workflow({ action }) {
     await writeWorkflow(
       globalRoot,
       "abortable",
-      "// description: Abortable workflow\nexport default function workflow({ agent }) { return agent({ id: 'slow-step', prompt: 'slow' }); }\n"
+      "export const metadata = { description: \"Abortable workflow\" };\nexport default function workflow({ agent }) { return agent({ id: 'slow-step', prompt: 'slow' }); }\n"
     );
     const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
     let agentWaitStarted = false;
@@ -896,7 +1255,7 @@ export default function workflow({ action }) {
     await writeWorkflow(
       globalRoot,
       "workspace-owned",
-      "// description: Workspace-owned workflow\nexport default function workflow({ agent }) { return agent({ id: 'slow-step', prompt: 'slow' }); }\n"
+      "export const metadata = { description: \"Workspace-owned workflow\" };\nexport default function workflow({ agent }) { return agent({ id: 'slow-step', prompt: 'slow' }); }\n"
     );
     const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
     let releaseAgent: ((value: { taskId: string; reportMarkdown: string }) => void) | undefined;
@@ -952,7 +1311,7 @@ export default function workflow({ action }) {
     await writeWorkflow(
       globalRoot,
       "interrupt-active",
-      "// description: Interrupt active\nexport default function workflow({ agent }) { return agent({ id: 'slow-step', prompt: 'slow' }); }\n"
+      "export const metadata = { description: \"Interrupt active\" };\nexport default function workflow({ agent }) { return agent({ id: 'slow-step', prompt: 'slow' }); }\n"
     );
     const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
     let agentWaitStarted = false;
@@ -1033,12 +1392,12 @@ export default function workflow({ action }) {
     await writeWorkflow(
       globalRoot,
       "child-interruptible",
-      "// description: Child interruptible\nexport default function workflow({ agent }) { return agent({ id: 'slow-child', prompt: 'slow' }); }\n"
+      "export const metadata = { description: \"Child interruptible\" };\nexport default function workflow({ agent }) { return agent({ id: 'slow-child', prompt: 'slow' }); }\n"
     );
     await writeWorkflow(
       globalRoot,
       "parent-interruptible",
-      `// description: Parent interruptible
+      `export const metadata = { description: "Parent interruptible" };
 export default function workflow({ action }) {
   return action.workflows.start({
     id: "child-interruptible",
@@ -1209,12 +1568,12 @@ export default function workflow({ action }) {
     await writeWorkflow(
       globalRoot,
       "child-direct-interruptible",
-      "// description: Child direct interruptible\nexport default function workflow({ agent }) { return agent({ id: 'slow-child', prompt: 'slow' }); }\n"
+      "export const metadata = { description: \"Child direct interruptible\" };\nexport default function workflow({ agent }) { return agent({ id: 'slow-child', prompt: 'slow' }); }\n"
     );
     await writeWorkflow(
       globalRoot,
       "parent-direct-interruptible",
-      `// description: Parent direct interruptible
+      `export const metadata = { description: "Parent direct interruptible" };
 export default function workflow({ action }) {
   return action.workflows.start({
     id: "child-direct-interruptible",
@@ -1311,12 +1670,12 @@ export default function workflow({ action }) {
     await writeWorkflow(
       globalRoot,
       "child-backgroundable",
-      "// description: Child backgroundable\nexport default function workflow({ agent }) { const result = agent({ id: 'slow-child', prompt: 'slow' }); return { reportMarkdown: 'Child ' + result.reportMarkdown }; }\n"
+      "export const metadata = { description: \"Child backgroundable\" };\nexport default function workflow({ agent }) { const result = agent({ id: 'slow-child', prompt: 'slow' }); return { reportMarkdown: 'Child ' + result.reportMarkdown }; }\n"
     );
     await writeWorkflow(
       globalRoot,
       "parent-backgroundable",
-      `// description: Parent backgroundable
+      `export const metadata = { description: "Parent backgroundable" };
 export default function workflow({ action }) {
   const child = action.workflows.start({
     id: "child-backgroundable",
@@ -1389,7 +1748,7 @@ export default function workflow({ action }) {
     await writeWorkflow(
       globalRoot,
       "backgroundable",
-      "// description: Backgroundable workflow\nexport default function workflow({ agent }) { return agent({ id: 'slow-step', prompt: 'slow' }); }\n"
+      "export const metadata = { description: \"Backgroundable workflow\" };\nexport default function workflow({ agent }) { return agent({ id: 'slow-step', prompt: 'slow' }); }\n"
     );
     const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
     let calls = 0;
@@ -1433,7 +1792,7 @@ export default function workflow({ action }) {
     await writeWorkflow(
       globalRoot,
       "foreground-only",
-      "// description: Foreground-only workflow\nexport default function workflow({ agent }) { return agent({ id: 'slow-step', prompt: 'slow' }); }\n"
+      "export const metadata = { description: \"Foreground-only workflow\" };\nexport default function workflow({ agent }) { return agent({ id: 'slow-step', prompt: 'slow' }); }\n"
     );
     const backgroundFlags: Array<boolean | undefined> = [];
     const service = new WorkflowService({
@@ -2396,7 +2755,7 @@ export default function workflow({ action }) {
       scope: "global",
       executable: true,
     });
-    expect(promotedSource).toContain("// description: Promoted research workflow");
+    expect(promotedSource).toContain('description: "Promoted research workflow"');
     expect(promotedSource).toContain("reportMarkdown: 'scratch'");
     await expect(service.listDefinitions({ projectTrusted: false })).resolves.toEqual([
       expect.objectContaining({ name: "promoted-research", scope: "global" }),
@@ -2429,7 +2788,7 @@ export default function workflow({ action }) {
     await writeWorkflow(
       scratchRoot,
       "scratch-draft",
-      "// description: Scratch draft\nexport default function workflow() { return { reportMarkdown: 'draft' }; }\n"
+      "export const metadata = { description: \"Scratch draft\" };\nexport default function workflow() { return { reportMarkdown: 'draft' }; }\n"
     );
 
     const descriptor = await service.promoteScratchDefinition({
@@ -2448,7 +2807,7 @@ export default function workflow({ action }) {
       scope: "project",
       executable: true,
     });
-    expect(promotedSource).toContain("// description: Reusable scratch draft");
+    expect(promotedSource).toContain('description: "Reusable scratch draft"');
     expect(promotedSource).toContain("reportMarkdown: 'draft'");
   });
 
@@ -2459,7 +2818,7 @@ export default function workflow({ action }) {
     await writeWorkflow(
       globalRoot,
       "background-research",
-      "// description: Background workflow\nexport default function workflow({ agent }) { return agent({ id: 'slow-step', prompt: 'slow' }); }\n"
+      "export const metadata = { description: \"Background workflow\" };\nexport default function workflow({ agent }) { return agent({ id: 'slow-step', prompt: 'slow' }); }\n"
     );
     const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
     let releaseAgent: ((value: { taskId: string; reportMarkdown: string }) => void) | undefined;
@@ -2529,7 +2888,7 @@ export default function workflow({ action }) {
     await writeWorkflow(
       globalRoot,
       "interruptable-background",
-      "// description: Interruptable background workflow\nexport default function workflow({ agent }) { return agent({ id: 'slow-step', prompt: 'slow' }); }\n"
+      "export const metadata = { description: \"Interruptable background workflow\" };\nexport default function workflow({ agent }) { return agent({ id: 'slow-step', prompt: 'slow' }); }\n"
     );
     const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
     let agentStarted = false;
@@ -2593,7 +2952,7 @@ export default function workflow({ action }) {
     await writeWorkflow(
       globalRoot,
       "logged-interrupt-background",
-      "// description: Logged interrupt background workflow\nexport default function workflow({ agent }) { return agent({ id: 'slow-step', prompt: 'slow' }); }\n"
+      "export const metadata = { description: \"Logged interrupt background workflow\" };\nexport default function workflow({ agent }) { return agent({ id: 'slow-step', prompt: 'slow' }); }\n"
     );
     const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
     let agentStarted = false;
@@ -2832,7 +3191,7 @@ export default function workflow({ action }) {
     using tmp = new DisposableTempDir("workflow-service");
     const projectRoot = path.join(tmp.path, "project", ".mux", "workflows");
     const globalRoot = path.join(tmp.path, "mux-home", "workflows");
-    const source = `// description: Demo workflow
+    const source = `export const metadata = { description: "Demo workflow" };
 export default function workflow() {
   return { reportMarkdown: "ok" };
 }

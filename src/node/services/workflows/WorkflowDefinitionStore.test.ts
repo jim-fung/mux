@@ -21,7 +21,7 @@ async function writeWorkflow(
   await fs.mkdir(root, { recursive: true });
   await fs.writeFile(
     path.join(root, `${name}.js`),
-    `// description: ${description}\nexport default async function workflow({ args }) { ${body} }\n`,
+    `export const metadata = { description: "${description}" };\nexport default async function workflow({ args }) { ${body} }\n`,
     "utf-8"
   );
 }
@@ -105,6 +105,44 @@ describe("WorkflowDefinitionStore", () => {
     expect(definitions.find((definition) => definition.name === "demo")?.description).toBe(
       "Project demo"
     );
+  });
+
+  test("discovers workflows with legacy description headers", async () => {
+    using tmp = new DisposableTempDir("workflow-definitions-legacy-description");
+    const projectRoot = path.join(tmp.path, "project", ".mux", "workflows");
+    const globalRoot = path.join(tmp.path, "mux-home", "workflows");
+    await fs.mkdir(projectRoot, { recursive: true });
+    await fs.writeFile(
+      path.join(projectRoot, "legacy.js"),
+      "// description: Legacy project workflow\nexport default function workflow() { return { reportMarkdown: 'ok' }; }\n",
+      "utf-8"
+    );
+    const store = new WorkflowDefinitionStore({ projectRoot, globalRoot, builtIns: [] });
+
+    const definitions = await store.listDefinitions({ projectTrusted: true });
+    const definition = await store.readDefinition("legacy", { projectTrusted: true });
+
+    expect(definitions.find((item) => item.name === "legacy")?.description).toBe(
+      "Legacy project workflow"
+    );
+    expect(definition.descriptor.description).toBe("Legacy project workflow");
+  });
+
+  test("ignores legacy description comments outside the header", async () => {
+    using tmp = new DisposableTempDir("workflow-definitions-legacy-body-description");
+    const projectRoot = path.join(tmp.path, "project", ".mux", "workflows");
+    const globalRoot = path.join(tmp.path, "mux-home", "workflows");
+    await fs.mkdir(projectRoot, { recursive: true });
+    await fs.writeFile(
+      path.join(projectRoot, "body-comment.js"),
+      "export default function workflow() {\n  // description: Body comments are not workflow headers\n  return { reportMarkdown: 'ok' };\n}\n",
+      "utf-8"
+    );
+    const store = new WorkflowDefinitionStore({ projectRoot, globalRoot, builtIns: [] });
+
+    const definitions = await store.listDefinitions({ projectTrusted: true });
+
+    expect(definitions).toEqual([]);
   });
 
   test("omits project-local workflows when the project is not trusted", async () => {
@@ -328,7 +366,7 @@ describe("WorkflowDefinitionStore", () => {
       },
     ]);
     expect(definition.descriptor.scope).toBe("scratch");
-    expect(definition.source).toContain("// description: Workspace scratch demo");
+    expect(definition.source).toContain('description: "Workspace scratch demo"');
     expect(definition.source).toContain("reportMarkdown: 'scratch'");
     expect(await pathExists(path.join(scratchRoot, ".gitignore"))).toBe(false);
     expect(gitExclude).toContain("# mux: local scratch workflow drafts");
@@ -733,7 +771,7 @@ describe("WorkflowDefinitionStore", () => {
       path.join(localWorkflowRoot, "promoted-demo.js"),
       "utf-8"
     );
-    expect(promotedSource).toContain("// description: Promoted over runtime");
+    expect(promotedSource).toContain('description: "Promoted over runtime"');
 
     let duplicateError: unknown;
     try {
@@ -754,12 +792,143 @@ describe("WorkflowDefinitionStore", () => {
     expect(duplicateError.message).toMatch(/already exists/);
   });
 
+  test("promotion preserves existing metadata args schema", async () => {
+    using tmp = new DisposableTempDir("workflow-definitions");
+    const projectRoot = path.join(tmp.path, "project", ".mux", "workflows");
+    const globalRoot = path.join(tmp.path, "mux-home", "workflows");
+    const store = new WorkflowDefinitionStore({ projectRoot, globalRoot, builtIns: [] });
+
+    await store.promoteDefinition({
+      name: "schema-draft",
+      description: "Reusable schema draft",
+      source:
+        'export const metadata = { description: "Scratch schema draft", argsSchema: { type: "object", properties: { target: { type: "string" } } } };\nexport default function workflow({ args }) { return { reportMarkdown: args.target }; }\n',
+      location: "project",
+      overwrite: false,
+      projectTrusted: true,
+    });
+
+    const promotedSource = await fs.readFile(path.join(projectRoot, "schema-draft.js"), "utf-8");
+    expect(promotedSource).toContain('description: "Reusable schema draft"');
+    expect(promotedSource).toContain("argsSchema");
+    expect(promotedSource).toContain('target: { type: "string" }');
+    expect(() => new Bun.Transpiler({ loader: "js" }).transformSync(promotedSource)).not.toThrow();
+  });
+
+  test("promotion adds descriptions to existing metadata without descriptions", async () => {
+    using tmp = new DisposableTempDir("workflow-definitions");
+    const projectRoot = path.join(tmp.path, "project", ".mux", "workflows");
+    const globalRoot = path.join(tmp.path, "mux-home", "workflows");
+    const store = new WorkflowDefinitionStore({ projectRoot, globalRoot, builtIns: [] });
+
+    await store.promoteDefinition({
+      name: "schema-only-draft",
+      description: "Reusable schema-only draft",
+      source:
+        'export const metadata = { argsSchema: { type: "object", properties: { target: { type: "string" } } } };\nexport default function workflow({ args }) { return { reportMarkdown: args.target }; }\n',
+      location: "project",
+      overwrite: false,
+      projectTrusted: true,
+    });
+
+    const promotedSource = await fs.readFile(
+      path.join(projectRoot, "schema-only-draft.js"),
+      "utf-8"
+    );
+    expect(promotedSource).toContain('description: "Reusable schema-only draft"');
+    expect(promotedSource).toContain("argsSchema");
+    expect(promotedSource.match(/export const metadata/g)).toHaveLength(1);
+    expect(() => new Bun.Transpiler({ loader: "js" }).transformSync(promotedSource)).not.toThrow();
+  });
+
+  test("promotion replaces template-literal metadata descriptions", async () => {
+    using tmp = new DisposableTempDir("workflow-definitions");
+    const projectRoot = path.join(tmp.path, "project", ".mux", "workflows");
+    const globalRoot = path.join(tmp.path, "mux-home", "workflows");
+    const store = new WorkflowDefinitionStore({ projectRoot, globalRoot, builtIns: [] });
+
+    await store.promoteDefinition({
+      name: "template-description-draft",
+      description: "Reusable template draft",
+      source:
+        'export const metadata = { description: `Scratch template draft`, argsSchema: { type: "object" } };\nexport default function workflow() { return { reportMarkdown: metadata.description }; }\n',
+      location: "project",
+      overwrite: false,
+      projectTrusted: true,
+    });
+
+    const promotedSource = await fs.readFile(
+      path.join(projectRoot, "template-description-draft.js"),
+      "utf-8"
+    );
+    expect(promotedSource).toContain('description: "Reusable template draft"');
+    expect(promotedSource.match(/export const metadata/g)).toHaveLength(1);
+    expect(() => new Bun.Transpiler({ loader: "js" }).transformSync(promotedSource)).not.toThrow();
+  });
+
+  test("promotion rejects interpolated template-literal metadata descriptions", async () => {
+    using tmp = new DisposableTempDir("workflow-definitions");
+    const projectRoot = path.join(tmp.path, "project", ".mux", "workflows");
+    const globalRoot = path.join(tmp.path, "mux-home", "workflows");
+    const store = new WorkflowDefinitionStore({ projectRoot, globalRoot, builtIns: [] });
+
+    let promotionError: unknown;
+    try {
+      await store.promoteDefinition({
+        name: "dynamic-description-draft",
+        description: "Reusable dynamic draft",
+        source:
+          'const branch = "main";\nexport const metadata = { description: `Scratch ${branch}` };\nexport default function workflow() { return { reportMarkdown: "ok" }; }\n',
+        location: "project",
+        overwrite: false,
+        projectTrusted: true,
+      });
+    } catch (error) {
+      promotionError = error;
+    }
+
+    expect(promotionError).toBeInstanceOf(Error);
+    expect(promotionError instanceof Error ? promotionError.message : "").toMatch(
+      /Workflow metadata/
+    );
+  });
+
+  test("promotion preserves body-only legacy description comments", async () => {
+    using tmp = new DisposableTempDir("workflow-definitions");
+    const projectRoot = path.join(tmp.path, "project", ".mux", "workflows");
+    const globalRoot = path.join(tmp.path, "mux-home", "workflows");
+    const store = new WorkflowDefinitionStore({ projectRoot, globalRoot, builtIns: [] });
+
+    await store.promoteDefinition({
+      name: "body-description-draft",
+      description: "Reusable body draft",
+      source:
+        "export default function workflow() {\n  // description: Keep this body comment\n  return { reportMarkdown: 'ok' };\n}\n",
+      location: "project",
+      overwrite: false,
+      projectTrusted: true,
+    });
+
+    const promotedSource = await fs.readFile(
+      path.join(projectRoot, "body-description-draft.js"),
+      "utf-8"
+    );
+    expect(
+      promotedSource.startsWith('export const metadata = { description: "Reusable body draft" };')
+    ).toBe(true);
+    expect(promotedSource).toContain("// description: Keep this body comment");
+  });
+
   test("skips invalid filenames and unreadable descriptors", async () => {
     using tmp = new DisposableTempDir("workflow-definitions");
     const projectRoot = path.join(tmp.path, "project", ".mux", "workflows");
     const globalRoot = path.join(tmp.path, "mux-home", "workflows");
     await writeWorkflow(projectRoot, "valid-name", "Valid workflow");
-    await fs.writeFile(path.join(projectRoot, "BadName.js"), "// description: bad\n", "utf-8");
+    await fs.writeFile(
+      path.join(projectRoot, "BadName.js"),
+      'export const metadata = { description: "bad" };\n',
+      "utf-8"
+    );
     await fs.writeFile(
       path.join(projectRoot, "missing-description.js"),
       "export default () => null;",
