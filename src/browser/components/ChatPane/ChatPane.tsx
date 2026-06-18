@@ -833,15 +833,50 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     await restoreQueuedDraft(queuedMessage);
   }, [restoreQueuedDraft, workspaceState?.queuedMessage]);
 
+  const sendQueuedImmediatelyInFlightRef = useRef<string | null>(null);
+
+  // The backend can resolve the interrupt RPC before the queued-message-cleared
+  // event renders, so keep duplicate send-now attempts blocked until the queued
+  // message id changes or clears.
+  useEffect(() => {
+    const queuedMessageId = workspaceState?.queuedMessage?.id ?? null;
+    if (queuedMessageId !== sendQueuedImmediatelyInFlightRef.current) {
+      sendQueuedImmediatelyInFlightRef.current = null;
+    }
+  }, [workspaceState?.queuedMessage?.id]);
+
   // Handler for sending queued message immediately (interrupt + send)
   const handleSendQueuedImmediately = useCallback(async () => {
-    if (!workspaceState?.queuedMessage || !workspaceState.canInterrupt) return;
-    // Set "interrupting" state immediately so UI shows "interrupting..." without flash
-    storeRaw.setInterrupting(workspaceId);
-    await api?.workspace.interruptStream({
-      workspaceId,
-      options: { sendQueuedImmediately: true },
-    });
+    const queuedMessage = workspaceState?.queuedMessage;
+    if (
+      !api ||
+      !queuedMessage ||
+      !workspaceState.canInterrupt ||
+      sendQueuedImmediatelyInFlightRef.current === queuedMessage.id
+    ) {
+      return;
+    }
+
+    sendQueuedImmediatelyInFlightRef.current = queuedMessage.id;
+    try {
+      // Set "interrupting" state immediately so UI shows "interrupting..." without flash.
+      storeRaw.setInterrupting(workspaceId);
+      const interruptResult = await api.workspace.interruptStream({
+        workspaceId,
+        options: { sendQueuedImmediately: true },
+      });
+      if (
+        !interruptResult.success &&
+        sendQueuedImmediatelyInFlightRef.current === queuedMessage.id
+      ) {
+        sendQueuedImmediatelyInFlightRef.current = null;
+      }
+    } catch (error) {
+      if (sendQueuedImmediatelyInFlightRef.current === queuedMessage.id) {
+        sendQueuedImmediatelyInFlightRef.current = null;
+      }
+      throw error;
+    }
   }, [api, workspaceId, workspaceState?.queuedMessage, workspaceState?.canInterrupt, storeRaw]);
 
   const handleCancelCompactionFromBarrier = useCallback(() => {
@@ -1768,6 +1803,8 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
         onCancelEdit={props.onCancelEdit}
         onEditLastUserMessage={props.onEditLastUserMessage}
         canInterrupt={props.canInterrupt}
+        queuedMessage={props.queuedMessage}
+        onSendQueuedImmediately={props.onSendQueuedImmediately}
         onReady={props.onChatInputReady}
         attachedReviews={reviews.attachedReviews}
         onDetachReview={reviews.detachReview}

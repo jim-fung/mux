@@ -72,6 +72,30 @@ async function getActiveTextarea(container: HTMLElement): Promise<HTMLTextAreaEl
   );
 }
 
+async function getComposerDockTextarea(container: HTMLElement): Promise<HTMLTextAreaElement> {
+  return waitFor(
+    () => {
+      const dock = container.querySelector('[data-testid="chat-composer-dock"]');
+      if (!dock) {
+        throw new Error("Chat composer dock not found");
+      }
+
+      const textarea = dock.querySelector(
+        'textarea[aria-label="Message Claude"]'
+      ) as HTMLTextAreaElement | null;
+      if (!textarea) {
+        throw new Error("Composer textarea not found");
+      }
+      if (textarea.disabled) {
+        throw new Error("Composer textarea is disabled");
+      }
+
+      return textarea;
+    },
+    { timeout: 10_000 }
+  );
+}
+
 async function startStreamingTurn(app: AppHarness, label: string): Promise<void> {
   // Keep stream alive so queued-send mode chooser can be used.
   const longStreamingTail = " keep-streaming".repeat(600);
@@ -168,6 +192,76 @@ describe("Send dispatch modes (mock AI router)", () => {
         const { goal } = await app.env.orpc.workspace.getGoal({ workspaceId: app.workspaceId });
         expect(goal?.status).toBe("paused");
       });
+    } finally {
+      await app.dispose();
+    }
+  }, 60_000);
+
+  test("pressing Enter on an empty composer sends the queued message now", async () => {
+    const app = await createAppHarness({ branchPrefix: "queued-enter-send-now" });
+
+    try {
+      await startStreamingTurn(app, "queued enter source");
+      await waitFor(
+        () => {
+          const state = workspaceStore.getWorkspaceSidebarState(app.workspaceId);
+          if (!state.canInterrupt) {
+            throw new Error("Expected source stream to be interruptible");
+          }
+        },
+        { timeout: 30_000 }
+      );
+
+      const queuedText = "queued enter send now test";
+      await app.chat.typeWithoutSending(queuedText);
+      await openSendModeMenu(app.view.container);
+      const sendAfterTurnRow = await waitFor(
+        () => {
+          const row = Array.from(app.view.container.querySelectorAll("button")).find((button) =>
+            button.textContent?.includes("Send after turn")
+          );
+          if (!row) {
+            throw new Error("Send after turn row not found");
+          }
+          return row;
+        },
+        { timeout: 30_000 }
+      );
+      fireEvent.click(sendAfterTurnRow);
+
+      await waitFor(() => {
+        const textContent = app.view.container.textContent ?? "";
+        expect(textContent).toContain("Queued - Sending after turn");
+        expect(textContent).toContain("Send now");
+      });
+
+      const textarea = await getComposerDockTextarea(app.view.container);
+      await waitFor(() => {
+        expect(textarea.value).toBe("");
+      });
+
+      textarea.focus();
+      expect(fireEvent.keyDown(textarea, { key: "Enter", code: "Enter", charCode: 13 })).toBe(
+        false
+      );
+      // A fast second Enter press should be ignored while the send-now interrupt is in flight.
+      expect(fireEvent.keyDown(textarea, { key: "Enter", code: "Enter", charCode: 13 })).toBe(
+        false
+      );
+
+      await waitFor(
+        () => {
+          const textContent = app.view.container.textContent ?? "";
+          expect(textContent).not.toContain("Queued - Sending after turn");
+        },
+        { timeout: 30_000 }
+      );
+      await app.chat.expectTranscriptContains(`Mock response: ${queuedText}`, 60_000);
+      await app.chat.expectStreamComplete(60_000);
+      const responseMatches = app.view.container.textContent?.match(
+        new RegExp(`Mock response: ${queuedText}`, "g")
+      );
+      expect(responseMatches).toHaveLength(1);
     } finally {
       await app.dispose();
     }
