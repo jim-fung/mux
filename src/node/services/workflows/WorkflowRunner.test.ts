@@ -1130,10 +1130,13 @@ describe("WorkflowRunner", () => {
       workspaceId: "workspace-1",
       definition,
       definitionSource: `export default function workflow({ parallelAgents }) {
-        const results = parallelAgents([
-          { id: "source-a", title: "Read source 1", prompt: "Read source A" },
-          { id: "source-b", title: "Read source 2", prompt: "Read source B" },
-        ]);
+        const results = parallelAgents(
+          [
+            { id: "source-a", title: "Read source 1", prompt: "Read source A" },
+            { id: "source-b", title: "Read source 2", prompt: "Read source B" },
+          ],
+          { maxParallel: 2 }
+        );
         return { reportMarkdown: results.map((result) => result.reportMarkdown).join(" + ") };
       }`,
       args: {},
@@ -1433,6 +1436,57 @@ describe("WorkflowRunner", () => {
     expect(interruptRunCalls).toBe(1);
   });
 
+  test("preserves the original parallelAgents child failure when queued specs remain", async () => {
+    using tmp = new DisposableTempDir("workflow-runner-parallel-window-failure");
+    const store = new WorkflowRunStore({
+      sessionDir: tmp.path,
+      staleLeaseMs: WORKFLOW_RUNNER_TEST_STALE_LEASE_MS,
+    });
+    await store.createRun({
+      id: "wfr_parallel_window_failure",
+      workspaceId: "workspace-1",
+      definition,
+      definitionSource: `export default function workflow({ parallelAgents }) {
+        parallelAgents(
+          [
+            { id: "source-a", prompt: "Read source A" },
+            { id: "source-b", prompt: "Read source B" },
+            { id: "source-c", prompt: "Read source C" },
+          ],
+          { maxParallel: 2 }
+        );
+        return { reportMarkdown: "unreachable" };
+      }`,
+      args: {},
+      now: "2026-05-29T00:00:00.000Z",
+    });
+    const releaseSourceA = createDeferred();
+    const calls: string[] = [];
+    let interruptRunCalls = 0;
+    const runner = createRunner(store, {
+      async runAgent(spec) {
+        calls.push(spec.id);
+        if (spec.id === "source-a") {
+          await releaseSourceA.promise;
+          return { taskId: "task_source-a", reportMarkdown: "source-a" };
+        }
+        if (spec.id === "source-b") {
+          throw new Error("source-b failed");
+        }
+        throw new Error("source-c should stay queued after source-b fails");
+      },
+      async interruptRun() {
+        interruptRunCalls += 1;
+        releaseSourceA.resolve();
+      },
+    });
+
+    await expect(runner.run("wfr_parallel_window_failure")).rejects.toThrow("source-b failed");
+
+    expect(calls).toEqual(["source-a", "source-b"]);
+    expect(interruptRunCalls).toBe(1);
+  });
+
   test("does not interrupt sibling parallelAgents when foreground wait backgrounds", async () => {
     using tmp = new DisposableTempDir("workflow-runner");
     const store = new WorkflowRunStore({
@@ -1487,7 +1541,62 @@ describe("WorkflowRunner", () => {
     expect(interruptRunCalls).toBe(0);
   });
 
-  test("records parallelAgents validation failures before slower siblings finish", async () => {
+  test("does not complete parallelAgents when abort prevents queued tasks from launching", async () => {
+    using tmp = new DisposableTempDir("workflow-runner-parallel-abort-queued");
+    const store = new WorkflowRunStore({
+      sessionDir: tmp.path,
+      staleLeaseMs: WORKFLOW_RUNNER_TEST_STALE_LEASE_MS,
+    });
+    await store.createRun({
+      id: "wfr_parallel_abort_queued",
+      workspaceId: "workspace-1",
+      definition,
+      definitionSource: `export default function workflow({ parallelAgents }) {
+        parallelAgents([
+          { id: "source-a", prompt: "Read source A" },
+          { id: "source-b", prompt: "Read source B" },
+        ]);
+        return { reportMarkdown: "must not complete" };
+      }`,
+      args: {},
+      now: "2026-05-29T00:00:00.000Z",
+    });
+    const abortController = new AbortController();
+    let interruptRunCalls = 0;
+    const runner = createRunner(store, {
+      async runAgent() {
+        throw new Error("queued agents should not start after abort");
+      },
+      async createAgentTasks(
+        specs,
+        lifecycle?: { onTaskCreated?: (index: number, taskId: string) => Promise<void> | void }
+      ) {
+        for (const [index, spec] of specs.entries()) {
+          await lifecycle?.onTaskCreated?.(index, `task_${spec.id}`);
+        }
+        abortController.abort();
+        return specs.map((spec) => ({ taskId: `task_${spec.id}`, status: "starting" as const }));
+      },
+      async waitForAgentTask() {
+        throw new Error("queued agents should not be waited after abort");
+      },
+      async interruptRun() {
+        interruptRunCalls += 1;
+      },
+    });
+
+    await expect(
+      runner.run("wfr_parallel_abort_queued", { abortSignal: abortController.signal })
+    ).rejects.toThrow(
+      /Execution aborted|parallelAgents aborted before launching 2 queued step\(s\)/
+    );
+
+    const run = await store.getRun("wfr_parallel_abort_queued");
+    expect(interruptRunCalls).toBe(1);
+    expect(run.status).not.toBe("completed");
+  });
+
+  test("retries parallelAgents validation failures before slower siblings finish", async () => {
     using tmp = new DisposableTempDir("workflow-runner-parallel-validation-incremental");
     const store = new WorkflowRunStore({
       sessionDir: tmp.path,
@@ -1519,50 +1628,74 @@ describe("WorkflowRunner", () => {
     const sourceABlocked = new Promise<void>((resolve) => {
       releaseSourceA = resolve;
     });
-    const calls: string[] = [];
     const sourceBFailureRecorded = createDeferred();
+    const sourceBRetryStarted = createDeferred();
     const recordFailed = store.recordStepFailedAndAppendTaskEvent.bind(store);
     spyOn(store, "recordStepFailedAndAppendTaskEvent").mockImplementation(
       async (runId, input, options) => {
         try {
           await recordFailed(runId, input, options);
         } catch (error) {
-          if (input.stepId === "source-b" && input.taskId === "task_source-b_bad") {
+          if (input.stepId === "source-b" && input.taskId === "task_source-b") {
             sourceBFailureRecorded.reject(error);
           }
           throw error;
         }
-        if (input.stepId === "source-b" && input.taskId === "task_source-b_bad") {
+        if (input.stepId === "source-b" && input.taskId === "task_source-b") {
           sourceBFailureRecorded.resolve();
         }
       }
     );
+    const createAgentTasks = mock(
+      async (
+        specs: Array<{ id: string }>,
+        lifecycle?: { onTaskCreated?: (index: number, taskId: string) => Promise<void> | void }
+      ) => {
+        for (const [index, spec] of specs.entries()) {
+          await lifecycle?.onTaskCreated?.(index, `task_${spec.id}`);
+        }
+        return specs.map((spec) => ({ taskId: `task_${spec.id}`, status: "starting" as const }));
+      }
+    );
+    const waitForAgentTask = mock(async (taskId: string) => {
+      if (taskId === "task_source-a") {
+        await sourceABlocked;
+        return {
+          taskId,
+          reportMarkdown: "source-a",
+          structuredOutput: { summary: "source-a" },
+        };
+      }
+      if (taskId === "task_source-b") {
+        return { taskId, reportMarkdown: "bad" };
+      }
+      throw new Error(`unexpected waitForAgentTask call for ${taskId}`);
+    });
+    const retryPrompts: string[] = [];
     const runner = createRunner(store, {
-      async runAgent(spec) {
-        calls.push(spec.id);
-        if (spec.id === "source-a") {
-          await sourceABlocked;
-          return {
-            taskId: `task_${spec.id}`,
-            reportMarkdown: spec.id,
-            structuredOutput: { summary: spec.id },
-          };
-        }
-        if (calls.filter((id) => id === "source-b").length === 1) {
-          return { taskId: "task_source-b_bad", reportMarkdown: "bad" };
-        }
+      async runAgent(spec, lifecycle) {
+        expect(spec.id).toBe("source-b");
+        retryPrompts.push(spec.prompt);
+        await lifecycle?.onTaskCreated?.("task_source-b_retry");
+        sourceBRetryStarted.resolve();
         return {
           taskId: "task_source-b_retry",
           reportMarkdown: "source-b",
           structuredOutput: { summary: "source-b" },
         };
       },
+      createAgentTasks,
+      waitForAgentTask,
     });
 
     const runPromise = runner.run("wfr_parallel_validation_incremental");
     await sourceBFailureRecorded.promise;
+    await sourceBRetryStarted.promise;
     const runDuringSlowSibling = await store.getRun("wfr_parallel_validation_incremental");
 
+    expect(createAgentTasks).toHaveBeenCalledTimes(1);
+    expect(retryPrompts).toHaveLength(1);
+    expect(retryPrompts[0]).toContain("Previous workflow attempt 1 failed output validation");
     const validationEvent = runDuringSlowSibling.events.find(
       (event) => event.type === "validation" && event.stepId === "source-b"
     );
@@ -1575,24 +1708,125 @@ describe("WorkflowRunner", () => {
       (event) =>
         event.type === "task" &&
         event.stepId === "source-b" &&
-        event.taskId === "task_source-b_bad" &&
+        event.taskId === "task_source-b" &&
         event.status === "failed"
     );
     expect(failedTaskEvent).toMatchObject({
       type: "task",
       stepId: "source-b",
-      taskId: "task_source-b_bad",
+      taskId: "task_source-b",
       status: "failed",
     });
+    expect(runDuringSlowSibling.steps).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          stepId: "source-b",
+          status: "started",
+          taskId: "task_source-b_retry",
+        }),
+      ])
+    );
     expect(
       runDuringSlowSibling.steps.some(
-        (step) => step.stepId === "source-b" && step.status === "completed"
+        (step) => step.stepId === "source-a" && step.status === "completed"
       )
     ).toBe(false);
 
     releaseSourceA();
     await expect(runPromise).resolves.toEqual({ reportMarkdown: "source-a + source-b" });
-    expect(calls).toEqual(["source-a", "source-b", "source-b"]);
+  });
+
+  test("prioritizes validation retries over queued parallelAgents specs", async () => {
+    using tmp = new DisposableTempDir("workflow-runner-parallel-validation-priority");
+    const store = new WorkflowRunStore({
+      sessionDir: tmp.path,
+      staleLeaseMs: WORKFLOW_RUNNER_TEST_STALE_LEASE_MS,
+    });
+    await store.createRun({
+      id: "wfr_parallel_validation_priority",
+      workspaceId: "workspace-1",
+      definition,
+      definitionSource: `export default function workflow({ parallelAgents }) {
+        const results = parallelAgents(
+          [
+            {
+              id: "source-a",
+              prompt: "Summarize A",
+              outputSchema: { type: "object", required: ["summary"], properties: { summary: { type: "string" } } },
+            },
+            {
+              id: "source-b",
+              prompt: "Summarize B",
+              outputSchema: { type: "object", required: ["summary"], properties: { summary: { type: "string" } } },
+            },
+            {
+              id: "source-c",
+              prompt: "Summarize C",
+              outputSchema: { type: "object", required: ["summary"], properties: { summary: { type: "string" } } },
+            },
+          ],
+          { maxParallel: 2 }
+        );
+        return { reportMarkdown: results.map((result) => result.structuredOutput.summary).join(" + ") };
+      }`,
+      args: {},
+      now: "2026-05-29T00:00:00.000Z",
+    });
+    const releaseSourceA = createDeferred();
+    const releaseSourceBRetry = createDeferred();
+    const sourceBRetryStarted = createDeferred();
+    const sourceCStarted = createDeferred();
+    const entered: string[] = [];
+    const runner = createRunner(store, {
+      async runAgent(spec, lifecycle) {
+        entered.push(spec.id);
+        if (spec.id === "source-a") {
+          await lifecycle?.onTaskCreated?.("task_source-a");
+          await releaseSourceA.promise;
+          return {
+            taskId: "task_source-a",
+            reportMarkdown: "source-a",
+            structuredOutput: { summary: "source-a" },
+          };
+        }
+        if (spec.id === "source-b" && entered.filter((id) => id === "source-b").length === 1) {
+          await lifecycle?.onTaskCreated?.("task_source-b_bad");
+          return { taskId: "task_source-b_bad", reportMarkdown: "bad" };
+        }
+        if (spec.id === "source-b") {
+          await lifecycle?.onTaskCreated?.("task_source-b_retry");
+          sourceBRetryStarted.resolve();
+          await releaseSourceBRetry.promise;
+          return {
+            taskId: "task_source-b_retry",
+            reportMarkdown: "source-b",
+            structuredOutput: { summary: "source-b" },
+          };
+        }
+        if (spec.id === "source-c") {
+          await lifecycle?.onTaskCreated?.("task_source-c");
+          sourceCStarted.resolve();
+          return {
+            taskId: "task_source-c",
+            reportMarkdown: "source-c",
+            structuredOutput: { summary: "source-c" },
+          };
+        }
+        throw new Error(`unexpected spec ${spec.id}`);
+      },
+    });
+
+    const runPromise = runner.run("wfr_parallel_validation_priority");
+    await sourceBRetryStarted.promise;
+
+    expect(entered).toEqual(["source-a", "source-b", "source-b"]);
+
+    releaseSourceBRetry.resolve();
+    await sourceCStarted.promise;
+    expect(entered).toEqual(["source-a", "source-b", "source-b", "source-c"]);
+
+    releaseSourceA.resolve();
+    await expect(runPromise).resolves.toEqual({ reportMarkdown: "source-a + source-b + source-c" });
   });
 
   test("retries only failed parallelAgents steps after structured output validation errors", async () => {
