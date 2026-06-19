@@ -2,10 +2,11 @@
 import { describe, expect, mock, test } from "bun:test";
 import { z } from "zod";
 
+import { Ok } from "@/common/types/result";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
-import { getToolsForModel } from "./tools";
+import { getToolsForModel, type WorkspaceHeartbeatToolService } from "./tools";
 
 const DESKTOP_TOOL_NAMES = [
   "desktop_screenshot",
@@ -88,6 +89,78 @@ describe("getToolsForModel", () => {
       initStateManager
     );
     expect(toolsWithReport.agent_report).toBeDefined();
+  });
+
+  test("includes heartbeat only when the heartbeat service and experiment are configured", async () => {
+    const runtime = new LocalRuntime(process.cwd());
+    const initStateManager = createInitStateManager();
+
+    const toolsWithoutHeartbeat = await getToolsForModel(
+      "noop:model",
+      {
+        cwd: process.cwd(),
+        runtime,
+        runtimeTempDir: "/tmp",
+        workspaceId: "ws-1",
+        experiments: { workspaceHeartbeats: true },
+      },
+      "ws-1",
+      initStateManager
+    );
+    expect(toolsWithoutHeartbeat.heartbeat).toBeUndefined();
+
+    const heartbeatService: WorkspaceHeartbeatToolService = {
+      getHeartbeatSettings: mock(() => null),
+      setHeartbeatSettings: mock(() =>
+        Promise.resolve(
+          Ok({ enabled: true, intervalMs: 30 * 60 * 1000, contextMode: "normal" as const })
+        )
+      ),
+      unsetHeartbeatSettings: mock(() => Promise.resolve(Ok(undefined))),
+    };
+    const toolsWithExperimentDisabled = await getToolsForModel(
+      "noop:model",
+      {
+        cwd: process.cwd(),
+        runtime,
+        runtimeTempDir: "/tmp",
+        workspaceId: "ws-1",
+        workspaceHeartbeatService: heartbeatService,
+      },
+      "ws-1",
+      initStateManager
+    );
+    expect(toolsWithExperimentDisabled.heartbeat).toBeUndefined();
+
+    const toolsWithHeartbeat = await getToolsForModel(
+      "noop:model",
+      {
+        cwd: process.cwd(),
+        runtime,
+        runtimeTempDir: "/tmp",
+        workspaceId: "ws-1",
+        experiments: { workspaceHeartbeats: true },
+        workspaceHeartbeatService: heartbeatService,
+      },
+      "ws-1",
+      initStateManager
+    );
+    const childToolsWithHeartbeat = await getToolsForModel(
+      "noop:model",
+      {
+        cwd: process.cwd(),
+        runtime,
+        runtimeTempDir: "/tmp",
+        workspaceId: "child-ws",
+        enableAgentReport: true,
+        experiments: { workspaceHeartbeats: true },
+        workspaceHeartbeatService: heartbeatService,
+      },
+      "child-ws",
+      initStateManager
+    );
+    expect(childToolsWithHeartbeat.heartbeat).toBeUndefined();
+    expect(toolsWithHeartbeat.heartbeat).toBeDefined();
   });
 
   test("withholds review_pane_* tools from sub-agents (enableAgentReport=true)", async () => {
