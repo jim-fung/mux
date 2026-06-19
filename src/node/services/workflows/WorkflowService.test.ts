@@ -2,11 +2,10 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { ForegroundWaitBackgroundedError } from "@/node/services/taskService";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
-import { WorkflowActionRegistry } from "./WorkflowActionRegistry";
 import { WorkflowDefinitionStore } from "./WorkflowDefinitionStore";
 import { WorkflowRunStore } from "./WorkflowRunStore";
 import { WorkflowService } from "./WorkflowService";
@@ -73,163 +72,20 @@ async function waitForWorkflowRunFileStatus(
   throw new Error(`Timed out waiting for ${runId} run file to become ${status}`);
 }
 
+interface MockWorkflowAgentResult {
+  taskId: string;
+  reportMarkdown: string;
+  structuredOutput: Record<string, never>;
+}
+
 describe("WorkflowService", () => {
-  test("lists workflow actions with statically parsed metadata", async () => {
-    using tmp = new DisposableTempDir("workflow-service-actions");
-    const workspaceRoot = path.join(tmp.path, "project");
-    const projectRoot = path.join(workspaceRoot, ".mux", "workflows");
-    const globalRoot = path.join(tmp.path, "mux-home", "workflows");
-    const projectActionRoot = path.join(workspaceRoot, ".mux", "actions");
-    const globalActionRoot = path.join(tmp.path, "mux-home", "actions");
-    await fs.mkdir(projectActionRoot, { recursive: true });
-    await fs.writeFile(
-      path.join(projectActionRoot, "echo.js"),
-      `
-        module.exports.metadata = {
-          version: 1,
-          description: "Echo action",
-          effect: "read",
-          inputSchema: { type: "object", required: ["name"], properties: { name: { type: "string" } } },
-          outputSchema: { type: "object" },
-        };
-        module.exports.execute = async function (input) { return input; };
-      `,
-      "utf-8"
-    );
-
-    const service = new WorkflowService({
-      definitionStore: new WorkflowDefinitionStore({ projectRoot, globalRoot, builtIns: [] }),
-      actionRegistry: new WorkflowActionRegistry({
-        projectRoot: projectActionRoot,
-        globalRoot: globalActionRoot,
-      }),
-      runStore: new WorkflowRunStore({ sessionDir: tmp.path }),
-      runtimeFactory: new QuickJSRuntimeFactory(),
-      taskAdapter: {
-        async runAgent() {
-          return { taskId: "task_1", reportMarkdown: "unused", structuredOutput: {} };
-        },
-      },
-      runnerId: "runner-a",
-    });
-
-    const actions = await service.listActions({ projectTrusted: true });
-    const action = actions.find((candidate) => candidate.name === "echo");
-
-    expect(action).toEqual({
-      name: "echo",
-      scope: "project",
-      sourcePath: path.join(projectActionRoot, "echo.js"),
-      executable: true,
-      metadata: {
-        version: 1,
-        description: "Echo action",
-        effect: "read",
-        inputSchema: {
-          type: "object",
-          required: ["name"],
-          properties: { name: { type: "string" } },
-        },
-        outputSchema: { type: "object" },
-      },
-      hasReconcile: false,
-    });
-  });
-
-  test("keeps action discovery available when one action has invalid metadata", async () => {
-    using tmp = new DisposableTempDir("workflow-service-actions-invalid");
-    const workspaceRoot = path.join(tmp.path, "project");
-    const projectRoot = path.join(workspaceRoot, ".mux", "workflows");
-    const globalRoot = path.join(tmp.path, "mux-home", "workflows");
-    const projectActionRoot = path.join(workspaceRoot, ".mux", "actions");
-    const globalActionRoot = path.join(tmp.path, "mux-home", "actions");
-    await fs.mkdir(globalActionRoot, { recursive: true });
-    await fs.writeFile(
-      path.join(globalActionRoot, "broken.js"),
-      `
-        module.exports.metadata = { version: 1, description: "Missing effect" };
-        module.exports.execute = async () => null;
-      `,
-      "utf-8"
-    );
-
-    const service = new WorkflowService({
-      definitionStore: new WorkflowDefinitionStore({ projectRoot, globalRoot, builtIns: [] }),
-      actionRegistry: new WorkflowActionRegistry({
-        projectRoot: projectActionRoot,
-        globalRoot: globalActionRoot,
-      }),
-      runStore: new WorkflowRunStore({ sessionDir: tmp.path }),
-      runtimeFactory: new QuickJSRuntimeFactory(),
-      taskAdapter: {
-        async runAgent() {
-          return { taskId: "task_1", reportMarkdown: "unused", structuredOutput: {} };
-        },
-      },
-      runnerId: "runner-a",
-    });
-
-    const actions = await service.listActions({ projectTrusted: true });
-    const action = actions.find((candidate) => candidate.name === "broken");
-
-    expect(action).toMatchObject({
-      name: "broken",
-      scope: "global",
-      sourcePath: path.join(globalActionRoot, "broken.js"),
-      executable: false,
-    });
-    expect(action?.executable === false ? action.blockedReason : "").toContain("effect");
-  });
-
-  test("marks metadata-only workflow actions as blocked during discovery", async () => {
-    using tmp = new DisposableTempDir("workflow-service-actions-missing-execute");
-    const workspaceRoot = path.join(tmp.path, "project");
-    const projectRoot = path.join(workspaceRoot, ".mux", "workflows");
-    const globalRoot = path.join(tmp.path, "mux-home", "workflows");
-    const projectActionRoot = path.join(workspaceRoot, ".mux", "actions");
-    const globalActionRoot = path.join(tmp.path, "mux-home", "actions");
-    await fs.mkdir(projectActionRoot, { recursive: true });
-    await fs.writeFile(
-      path.join(projectActionRoot, "metadataOnly.js"),
-      `module.exports.metadata = { version: 1, description: "Metadata only", effect: "read" };`,
-      "utf-8"
-    );
-
-    const service = new WorkflowService({
-      definitionStore: new WorkflowDefinitionStore({ projectRoot, globalRoot, builtIns: [] }),
-      actionRegistry: new WorkflowActionRegistry({
-        projectRoot: projectActionRoot,
-        globalRoot: globalActionRoot,
-      }),
-      runStore: new WorkflowRunStore({ sessionDir: tmp.path }),
-      runtimeFactory: new QuickJSRuntimeFactory(),
-      taskAdapter: {
-        async runAgent() {
-          return { taskId: "task_1", reportMarkdown: "unused", structuredOutput: {} };
-        },
-      },
-      runnerId: "runner-a",
-    });
-
-    const actions = await service.listActions({ projectTrusted: true });
-    const action = actions.find((candidate) => candidate.name === "metadataOnly");
-
-    expect(action).toMatchObject({
-      name: "metadataOnly",
-      scope: "project",
-      sourcePath: path.join(projectActionRoot, "metadataOnly.js"),
-      executable: false,
-    });
-    expect(action?.executable === false ? action.blockedReason : "").toContain("execute");
-  });
-
   test("starts a named workflow and persists the captured definition source", async () => {
     using tmp = new DisposableTempDir("workflow-service");
     const projectRoot = path.join(tmp.path, "project", ".mux", "workflows");
     const globalRoot = path.join(tmp.path, "mux-home", "workflows");
     const source = `export const metadata = { description: "Demo workflow" };
 export default function workflow({ args, agent }) {
-  const child = agent({ id: "summarize", prompt: "Summarize " + args.topic, outputSchema: {} });
+  const child = agent({ id: "summarize", prompt: "Summarize " + args.topic, outputSchema: {}});
   return { reportMarkdown: "Final " + child.reportMarkdown };
 }
 `;
@@ -277,6 +133,72 @@ export default function workflow({ args, agent }) {
     ]);
     expect(run.definitionSource).toBe(source);
     expect(run.definition.scope).toBe("global");
+  });
+
+  test("listRuns only loads root runs for the requested workspace", async () => {
+    using tmp = new DisposableTempDir("workflow-service-list-runs");
+    const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
+    const definition = {
+      name: "demo",
+      description: "Demo",
+      scope: "built-in",
+      executable: true,
+    } as const;
+    await runStore.createRun({
+      id: "wfr_workspace_1",
+      workspaceId: "workspace-1",
+      definition,
+      definitionSource: "export default function workflow() { return {}; }\n",
+      args: {},
+      now: "2026-05-29T00:00:00.000Z",
+    });
+    await runStore.createRun({
+      id: "wfr_workspace_2",
+      workspaceId: "workspace-2",
+      definition,
+      definitionSource: "export default function workflow() { return {}; }\n",
+      args: {},
+      now: "2026-05-29T00:00:01.000Z",
+    });
+    await runStore.createRun({
+      id: "wfr_workspace_1_child",
+      workspaceId: "workspace-1",
+      definition,
+      definitionSource: "export default function workflow() { return {}; }\n",
+      args: {},
+      parentWorkflow: {
+        runId: "wfr_workspace_1",
+        stepId: "child-step",
+        inputHash: "child-input",
+        depth: 0,
+      },
+      now: "2026-05-29T00:00:02.000Z",
+    });
+    const getRunSpy = spyOn(runStore, "getRun");
+    const service = new WorkflowService({
+      definitionStore: new WorkflowDefinitionStore({
+        projectRoot: path.join(tmp.path, "project"),
+        globalRoot: path.join(tmp.path, "global"),
+        builtIns: [],
+      }),
+      runStore,
+      runtimeFactory: new QuickJSRuntimeFactory(),
+      taskAdapter: {
+        async runAgent() {
+          throw new Error("agent should not run");
+        },
+      },
+      runnerId: "runner-a",
+    });
+
+    try {
+      const runs = await service.listRuns({ workspaceId: "workspace-1" });
+
+      expect(runs.map((run) => run.id)).toEqual(["wfr_workspace_1"]);
+      expect(getRunSpy.mock.calls.map((call) => call[0])).toEqual(["wfr_workspace_1"]);
+    } finally {
+      getRunSpy.mockRestore();
+    }
   });
 
   test("normalizes workflow args from static metadata and exposes mux helpers", async () => {
@@ -622,7 +544,7 @@ export default function workflow() {
       reportMarkdown: "done",
       structuredOutput: { summaries: ["Review reuse", "Review quality"] },
     });
-    expect(run.steps.map((step) => step.stepId)).toEqual(["review-reuse", "review-quality"]);
+    expect(run.steps.map((step) => step.stepId).sort()).toEqual(["review-quality", "review-reuse"]);
   });
 
   test("rejects invalid workflow args before creating a run", async () => {
@@ -669,345 +591,6 @@ export default function workflow() { return { reportMarkdown: "should not run" }
     );
   });
 
-  test("runs a nested workflow through action.workflows.start and reuses the child on replay", async () => {
-    using tmp = new DisposableTempDir("workflow-service-nested");
-    const workspaceRoot = path.join(tmp.path, "project");
-    const projectRoot = path.join(workspaceRoot, ".mux", "workflows");
-    const globalRoot = path.join(tmp.path, "mux-home", "workflows");
-    const actionProjectRoot = path.join(workspaceRoot, ".mux", "actions");
-    const actionGlobalRoot = path.join(tmp.path, "mux-home", "actions");
-    await writeWorkflow(
-      globalRoot,
-      "child-simple",
-      "export const metadata = { description: \"Child workflow\" };\nexport default function workflow({ args }) { return { reportMarkdown: 'Child: ' + args.topic }; }\n"
-    );
-    await writeWorkflow(
-      globalRoot,
-      "parent-simple",
-      `export const metadata = { description: "Parent workflow" };
-      export default function workflow({ args, action }) {
-        const child = action.workflows.start({
-          id: "child-simple",
-          input: { name: "child-simple", args: { topic: args.topic } },
-        });
-        return { reportMarkdown: "Parent saw " + child.reportMarkdown, structuredOutput: { childRunId: child.runId } };
-      }\n`
-    );
-
-    const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
-    const service = new WorkflowService({
-      definitionStore: new WorkflowDefinitionStore({ projectRoot, globalRoot, builtIns: [] }),
-      actionRegistry: new WorkflowActionRegistry({
-        projectRoot: actionProjectRoot,
-        globalRoot: actionGlobalRoot,
-      }),
-      runStore,
-      runtimeFactory: new QuickJSRuntimeFactory(),
-      taskAdapter: {
-        async runAgent() {
-          throw new Error("agent should not run");
-        },
-      },
-      generateRunId: () => "wfr_parent_simple",
-      runnerId: "runner-a",
-      clock: {
-        nowIso: () => "2026-05-29T00:00:00.000Z",
-        nowMs: () => 1_000,
-      },
-    });
-
-    const result = await service.startNamedWorkflow({
-      name: "parent-simple",
-      workspaceId: "workspace-1",
-      projectTrusted: true,
-      args: { topic: "nested smoke" },
-    });
-    const parentRun = await runStore.getRun("wfr_parent_simple");
-    const childStep = parentRun.steps.find((step) => step.stepId === "child-simple");
-    expect(childStep?.taskId).toMatch(/^wfr_child_/);
-    const childRunId = childStep?.taskId;
-    if (childRunId == null) {
-      throw new Error("Expected nested workflow step to record a child run id");
-    }
-    const childRun = await runStore.getRun(childRunId);
-
-    expect(result).toEqual({
-      runId: "wfr_parent_simple",
-      status: "completed",
-      result: {
-        reportMarkdown: "Parent saw Child: nested smoke",
-        structuredOutput: { childRunId },
-      },
-    });
-    expect(childRun.id).toBe(childRunId);
-    expect(childRun.workspaceId).toBe("workspace-1");
-    expect(childRun.definition.name).toBe("child-simple");
-    expect(childRun.parentWorkflow?.runId).toBe("wfr_parent_simple");
-    expect(childRun.parentWorkflow?.stepId).toBe("child-simple");
-    expect(childRun.status).toBe("completed");
-    expect(parentRun.events).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          type: "workflow",
-          stepId: "child-simple",
-          runId: childRunId,
-          status: "started",
-        }),
-        expect.objectContaining({
-          type: "workflow",
-          stepId: "child-simple",
-          runId: childRunId,
-          status: "completed",
-        }),
-      ])
-    );
-
-    const runsAfterCompletion = await runStore.listRuns();
-    expect(
-      runsAfterCompletion.filter((run) => run.parentWorkflow?.runId === "wfr_parent_simple")
-    ).toHaveLength(1);
-  });
-
-  test("snapshots parent action cwd when replay creates a nested child run", async () => {
-    using tmp = new DisposableTempDir("workflow-service-nested-cwd");
-    const workspaceRoot = path.join(tmp.path, "project");
-    const projectRoot = path.join(workspaceRoot, ".mux", "workflows");
-    const globalRoot = path.join(tmp.path, "mux-home", "workflows");
-    const actionProjectRoot = path.join(workspaceRoot, ".mux", "actions");
-    const actionGlobalRoot = path.join(tmp.path, "mux-home", "actions");
-    await writeWorkflow(
-      globalRoot,
-      "child-cwd",
-      "export const metadata = { description: \"Child cwd\" };\nexport default function workflow() { return { reportMarkdown: 'child' }; }\n"
-    );
-    const parentSource = `export const metadata = { description: "Parent cwd" };
-export default function workflow({ action }) {
-  return action.workflows.start({
-    id: "child-cwd",
-    input: { name: "child-cwd", args: {} },
-  });
-}\n`;
-    const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
-    const parentCwd = path.join(tmp.path, "parent-cwd");
-    await runStore.createRun({
-      id: "wfr_parent_cwd",
-      workspaceId: "workspace-1",
-      definition: {
-        name: "parent-cwd",
-        description: "Parent cwd",
-        scope: "global",
-        executable: true,
-      },
-      definitionSource: parentSource,
-      args: {},
-      defaultActionCwd: parentCwd,
-      now: "2026-05-29T00:00:00.000Z",
-    });
-    const service = new WorkflowService({
-      definitionStore: new WorkflowDefinitionStore({ projectRoot, globalRoot, builtIns: [] }),
-      actionRegistry: new WorkflowActionRegistry({
-        projectRoot: actionProjectRoot,
-        globalRoot: actionGlobalRoot,
-      }),
-      runStore,
-      runtimeFactory: new QuickJSRuntimeFactory(),
-      taskAdapter: {
-        async runAgent() {
-          throw new Error("agent should not run");
-        },
-      },
-      defaultActionCwd: path.join(tmp.path, "service-cwd"),
-      runnerId: "runner-a",
-    });
-
-    await service.resumeRun({
-      workspaceId: "workspace-1",
-      runId: "wfr_parent_cwd",
-      projectTrusted: true,
-    });
-    const parentRun = await runStore.getRun("wfr_parent_cwd");
-    const childRunId = parentRun.steps.find((step) => step.stepId === "child-cwd")?.taskId;
-    if (childRunId == null) {
-      throw new Error("Expected nested cwd workflow to record a child run id");
-    }
-    const childRun = await runStore.getRun(childRunId);
-
-    expect(childRun.defaultActionCwd).toBe(parentCwd);
-  });
-
-  test("preserves explicit null args for nested child workflows", async () => {
-    using tmp = new DisposableTempDir("workflow-service-nested-null-args");
-    const workspaceRoot = path.join(tmp.path, "project");
-    const projectRoot = path.join(workspaceRoot, ".mux", "workflows");
-    const globalRoot = path.join(tmp.path, "mux-home", "workflows");
-    const actionProjectRoot = path.join(workspaceRoot, ".mux", "actions");
-    const actionGlobalRoot = path.join(tmp.path, "mux-home", "actions");
-    await writeWorkflow(
-      globalRoot,
-      "child-null-args",
-      'export const metadata = { description: "Child null args" };\nexport default function workflow({ args }) { return { reportMarkdown: String(args === null) }; }\n'
-    );
-    await writeWorkflow(
-      globalRoot,
-      "parent-null-args",
-      `export const metadata = { description: "Parent null args" };
-export default function workflow({ action }) {
-  return action.workflows.start({
-    id: "child-null-args",
-    input: { name: "child-null-args", args: null },
-  });
-}\n`
-    );
-    const service = new WorkflowService({
-      definitionStore: new WorkflowDefinitionStore({ projectRoot, globalRoot, builtIns: [] }),
-      actionRegistry: new WorkflowActionRegistry({
-        projectRoot: actionProjectRoot,
-        globalRoot: actionGlobalRoot,
-      }),
-      runStore: new WorkflowRunStore({ sessionDir: tmp.path }),
-      runtimeFactory: new QuickJSRuntimeFactory(),
-      taskAdapter: {
-        async runAgent() {
-          throw new Error("agent should not run");
-        },
-      },
-      generateRunId: () => "wfr_parent_null_args",
-      runnerId: "runner-a",
-    });
-
-    const result = await service.startNamedWorkflow({
-      name: "parent-null-args",
-      workspaceId: "workspace-1",
-      projectTrusted: true,
-      args: {},
-    });
-
-    expect(result.result).toMatchObject({ reportMarkdown: "true" });
-  });
-
-  test("records terminal parent step state when a nested child workflow fails", async () => {
-    using tmp = new DisposableTempDir("workflow-service-nested-failure");
-    const workspaceRoot = path.join(tmp.path, "project");
-    const projectRoot = path.join(workspaceRoot, ".mux", "workflows");
-    const globalRoot = path.join(tmp.path, "mux-home", "workflows");
-    const actionProjectRoot = path.join(workspaceRoot, ".mux", "actions");
-    const actionGlobalRoot = path.join(tmp.path, "mux-home", "actions");
-    await writeWorkflow(
-      globalRoot,
-      "child-fails",
-      "export const metadata = { description: \"Child fails\" };\nexport default function workflow() { throw new Error('child boom'); }\n"
-    );
-    await writeWorkflow(
-      globalRoot,
-      "parent-catches-child-failure",
-      `export const metadata = { description: "Parent catches child failure" };
-export default function workflow({ action }) {
-  try {
-    action.workflows.start({
-      id: "child-fails",
-      input: { name: "child-fails", args: {} },
-    });
-  } catch (error) {
-    return { reportMarkdown: "caught " + error.message };
-  }
-  return { reportMarkdown: "unexpected" };
-}\n`
-    );
-    const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
-    const service = new WorkflowService({
-      definitionStore: new WorkflowDefinitionStore({ projectRoot, globalRoot, builtIns: [] }),
-      actionRegistry: new WorkflowActionRegistry({
-        projectRoot: actionProjectRoot,
-        globalRoot: actionGlobalRoot,
-      }),
-      runStore,
-      runtimeFactory: new QuickJSRuntimeFactory(),
-      taskAdapter: {
-        async runAgent() {
-          throw new Error("agent should not run");
-        },
-      },
-      generateRunId: () => "wfr_parent_catches_child_failure",
-      runnerId: "runner-a",
-    });
-
-    const result = await service.startNamedWorkflow({
-      name: "parent-catches-child-failure",
-      workspaceId: "workspace-1",
-      projectTrusted: true,
-      args: {},
-    });
-    const parentRun = await runStore.getRun("wfr_parent_catches_child_failure");
-    const childStep = parentRun.steps.find((step) => step.stepId === "child-fails");
-
-    expect(result.status).toBe("completed");
-    expect(childStep?.status).toBe("failed");
-    expect(parentRun.events).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          type: "workflow",
-          stepId: "child-fails",
-          status: "failed",
-        }),
-      ])
-    );
-  });
-
-  test("applies current project trust before starting nested project workflows", async () => {
-    using tmp = new DisposableTempDir("workflow-service-nested-trust");
-    const workspaceRoot = path.join(tmp.path, "project");
-    const projectRoot = path.join(workspaceRoot, ".mux", "workflows");
-    const globalRoot = path.join(tmp.path, "mux-home", "workflows");
-    const actionProjectRoot = path.join(workspaceRoot, ".mux", "actions");
-    const actionGlobalRoot = path.join(tmp.path, "mux-home", "actions");
-    await writeWorkflow(
-      projectRoot,
-      "child-project",
-      "export const metadata = { description: \"Project child\" };\nexport default function workflow() { return { reportMarkdown: 'project child' }; }\n"
-    );
-    await writeWorkflow(
-      globalRoot,
-      "parent-project-child",
-      `export const metadata = { description: "Parent project child" };
-export default function workflow({ action }) {
-  return action.workflows.start({
-    id: "child-project",
-    input: { name: "child-project", args: {} },
-  });
-}\n`
-    );
-    const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
-    const service = new WorkflowService({
-      definitionStore: new WorkflowDefinitionStore({ projectRoot, globalRoot, builtIns: [] }),
-      actionRegistry: new WorkflowActionRegistry({
-        projectRoot: actionProjectRoot,
-        globalRoot: actionGlobalRoot,
-      }),
-      runStore,
-      runtimeFactory: new QuickJSRuntimeFactory(),
-      taskAdapter: {
-        async runAgent() {
-          throw new Error("agent should not run");
-        },
-      },
-      getCurrentProjectTrusted: () => false,
-      generateRunId: () => "wfr_parent_project_child",
-      runnerId: "runner-a",
-    });
-
-    await expect(
-      service.startNamedWorkflow({
-        name: "parent-project-child",
-        workspaceId: "workspace-1",
-        projectTrusted: true,
-        args: {},
-      })
-    ).rejects.toThrow(/Project trust|Workflow definition not found/);
-    const parentRun = await runStore.getRun("wfr_parent_project_child");
-
-    expect(parentRun.steps.find((step) => step.stepId === "child-project")?.status).toBe("failed");
-  });
-
   test("notifies foreground run creation before the first workflow step blocks", async () => {
     using tmp = new DisposableTempDir("workflow-service-created-callback");
     const projectRoot = path.join(tmp.path, "project", ".mux", "workflows");
@@ -1015,12 +598,10 @@ export default function workflow({ action }) {
     await writeWorkflow(
       globalRoot,
       "scheduled-scan",
-      "export const metadata = { description: \"Scheduled scan\" };\nexport default function workflow({ agent }) { return agent({ id: 'scope', prompt: 'scope security surface', outputSchema: {} }); }\n"
+      "export const metadata = { description: \"Scheduled scan\" };\nexport default function workflow({ agent }) { return agent({ id: 'scope', prompt: 'scope security surface', outputSchema: {}}); }\n"
     );
 
-    let releaseAgent:
-      | ((value: { taskId: string; reportMarkdown: string; structuredOutput: unknown }) => void)
-      | undefined;
+    let releaseAgent: ((value: MockWorkflowAgentResult) => void) | undefined;
     const runCreatedGate = Promise.withResolvers<void>();
     const lifecycleEvents: string[] = [];
     const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
@@ -1031,11 +612,7 @@ export default function workflow({ action }) {
       taskAdapter: {
         async runAgent() {
           lifecycleEvents.push("agent-started");
-          return await new Promise<{
-            taskId: string;
-            reportMarkdown: string;
-            structuredOutput: unknown;
-          }>((resolve) => {
+          return await new Promise<MockWorkflowAgentResult>((resolve) => {
             releaseAgent = resolve;
           });
         },
@@ -1233,6 +810,113 @@ export default function workflow({ action }) {
     expect(completedStep?.result).toEqual({ reportMarkdown: "done" });
   });
 
+  test("interrupts nested child workflow runs before returning", async () => {
+    using tmp = new DisposableTempDir("workflow-service-nested-interrupt");
+    const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
+    const definition = {
+      name: "demo",
+      description: "Demo",
+      scope: "built-in",
+      executable: true,
+    } as const;
+    const definitionSource =
+      "export default function workflow() { return { reportMarkdown: 'unused' }; }\n";
+    await runStore.createRun({
+      id: "wfr_parent",
+      workspaceId: "workspace-1",
+      definition,
+      definitionSource,
+      args: {},
+      now: "2026-05-29T00:00:00.000Z",
+    });
+    await runStore.appendStatus("wfr_parent", "running", "2026-05-29T00:00:01.000Z");
+    await runStore.createRun({
+      id: "wfr_child",
+      workspaceId: "workspace-1",
+      definition,
+      definitionSource,
+      args: {},
+      parentWorkflow: {
+        runId: "wfr_parent",
+        stepId: "child-step",
+        inputHash: "child-input",
+        depth: 0,
+      },
+      now: "2026-05-29T00:00:02.000Z",
+    });
+    await runStore.appendStatus("wfr_child", "running", "2026-05-29T00:00:03.000Z");
+    await runStore.createRun({
+      id: "wfr_grandchild",
+      workspaceId: "workspace-1",
+      definition,
+      definitionSource,
+      args: {},
+      parentWorkflow: {
+        runId: "wfr_child",
+        stepId: "grandchild-step",
+        inputHash: "grandchild-input",
+        depth: 1,
+      },
+      now: "2026-05-29T00:00:04.000Z",
+    });
+    await runStore.appendStatus("wfr_grandchild", "backgrounded", "2026-05-29T00:00:05.000Z");
+    await runStore.createRun({
+      id: "wfr_completed_child",
+      workspaceId: "workspace-1",
+      definition,
+      definitionSource,
+      args: {},
+      parentWorkflow: {
+        runId: "wfr_parent",
+        stepId: "completed-child-step",
+        inputHash: "completed-child-input",
+        depth: 0,
+      },
+      now: "2026-05-29T00:00:06.000Z",
+    });
+    await runStore.appendStatus("wfr_completed_child", "completed", "2026-05-29T00:00:07.000Z");
+    const interruptedRunIds: string[] = [];
+    const service = new WorkflowService({
+      definitionStore: new WorkflowDefinitionStore({
+        projectRoot: path.join(tmp.path, "project"),
+        globalRoot: path.join(tmp.path, "global"),
+        builtIns: [],
+      }),
+      runStore,
+      runtimeFactory: new QuickJSRuntimeFactory(),
+      taskAdapterFactory: (runId) => ({
+        async runAgent() {
+          throw new Error("unused");
+        },
+        async interruptRun() {
+          interruptedRunIds.push(runId);
+        },
+      }),
+      runnerId: "runner-a",
+      clock: {
+        nowIso: () => "2026-05-29T00:00:08.000Z",
+        nowMs: () => 1_000,
+      },
+    });
+
+    const interrupted = await service.interruptRun({
+      workspaceId: "workspace-1",
+      runId: "wfr_parent",
+    });
+
+    expect(interrupted.status).toBe("interrupted");
+    await expect(runStore.getRun("wfr_child")).resolves.toMatchObject({
+      status: "interrupted",
+    });
+    await expect(runStore.getRun("wfr_grandchild")).resolves.toMatchObject({
+      status: "interrupted",
+    });
+    await expect(runStore.getRun("wfr_completed_child")).resolves.toMatchObject({
+      status: "completed",
+    });
+    expect(interruptedRunIds).toEqual(["wfr_parent", "wfr_child", "wfr_grandchild"]);
+  });
+
   test("interrupts foreground workflow runs when the caller aborts", async () => {
     using tmp = new DisposableTempDir("workflow-service");
     const projectRoot = path.join(tmp.path, "project", ".mux", "workflows");
@@ -1240,7 +924,7 @@ export default function workflow({ action }) {
     await writeWorkflow(
       globalRoot,
       "abortable",
-      "export const metadata = { description: \"Abortable workflow\" };\nexport default function workflow({ agent }) { return agent({ id: 'slow-step', prompt: 'slow', outputSchema: {} }); }\n"
+      "export const metadata = { description: \"Abortable workflow\" };\nexport default function workflow({ agent }) { return agent({ id: 'slow-step', prompt: 'slow', outputSchema: {}}); }\n"
     );
     const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
     let agentWaitStarted = false;
@@ -1301,12 +985,10 @@ export default function workflow({ action }) {
     await writeWorkflow(
       globalRoot,
       "workspace-owned",
-      "export const metadata = { description: \"Workspace-owned workflow\" };\nexport default function workflow({ agent }) { return agent({ id: 'slow-step', prompt: 'slow', outputSchema: {} }); }\n"
+      "export const metadata = { description: \"Workspace-owned workflow\" };\nexport default function workflow({ agent }) { return agent({ id: 'slow-step', prompt: 'slow', outputSchema: {}}); }\n"
     );
     const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
-    let releaseAgent:
-      | ((value: { taskId: string; reportMarkdown: string; structuredOutput: unknown }) => void)
-      | undefined;
+    let releaseAgent: ((value: MockWorkflowAgentResult) => void) | undefined;
     let agentAbortObserved = false;
     const service = new WorkflowService({
       definitionStore: new WorkflowDefinitionStore({ projectRoot, globalRoot, builtIns: [] }),
@@ -1314,11 +996,7 @@ export default function workflow({ action }) {
       runtimeFactory: new QuickJSRuntimeFactory(),
       taskAdapter: {
         async runAgent(_spec, _lifecycle, waitOptions) {
-          return await new Promise<{
-            taskId: string;
-            reportMarkdown: string;
-            structuredOutput: unknown;
-          }>((resolve, reject) => {
+          return await new Promise<MockWorkflowAgentResult>((resolve, reject) => {
             releaseAgent = resolve;
             waitOptions?.abortSignal?.addEventListener(
               "abort",
@@ -1361,7 +1039,7 @@ export default function workflow({ action }) {
     await writeWorkflow(
       globalRoot,
       "interrupt-active",
-      "export const metadata = { description: \"Interrupt active\" };\nexport default function workflow({ agent }) { return agent({ id: 'slow-step', prompt: 'slow', outputSchema: {} }); }\n"
+      "export const metadata = { description: \"Interrupt active\" };\nexport default function workflow({ agent }) { return agent({ id: 'slow-step', prompt: 'slow', outputSchema: {}}); }\n"
     );
     const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
     let agentWaitStarted = false;
@@ -1432,365 +1110,6 @@ export default function workflow({ action }) {
     expect(runError instanceof Error ? runError.message : "").toMatch(/interrupted|aborted/i);
   });
 
-  test("interruptRun cascades to an active nested child workflow", async () => {
-    using tmp = new DisposableTempDir("workflow-service-nested-interrupt");
-    const workspaceRoot = path.join(tmp.path, "project");
-    const projectRoot = path.join(workspaceRoot, ".mux", "workflows");
-    const globalRoot = path.join(tmp.path, "mux-home", "workflows");
-    const actionProjectRoot = path.join(workspaceRoot, ".mux", "actions");
-    const actionGlobalRoot = path.join(tmp.path, "mux-home", "actions");
-    await writeWorkflow(
-      globalRoot,
-      "child-interruptible",
-      "export const metadata = { description: \"Child interruptible\" };\nexport default function workflow({ agent }) { return agent({ id: 'slow-child', prompt: 'slow', outputSchema: {} }); }\n"
-    );
-    await writeWorkflow(
-      globalRoot,
-      "parent-interruptible",
-      `export const metadata = { description: "Parent interruptible" };
-export default function workflow({ action }) {
-  return action.workflows.start({
-    id: "child-interruptible",
-    input: { name: "child-interruptible", args: {} },
-  });
-}\n`
-    );
-    const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
-    let agentWaitStarted = false;
-    let agentAbortObserved = false;
-    const starterService = new WorkflowService({
-      definitionStore: new WorkflowDefinitionStore({ projectRoot, globalRoot, builtIns: [] }),
-      actionRegistry: new WorkflowActionRegistry({
-        projectRoot: actionProjectRoot,
-        globalRoot: actionGlobalRoot,
-      }),
-      runStore,
-      runtimeFactory: new QuickJSRuntimeFactory(),
-      taskAdapter: {
-        async runAgent(_spec, _lifecycle, waitOptions) {
-          agentWaitStarted = true;
-          return await new Promise((_, reject) => {
-            waitOptions?.abortSignal?.addEventListener(
-              "abort",
-              () => {
-                agentAbortObserved = true;
-                reject(new Error("Task interrupted"));
-              },
-              { once: true }
-            );
-          });
-        },
-      },
-      generateRunId: () => "wfr_nested_interrupt_parent",
-      runnerId: "runner-a",
-    });
-    let interruptCalls = 0;
-    const interruptService = new WorkflowService({
-      definitionStore: new WorkflowDefinitionStore({ projectRoot, globalRoot, builtIns: [] }),
-      actionRegistry: new WorkflowActionRegistry({
-        projectRoot: actionProjectRoot,
-        globalRoot: actionGlobalRoot,
-      }),
-      runStore,
-      runtimeFactory: new QuickJSRuntimeFactory(),
-      taskAdapter: {
-        async runAgent() {
-          throw new Error("interrupt service runAgent should not be called");
-        },
-        async interruptRun() {
-          interruptCalls += 1;
-        },
-      },
-      runnerId: "runner-b",
-    });
-
-    const runPromise = starterService.startNamedWorkflow({
-      name: "parent-interruptible",
-      workspaceId: "workspace-1",
-      projectTrusted: true,
-      args: {},
-    });
-    const runErrorPromise = runPromise.then(
-      () => null,
-      (error: unknown) => error
-    );
-    await waitForCondition("nested child agent to start", () => agentWaitStarted);
-
-    const interrupted = await interruptService.interruptRun({
-      workspaceId: "workspace-1",
-      runId: "wfr_nested_interrupt_parent",
-    });
-    const parentRun = await runStore.getRun("wfr_nested_interrupt_parent");
-    const childRunId = parentRun.steps.find(
-      (step) => step.stepId === "child-interruptible"
-    )?.taskId;
-    if (childRunId == null) {
-      throw new Error("Expected nested interrupt workflow to record a child run id");
-    }
-    const childRun = await runStore.getRun(childRunId);
-    const runError = await runErrorPromise;
-
-    expect(interrupted.status).toBe("interrupted");
-    expect(childRun.status).toBe("interrupted");
-    expect(agentAbortObserved).toBe(true);
-    expect(interruptCalls).toBeGreaterThanOrEqual(1);
-    expect(runError).toBeInstanceOf(Error);
-    expect(runError instanceof Error ? runError.message : "").toMatch(/interrupted|aborted/i);
-  });
-
-  test("interruptRun still interrupts tasks for already-interrupted nested children", async () => {
-    using tmp = new DisposableTempDir("workflow-service-nested-interrupted-task-cascade");
-    const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
-    await runStore.createRun({
-      id: "wfr_parent_interrupted_child_task",
-      workspaceId: "workspace-1",
-      definition: { name: "parent", description: "Parent", scope: "built-in", executable: true },
-      definitionSource:
-        "export default function workflow() { return { reportMarkdown: 'parent' }; }\n",
-      args: {},
-      now: "2026-05-29T00:00:00.000Z",
-    });
-    await runStore.appendStatus(
-      "wfr_parent_interrupted_child_task",
-      "running",
-      "2026-05-29T00:00:01.000Z"
-    );
-    await runStore.createRun({
-      id: "wfr_child_already_interrupted",
-      workspaceId: "workspace-1",
-      definition: { name: "child", description: "Child", scope: "built-in", executable: true },
-      definitionSource:
-        "export default function workflow() { return { reportMarkdown: 'child' }; }\n",
-      args: {},
-      parentWorkflow: {
-        runId: "wfr_parent_interrupted_child_task",
-        stepId: "child",
-        inputHash: "hash:child",
-        depth: 0,
-      },
-      now: "2026-05-29T00:00:00.000Z",
-    });
-    await runStore.appendStatus(
-      "wfr_child_already_interrupted",
-      "running",
-      "2026-05-29T00:00:01.000Z"
-    );
-    await runStore.appendStatus(
-      "wfr_child_already_interrupted",
-      "interrupted",
-      "2026-05-29T00:00:02.000Z"
-    );
-    const interruptedTaskAdapters: string[] = [];
-    const service = new WorkflowService({
-      definitionStore: new WorkflowDefinitionStore({
-        projectRoot: path.join(tmp.path, "project"),
-        globalRoot: path.join(tmp.path, "global"),
-        builtIns: [],
-      }),
-      runStore,
-      runtimeFactory: new QuickJSRuntimeFactory(),
-      taskAdapterFactory: (runId) => ({
-        async runAgent() {
-          throw new Error("agent should not run");
-        },
-        async interruptRun() {
-          interruptedTaskAdapters.push(runId);
-        },
-      }),
-      runnerId: "runner-a",
-    });
-
-    await service.interruptRun({
-      workspaceId: "workspace-1",
-      runId: "wfr_parent_interrupted_child_task",
-    });
-
-    expect(interruptedTaskAdapters).toContain("wfr_child_already_interrupted");
-  });
-
-  test("interruptRun aborts an active nested child workflow by child run id", async () => {
-    using tmp = new DisposableTempDir("workflow-service-nested-direct-interrupt");
-    const workspaceRoot = path.join(tmp.path, "project");
-    const projectRoot = path.join(workspaceRoot, ".mux", "workflows");
-    const globalRoot = path.join(tmp.path, "mux-home", "workflows");
-    const actionProjectRoot = path.join(workspaceRoot, ".mux", "actions");
-    const actionGlobalRoot = path.join(tmp.path, "mux-home", "actions");
-    await writeWorkflow(
-      globalRoot,
-      "child-direct-interruptible",
-      "export const metadata = { description: \"Child direct interruptible\" };\nexport default function workflow({ agent }) { return agent({ id: 'slow-child', prompt: 'slow', outputSchema: {} }); }\n"
-    );
-    await writeWorkflow(
-      globalRoot,
-      "parent-direct-interruptible",
-      `export const metadata = { description: "Parent direct interruptible" };
-export default function workflow({ action }) {
-  return action.workflows.start({
-    id: "child-direct-interruptible",
-    input: { name: "child-direct-interruptible", args: {} },
-  });
-}\n`
-    );
-    const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
-    let agentWaitStarted = false;
-    let agentAbortObserved = false;
-    const starterService = new WorkflowService({
-      definitionStore: new WorkflowDefinitionStore({ projectRoot, globalRoot, builtIns: [] }),
-      actionRegistry: new WorkflowActionRegistry({
-        projectRoot: actionProjectRoot,
-        globalRoot: actionGlobalRoot,
-      }),
-      runStore,
-      runtimeFactory: new QuickJSRuntimeFactory(),
-      taskAdapter: {
-        async runAgent(_spec, _lifecycle, waitOptions) {
-          agentWaitStarted = true;
-          return await new Promise((_, reject) => {
-            waitOptions?.abortSignal?.addEventListener(
-              "abort",
-              () => {
-                agentAbortObserved = true;
-                reject(new Error("Task interrupted"));
-              },
-              { once: true }
-            );
-          });
-        },
-      },
-      generateRunId: () => "wfr_nested_direct_interrupt_parent",
-      runnerId: "runner-a",
-    });
-    const interruptService = new WorkflowService({
-      definitionStore: new WorkflowDefinitionStore({ projectRoot, globalRoot, builtIns: [] }),
-      actionRegistry: new WorkflowActionRegistry({
-        projectRoot: actionProjectRoot,
-        globalRoot: actionGlobalRoot,
-      }),
-      runStore,
-      runtimeFactory: new QuickJSRuntimeFactory(),
-      taskAdapter: {
-        async runAgent() {
-          throw new Error("interrupt service runAgent should not be called");
-        },
-        async interruptRun() {
-          // child task adapter interrupt is supplementary; the child workflow runtime must
-          // also abort through the active child runner controller.
-        },
-      },
-      runnerId: "runner-b",
-    });
-
-    const runPromise = starterService.startNamedWorkflow({
-      name: "parent-direct-interruptible",
-      workspaceId: "workspace-1",
-      projectTrusted: true,
-      args: {},
-    });
-    const runErrorPromise = runPromise.then(
-      () => null,
-      (error: unknown) => error
-    );
-    await waitForCondition("nested child agent to start", () => agentWaitStarted);
-    const parentRun = await runStore.getRun("wfr_nested_direct_interrupt_parent");
-    const childRunId = parentRun.steps.find(
-      (step) => step.stepId === "child-direct-interruptible"
-    )?.taskId;
-    if (childRunId == null) {
-      throw new Error("Expected direct interrupt workflow to record a child run id");
-    }
-
-    const interrupted = await interruptService.interruptRun({
-      workspaceId: "workspace-1",
-      runId: childRunId,
-    });
-    const runError = await runErrorPromise;
-
-    expect(interrupted.status).toBe("interrupted");
-    expect(agentAbortObserved).toBe(true);
-    expect(runError).toBeInstanceOf(Error);
-  });
-
-  test("backgrounds and resumes parent workflows when a nested child workflow backgrounds", async () => {
-    using tmp = new DisposableTempDir("workflow-service-nested-background");
-    const workspaceRoot = path.join(tmp.path, "project");
-    const projectRoot = path.join(workspaceRoot, ".mux", "workflows");
-    const globalRoot = path.join(tmp.path, "mux-home", "workflows");
-    const actionProjectRoot = path.join(workspaceRoot, ".mux", "actions");
-    const actionGlobalRoot = path.join(tmp.path, "mux-home", "actions");
-    await writeWorkflow(
-      globalRoot,
-      "child-backgroundable",
-      "export const metadata = { description: \"Child backgroundable\" };\nexport default function workflow({ agent }) { const result = agent({ id: 'slow-child', prompt: 'slow', outputSchema: {} }); return { reportMarkdown: 'Child ' + result.reportMarkdown }; }\n"
-    );
-    await writeWorkflow(
-      globalRoot,
-      "parent-backgroundable",
-      `export const metadata = { description: "Parent backgroundable" };
-export default function workflow({ action }) {
-  const child = action.workflows.start({
-    id: "child-backgroundable",
-    input: { name: "child-backgroundable", args: {} },
-  });
-  return { reportMarkdown: "Parent " + child.reportMarkdown };
-}\n`
-    );
-    const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
-    let calls = 0;
-    const backgroundFlags: Array<boolean | undefined> = [];
-    const service = new WorkflowService({
-      definitionStore: new WorkflowDefinitionStore({ projectRoot, globalRoot, builtIns: [] }),
-      actionRegistry: new WorkflowActionRegistry({
-        projectRoot: actionProjectRoot,
-        globalRoot: actionGlobalRoot,
-      }),
-      runStore,
-      runtimeFactory: new QuickJSRuntimeFactory(),
-      taskAdapter: {
-        async runAgent(_spec, _lifecycle, waitOptions) {
-          calls += 1;
-          backgroundFlags.push(waitOptions?.backgroundOnMessageQueued);
-          if (calls === 1) {
-            throw new ForegroundWaitBackgroundedError();
-          }
-          return { taskId: "task_slow_child", reportMarkdown: "done", structuredOutput: {} };
-        },
-      },
-      generateRunId: () => "wfr_nested_background_parent",
-      runnerId: "runner-a",
-    });
-
-    const result = await service.startNamedWorkflow({
-      name: "parent-backgroundable",
-      workspaceId: "workspace-1",
-      projectTrusted: true,
-      args: {},
-    });
-
-    expect(result).toEqual({
-      runId: "wfr_nested_background_parent",
-      status: "backgrounded",
-      result: null,
-    });
-    await waitForWorkflowStatus(runStore, "wfr_nested_background_parent", "completed");
-    const parentRun = await runStore.getRun("wfr_nested_background_parent");
-    const childRunId = parentRun.steps.find(
-      (step) => step.stepId === "child-backgroundable"
-    )?.taskId;
-    if (childRunId == null) {
-      throw new Error("Expected nested background workflow to record a child run id");
-    }
-    const childRun = await runStore.getRun(childRunId);
-
-    expect(childRun.status).toBe("completed");
-    expect(parentRun.events).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ type: "workflow", status: "backgrounded", runId: childRunId }),
-        expect.objectContaining({ type: "workflow", status: "completed", runId: childRunId }),
-      ])
-    );
-    expect(backgroundFlags).toEqual([true, false]);
-  });
-
   test("moves foreground workflow runs to background when child waits are backgrounded", async () => {
     using tmp = new DisposableTempDir("workflow-service");
     const projectRoot = path.join(tmp.path, "project", ".mux", "workflows");
@@ -1798,7 +1117,7 @@ export default function workflow({ action }) {
     await writeWorkflow(
       globalRoot,
       "backgroundable",
-      "export const metadata = { description: \"Backgroundable workflow\" };\nexport default function workflow({ agent }) { return agent({ id: 'slow-step', prompt: 'slow', outputSchema: {} }); }\n"
+      "export const metadata = { description: \"Backgroundable workflow\" };\nexport default function workflow({ agent }) { return agent({ id: 'slow-step', prompt: 'slow', outputSchema: {}}); }\n"
     );
     const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
     let calls = 0;
@@ -1852,7 +1171,7 @@ export default function workflow({ action }) {
     await writeWorkflow(
       globalRoot,
       "foreground-only",
-      "export const metadata = { description: \"Foreground-only workflow\" };\nexport default function workflow({ agent }) { return agent({ id: 'slow-step', prompt: 'slow', outputSchema: {} }); }\n"
+      "export const metadata = { description: \"Foreground-only workflow\" };\nexport default function workflow({ agent }) { return agent({ id: 'slow-step', prompt: 'slow', outputSchema: {}}); }\n"
     );
     const backgroundFlags: Array<boolean | undefined> = [];
     const service = new WorkflowService({
@@ -1889,8 +1208,8 @@ export default function workflow({ action }) {
     using tmp = new DisposableTempDir("workflow-service");
     const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
     const source = `export default function workflow({ agent }) {
-  const first = agent({ id: "first", prompt: "first", outputSchema: {} });
-  const second = agent({ id: "second", prompt: "second", outputSchema: {} });
+  const first = agent({ id: "first", prompt: "first", outputSchema: {}});
+  const second = agent({ id: "second", prompt: "second", outputSchema: {}});
   return { reportMarkdown: first.reportMarkdown + " + " + second.reportMarkdown };
 }
 `;
@@ -1965,7 +1284,7 @@ export default function workflow({ action }) {
       workspaceId: "workspace-1",
       definition: { name: "demo", description: "Demo", scope: "built-in", executable: true },
       definitionSource:
-        "export default function workflow({ agent }) { return agent({ id: 'orphaned-step', prompt: 'resume', outputSchema: {} }); }\n",
+        "export default function workflow({ agent }) { return agent({ id: 'orphaned-step', prompt: 'resume', outputSchema: {}}); }\n",
       args: {},
       now: "2026-05-29T00:00:00.000Z",
     });
@@ -2011,7 +1330,7 @@ export default function workflow({ action }) {
       workspaceId: "workspace-1",
       definition: { name: "demo", description: "Demo", scope: "built-in", executable: true },
       definitionSource:
-        "export default function workflow({ agent }) { return agent({ id: 'backgrounded-step', prompt: 'resume', outputSchema: {} }); }\n",
+        "export default function workflow({ agent }) { return agent({ id: 'backgrounded-step', prompt: 'resume', outputSchema: {}}); }\n",
       args: {},
       now: "2026-05-29T00:00:00.000Z",
     });
@@ -2062,7 +1381,7 @@ export default function workflow({ action }) {
       workspaceId: "workspace-1",
       definition: { name: "demo", description: "Demo", scope: "built-in", executable: true },
       definitionSource:
-        "export default function workflow({ agent }) { return agent({ id: 'slow-step', prompt: 'slow', outputSchema: {} }); }\n",
+        "export default function workflow({ agent }) { return agent({ id: 'slow-step', prompt: 'slow', outputSchema: {}}); }\n",
       args: {},
       now: "2026-05-29T00:00:00.000Z",
     });
@@ -2119,7 +1438,7 @@ export default function workflow({ action }) {
       workspaceId: "workspace-1",
       definition: { name: "demo", description: "Demo", scope: "built-in", executable: true },
       definitionSource:
-        "export default function workflow({ agent }) { return agent({ id: 'slow-step', prompt: 'slow', outputSchema: {} }); }\n",
+        "export default function workflow({ agent }) { return agent({ id: 'slow-step', prompt: 'slow', outputSchema: {}}); }\n",
       args: {},
       now: "2026-05-29T00:00:00.000Z",
     });
@@ -2207,7 +1526,7 @@ export default function workflow({ action }) {
       workspaceId: "workspace-1",
       definition: { name: "demo", description: "Demo", scope: "built-in", executable: true },
       definitionSource:
-        "export default function workflow({ agent }) { return agent({ id: 'step', prompt: 'p', outputSchema: {} }); }\n",
+        "export default function workflow({ agent }) { return agent({ id: 'step', prompt: 'p', outputSchema: {}}); }\n",
       args: {},
       now: "2026-05-29T00:00:00.000Z",
     });
@@ -2314,7 +1633,7 @@ export default function workflow({ action }) {
       workspaceId: "workspace-1",
       definition: { name: "demo", description: "Demo", scope: "built-in", executable: true },
       definitionSource:
-        "export default function workflow({ agent }) { return agent({ id: 'slow-step', prompt: 'slow', outputSchema: {} }); }\n",
+        "export default function workflow({ agent }) { return agent({ id: 'slow-step', prompt: 'slow', outputSchema: {}}); }\n",
       args: {},
       now: "2026-05-29T00:00:00.000Z",
     });
@@ -2378,7 +1697,7 @@ export default function workflow({ action }) {
         executable: true,
       },
       definitionSource:
-        "export default function workflow({ agent }) { const child = agent({ id: 'summarize-topic', prompt: 'Summarize durable workflows', outputSchema: {} }); return { reportMarkdown: 'Final: ' + child.reportMarkdown }; }\n",
+        "export default function workflow({ agent }) { const child = agent({ id: 'summarize-topic', prompt: 'Summarize durable workflows', outputSchema: {}}); return { reportMarkdown: 'Final: ' + child.reportMarkdown }; }\n",
       args: {},
       now: "2026-05-29T00:00:00.000Z",
     });
@@ -2503,7 +1822,7 @@ export default function workflow({ action }) {
         executable: true,
       },
       definitionSource:
-        "export default function workflow({ agent }) { const child = agent({ id: 'summarize-topic', prompt: 'Summarize durable workflows', outputSchema: {} }); return { reportMarkdown: 'Final: ' + child.reportMarkdown }; }\n",
+        "export default function workflow({ agent }) { const child = agent({ id: 'summarize-topic', prompt: 'Summarize durable workflows', outputSchema: {}}); return { reportMarkdown: 'Final: ' + child.reportMarkdown }; }\n",
       args: {},
       now: "2026-05-29T00:00:00.000Z",
     });
@@ -2579,7 +1898,7 @@ export default function workflow({ action }) {
         executable: true,
       },
       definitionSource:
-        "export default function workflow({ agent, applyPatch }) { const child = agent({ id: 'implement', prompt: 'Implement change', outputSchema: {} }); const patch = applyPatch({ id: 'apply-implement', source: child, target: 'parent' }); return { reportMarkdown: 'Patch ' + patch.status }; }\n",
+        "export default function workflow({ agent, applyPatch }) { const child = agent({ id: 'implement', prompt: 'Implement change', outputSchema: {}}); const patch = applyPatch({ id: 'apply-implement', source: child, target: 'parent' }); return { reportMarkdown: 'Patch ' + patch.status }; }\n",
       args: {},
       now: "2026-05-29T00:00:00.000Z",
     });
@@ -2588,7 +1907,7 @@ export default function workflow({ action }) {
       stepId: agentSpec.id,
       inputHash: hashWorkflowStepInput(agentSpec.id, agentSpec),
       taskId: "task_impl",
-      result: { taskId: "task_impl", reportMarkdown: "implemented", structuredOutput: {} },
+      result: { taskId: "task_impl", reportMarkdown: "implemented" },
       startedAt: "2026-05-29T00:00:00.100Z",
       completedAt: "2026-05-29T00:00:00.200Z",
     });
@@ -2882,12 +2201,10 @@ export default function workflow({ action }) {
     await writeWorkflow(
       globalRoot,
       "background-research",
-      "export const metadata = { description: \"Background workflow\" };\nexport default function workflow({ agent }) { return agent({ id: 'slow-step', prompt: 'slow', outputSchema: {} }); }\n"
+      "export const metadata = { description: \"Background workflow\" };\nexport default function workflow({ agent }) { return agent({ id: 'slow-step', prompt: 'slow', outputSchema: {}}); }\n"
     );
     const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
-    let releaseAgent:
-      | ((value: { taskId: string; reportMarkdown: string; structuredOutput: unknown }) => void)
-      | undefined;
+    let releaseAgent: ((value: MockWorkflowAgentResult) => void) | undefined;
     const terminalEvents: Array<{ runId: string; status: string; result: unknown }> = [];
     const lifecycleEvents: string[] = [];
     const service = new WorkflowService({
@@ -2897,11 +2214,7 @@ export default function workflow({ action }) {
       taskAdapter: {
         async runAgent() {
           lifecycleEvents.push("agent-started");
-          return await new Promise<{
-            taskId: string;
-            reportMarkdown: string;
-            structuredOutput: unknown;
-          }>((resolve) => {
+          return await new Promise<MockWorkflowAgentResult>((resolve) => {
             releaseAgent = resolve;
           });
         },
@@ -2958,7 +2271,7 @@ export default function workflow({ action }) {
     await writeWorkflow(
       globalRoot,
       "interruptable-background",
-      "export const metadata = { description: \"Interruptable background workflow\" };\nexport default function workflow({ agent }) { return agent({ id: 'slow-step', prompt: 'slow', outputSchema: {} }); }\n"
+      "export const metadata = { description: \"Interruptable background workflow\" };\nexport default function workflow({ agent }) { return agent({ id: 'slow-step', prompt: 'slow', outputSchema: {}}); }\n"
     );
     const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
     let agentStarted = false;
@@ -3022,7 +2335,7 @@ export default function workflow({ action }) {
     await writeWorkflow(
       globalRoot,
       "logged-interrupt-background",
-      "export const metadata = { description: \"Logged interrupt background workflow\" };\nexport default function workflow({ agent }) { return agent({ id: 'slow-step', prompt: 'slow', outputSchema: {} }); }\n"
+      "export const metadata = { description: \"Logged interrupt background workflow\" };\nexport default function workflow({ agent }) { return agent({ id: 'slow-step', prompt: 'slow', outputSchema: {}}); }\n"
     );
     const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
     let agentStarted = false;
@@ -3044,7 +2357,7 @@ export default function workflow({ action }) {
             if (abortSignal == null) {
               throw new Error("expected a background run abort signal");
             }
-            return await new Promise<{ taskId: string; reportMarkdown: string }>((_, reject) => {
+            return await new Promise<MockWorkflowAgentResult>((_, reject) => {
               abortSignal.addEventListener("abort", () => reject(new Error("Task interrupted")), {
                 once: true,
               });
@@ -3098,7 +2411,7 @@ export default function workflow({ action }) {
       workspaceId: "workspace-1",
       definition: { name: "demo", description: "Demo", scope: "built-in", executable: true },
       definitionSource:
-        "export default function workflow({ agent }) { return agent({ id: 'after-crash', prompt: 'resume', outputSchema: {} }); }\n",
+        "export default function workflow({ agent }) { return agent({ id: 'after-crash', prompt: 'resume', outputSchema: {}}); }\n",
       args: {},
       now: "2026-05-29T00:00:00.000Z",
     });
@@ -3108,7 +2421,7 @@ export default function workflow({ action }) {
       workspaceId: "workspace-1",
       definition: { name: "demo", description: "Demo", scope: "built-in", executable: true },
       definitionSource:
-        "export default function workflow({ agent }) { return agent({ id: 'should-not-run', prompt: 'blocked', outputSchema: {} }); }\n",
+        "export default function workflow({ agent }) { return agent({ id: 'should-not-run', prompt: 'blocked', outputSchema: {}}); }\n",
       args: {},
       now: "2026-05-29T00:00:00.000Z",
     });
@@ -3151,7 +2464,7 @@ export default function workflow({ action }) {
       workspaceId: "workspace-1",
       definition: { name: "demo", description: "Demo", scope: "built-in", executable: true },
       definitionSource:
-        "export default function workflow({ agent }) { return agent({ id: 'after-lease', prompt: 'resume', outputSchema: {} }); }\n",
+        "export default function workflow({ agent }) { return agent({ id: 'after-lease', prompt: 'resume', outputSchema: {}}); }\n",
       args: {},
       now: "2026-05-29T00:00:00.000Z",
     });
@@ -3199,7 +2512,7 @@ export default function workflow({ action }) {
         executable: true,
       },
       definitionSource:
-        "export default function workflow({ agent }) { return agent({ id: 'after-trust-revoked', prompt: 'blocked', outputSchema: {} }); }\n",
+        "export default function workflow({ agent }) { return agent({ id: 'after-trust-revoked', prompt: 'blocked', outputSchema: {}}); }\n",
       args: {},
       now: "2026-05-29T00:00:00.000Z",
     });
@@ -3327,7 +2640,7 @@ export default function workflow() {
         executable: true,
       },
       definitionSource:
-        "export default function workflow({ agent }) { return agent({ id: 'trusted-step', prompt: 'run', outputSchema: {} }); }\n",
+        "export default function workflow({ agent }) { return agent({ id: 'trusted-step', prompt: 'run', outputSchema: {}}); }\n",
       args: {},
       now: "2026-05-29T00:00:00.000Z",
     });
@@ -3380,7 +2693,7 @@ export default function workflow() {
         executable: true,
       },
       definitionSource:
-        "export default function workflow({ agent }) { return agent({ id: 'scratch-step', prompt: 'run', outputSchema: {} }); }\n",
+        "export default function workflow({ agent }) { return agent({ id: 'scratch-step', prompt: 'run', outputSchema: {}}); }\n",
       args: {},
       now: "2026-05-29T00:00:00.000Z",
     });

@@ -1,7 +1,11 @@
 /* eslint-disable @typescript-eslint/await-thenable, @typescript-eslint/require-await */
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import assert from "node:assert/strict";
 import { describe, expect, mock, test } from "bun:test";
 import { Ok } from "@/common/types/result";
+import type { TaskApplyGitPatchConfiguration } from "@/node/services/tools/task_apply_git_patch";
+import { DisposableTempDir } from "@/node/services/tempDir";
 import type { TaskCreateResult } from "@/node/services/taskService";
 import { WorkflowTaskServiceAdapter } from "./WorkflowTaskServiceAdapter";
 
@@ -105,7 +109,7 @@ describe("WorkflowTaskServiceAdapter", () => {
     });
   });
 
-  test("passes onRefusal through to task creation so refusal policy persists on the child", async () => {
+  test("passes onRefusal and isolation through to task creation", async () => {
     let createArgs: unknown;
     const create = mock(async (args: unknown) => {
       createArgs = args;
@@ -124,16 +128,26 @@ describe("WorkflowTaskServiceAdapter", () => {
       defaultAgentId: "explore",
     });
 
-    await adapter.runAgent({ id: "verify", prompt: "Verify claims", onRefusal: "fail" });
-    expect(createArgs).toMatchObject({ onRefusal: "fail" });
+    await adapter.runAgent({
+      id: "verify",
+      prompt: "Verify claims",
+      onRefusal: "fail",
+      isolation: "none",
+    });
+    expect(createArgs).toMatchObject({ onRefusal: "fail", isolation: "none" });
 
     // The parallel path must preserve the refusal policy too: a verifier step
     // marked onRefusal: "fail" must fail honestly instead of silently
     // continuing on a configured fallback model.
     await adapter.createAgentTasks([
-      { id: "verify-parallel", prompt: "Verify claims in parallel", onRefusal: "fail" },
+      {
+        id: "verify-parallel",
+        prompt: "Verify claims in parallel",
+        onRefusal: "fail",
+        isolation: "none",
+      },
     ]);
-    expect(createManyArgs).toMatchObject([{ onRefusal: "fail" }]);
+    expect(createManyArgs).toMatchObject([{ onRefusal: "fail", isolation: "none" }]);
   });
 
   test("passes CLI-selected model and thinking level to workflow child task creation", async () => {
@@ -391,6 +405,107 @@ describe("WorkflowTaskServiceAdapter", () => {
       },
     ]);
     expect(result).toMatchObject({ success: true, dryRun: false });
+  });
+
+  test("rejects workflow patch artifacts outside allowed path prefixes", async () => {
+    using tmp = new DisposableTempDir("workflow-adapter-patch-paths");
+    const mboxPath = path.join(tmp.path, "subagent-patches", "task_impl", "repo", "series.mbox");
+    await fs.mkdir(path.dirname(mboxPath), { recursive: true });
+    await fs.writeFile(
+      mboxPath,
+      [
+        "diff --git a/.mux/security/runs/latest b/.mux/security/runs/latest",
+        "--- a/.mux/security/runs/latest",
+        "+++ b/.mux/security/runs/latest",
+        "@@ -1 +1 @@",
+        "-old",
+        "+new",
+        "diff --git a/src/app.ts b/src/app.ts",
+        "--- a/src/app.ts",
+        "+++ b/src/app.ts",
+        "@@ -1 +1 @@",
+        "-old",
+        "+new",
+      ].join("\n")
+    );
+    await fs.writeFile(
+      path.join(tmp.path, "subagent-patches.json"),
+      JSON.stringify({
+        version: 2,
+        artifactsByChildTaskId: {
+          task_impl: {
+            childTaskId: "task_impl",
+            parentWorkspaceId: "parent_1",
+            createdAtMs: 1,
+            status: "ready",
+            projectArtifacts: [
+              {
+                projectPath: "/other-repo",
+                projectName: "other-repo",
+                storageKey: "other-repo",
+                status: "skipped",
+              },
+              {
+                projectPath: "/repo",
+                projectName: "repo",
+                storageKey: "repo",
+                status: "ready",
+                mboxPath,
+                commitCount: 1,
+              },
+            ],
+            readyProjectCount: 1,
+            failedProjectCount: 0,
+            skippedProjectCount: 0,
+            totalCommitCount: 1,
+          },
+        },
+      })
+    );
+    const create = mock(async () =>
+      Ok({ taskId: "task_1", kind: "agent" as const, status: "running" as const })
+    );
+    const waitForAgentReport = mock(async () => ({ reportMarkdown: "unused" }));
+    const applyPatchCalls: unknown[] = [];
+    const applyPatchArtifact = mock(async (args: unknown) => {
+      applyPatchCalls.push(args);
+      return {
+        success: true as const,
+        taskId: "task_impl",
+        projectResults: [],
+      };
+    });
+    const patchToolConfig: TaskApplyGitPatchConfiguration = {
+      cwd: "/repo",
+      runtime: undefined as unknown as TaskApplyGitPatchConfiguration["runtime"],
+      runtimeTempDir: "/tmp",
+      workspaceSessionDir: tmp.path,
+    };
+    const adapter = new WorkflowTaskServiceAdapter({
+      taskService: { create, waitForAgentReport },
+      parentWorkspaceId: "parent_1",
+      workflowRunId: "wfr_123",
+      defaultAgentId: "explore",
+      getProjectTrusted: () => true,
+      patchToolConfig,
+      applyPatchArtifact,
+    });
+
+    const result = await adapter.applyPatch({
+      id: "apply-security-state",
+      sourceTaskId: "task_impl",
+      target: "parent",
+      threeWay: true,
+      force: true,
+      allowedPathPrefixes: [".mux/security"],
+    });
+
+    expect(result).toMatchObject({ success: false, taskId: "task_impl" });
+    expect(result.success ? "" : result.error).toContain("src/app.ts");
+    expect(applyPatchArtifact).toHaveBeenCalledTimes(1);
+    expect(applyPatchCalls).toEqual([
+      expect.objectContaining({ task_id: "task_impl", dry_run: true }),
+    ]);
   });
 
   test("returns dry-run conflicts without applying workflow patches", async () => {
