@@ -124,6 +124,36 @@
               "adr/0004-cli-goal-runs-are-not-strict-goal-aliases",
               "AGENTS"
             ]
+          },
+          {
+            "group": "Codebase Analysis",
+            "pages": [
+              "analysis/00-system-overview",
+              "analysis/01-architecture-build",
+              "analysis/02-ipc-config",
+              "analysis/03-ai-agent-runtime",
+              "analysis/04-tools-mcp-skills",
+              "analysis/05-workspace-persistence",
+              "analysis/06-workflow-engine",
+              "analysis/07-react-frontend",
+              "analysis/08-mobile",
+              "analysis/09-testing-ci-security"
+            ]
+          },
+          {
+            "group": "Improvements",
+            "pages": [
+              "improvement/00-system-wide-roadmap",
+              "improvement/01-architecture-build",
+              "improvement/02-ipc-config",
+              "improvement/03-ai-agent-runtime",
+              "improvement/04-tools-mcp-skills",
+              "improvement/05-workspace-persistence",
+              "improvement/06-workflow-engine",
+              "improvement/07-react-frontend",
+              "improvement/08-mobile",
+              "improvement/09-testing-ci-security"
+            ]
           }
         ]
       }
