@@ -140,6 +140,35 @@ function getExplicitThinkingPolicy(modelString: string): ThinkingPolicy | null {
     return ["low", "high"];
   }
 
+  // OpenAI-compatible vendor reasoning models (Z.AI/Zhipu GLM, Moonshot Kimi,
+  // MiniMax, Xiaomi MiMo, Alibaba Qwen/Qwq). All support a standard on/low/med/high
+  // reasoning surface; vendor-specific body shaping happens in buildProviderOptions
+  // + makeOpenAICompatibleReasoningTransform.
+  //
+  // Accuracy matters for DashScope (Alibaba): a matched model gets `enable_thinking`
+  // injected, so non-reasoning variants (qwen3-coder-*, qwen*-max, qwen-vl-*, qwen2-5-*
+  // instruct, kimi-k2-*-preview) are deliberately excluded.
+  if (
+    // Z.AI/Zhipu GLM (all GLM-4.x/5.x are reasoning models)
+    /^glm-[45]/.test(withoutProviderNamespace) ||
+    // Moonshot Kimi reasoning variants (kimi-k2-thinking*, kimi-k2.5/.6)
+    withoutProviderNamespace.startsWith("kimi-k2-thinking") ||
+    /^kimi-k2\.[0-9]/.test(withoutProviderNamespace) ||
+    // MiniMax M2.x / M3 (all reasoning)
+    /^minimax-m[0-9]/.test(withoutProviderNamespace) ||
+    // Xiaomi MiMo (all reasoning)
+    withoutProviderNamespace.startsWith("mimo-v") ||
+    // Alibaba Qwen reasoning models. Excludes coder/max/vl/omni/instruct/mt and the
+    // qwen2-5 series, which the DashScope catalog marks non-reasoning.
+    withoutProviderNamespace.startsWith("qwq") ||
+    withoutProviderNamespace.startsWith("qvq") ||
+    /^qwen3\.[5-9]/.test(withoutProviderNamespace) ||
+    /^qwen3-(?!coder|max|omni)/.test(withoutProviderNamespace) ||
+    /^qwen-(?:plus|flash|turbo)(?!-)/.test(withoutProviderNamespace)
+  ) {
+    return ["off", "low", "medium", "high"];
+  }
+
   // No explicit reasoning rule matched.
   return null;
 }

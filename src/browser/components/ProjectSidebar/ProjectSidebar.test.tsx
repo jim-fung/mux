@@ -62,6 +62,11 @@ function installProviderIconSvgMocks() {
     "@/browser/assets/icons/deepseek.svg?react",
     "@/browser/assets/icons/aws.svg?react",
     "@/browser/assets/icons/github.svg?react",
+    "@/browser/assets/icons/zai.svg?react",
+    "@/browser/assets/icons/moonshot.svg?react",
+    "@/browser/assets/icons/minimax.svg?react",
+    "@/browser/assets/icons/xiaomi.svg?react",
+    "@/browser/assets/icons/alibaba.svg?react",
   ] as const;
 
   for (const svgPath of providerIconSvgPaths) {

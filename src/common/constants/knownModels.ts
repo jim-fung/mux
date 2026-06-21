@@ -4,7 +4,18 @@
 
 import { formatModelDisplayName } from "../utils/ai/modelDisplay";
 
-type ModelProvider = "anthropic" | "openai" | "google" | "xai" | "deepseek";
+type ModelProvider =
+  | "anthropic"
+  | "openai"
+  | "google"
+  | "xai"
+  | "deepseek"
+  // OpenAI-compatible vendors
+  | "zai"
+  | "moonshot"
+  | "minimax"
+  | "xiaomi"
+  | "alibaba";
 
 interface KnownModelDefinition {
   /** Provider identifier used by SDK factories */
@@ -166,6 +177,37 @@ const MODEL_DEFINITIONS = {
     providerModelId: "deepseek-v4-flash",
     aliases: ["deepseek-flash", "deepseek-v4-flash"],
     tokenizerOverride: "deepseek/deepseek-v3.1",
+  },
+  // ---------------------------------------------------------------------------
+  // OpenAI-compatible vendor focal models. These give convenient short aliases
+  // (e.g. `glm` -> zai:glm-4.6). Token counting uses the default estimator; the
+  // vendors have not published ai-tokenizer weights. Per-provider reasoning body
+  // shaping is handled in buildProviderOptions + transformRequestBody.
+  // ---------------------------------------------------------------------------
+  GLM: {
+    provider: "zai",
+    providerModelId: "glm-4.6",
+    aliases: ["glm"],
+  },
+  KIMI: {
+    provider: "moonshot",
+    providerModelId: "kimi-k2-thinking",
+    aliases: ["kimi"],
+  },
+  MINIMAX: {
+    provider: "minimax",
+    providerModelId: "MiniMax-M2",
+    aliases: ["minimax"],
+  },
+  MIMO: {
+    provider: "xiaomi",
+    providerModelId: "mimo-v2.5-pro",
+    aliases: ["mimo"],
+  },
+  QWEN: {
+    provider: "alibaba",
+    providerModelId: "qwen3-coder-plus",
+    aliases: ["qwen"],
   },
 } as const satisfies Record<string, KnownModelDefinition>;
 

@@ -20,6 +20,7 @@ import {
   resolveAIProviderHeaderSource,
   resolveOpenAIWebSocketResponsesUrl,
   wrapFetchWithAnthropicCacheControl,
+  makeOpenAICompatibleReasoningTransform,
 } from "./providerModelFactory";
 import { MUX_ANTHROPIC_EFFORT_OVERRIDE_HEADER } from "@/common/utils/ai/providerOptions";
 import { hasLanguageModelCleanup } from "./languageModelCleanup";
@@ -27,6 +28,48 @@ import type { DevToolsService } from "./devToolsService";
 import { CodexOauthService } from "./codexOauthService";
 import { PolicyService } from "./policyService";
 import { ProviderService } from "./providerService";
+
+describe("makeOpenAICompatibleReasoningTransform", () => {
+  // The openai-compatible SDK surfaces reasoningEffort as body `reasoning_effort`.
+  // Per-vendor transform translates that carrier into the field each API understands.
+  it("translates the carrier to GLM thinking for zai", () => {
+    const t = makeOpenAICompatibleReasoningTransform("zai");
+    const out = t({ reasoning_effort: "medium", model: "glm-4.6", messages: [] });
+    expect(out).toEqual({
+      model: "glm-4.6",
+      messages: [],
+      thinking: { type: "enabled", clear_thinking: false },
+    });
+  });
+
+  it("translates the carrier to enable_thinking for alibaba (DashScope)", () => {
+    const t = makeOpenAICompatibleReasoningTransform("alibaba");
+    const out = t({ reasoning_effort: "high", model: "qwq-plus" });
+    expect(out).toEqual({ model: "qwq-plus", enable_thinking: true });
+    // reasoning_effort is stripped (DashScope rejects unknown params).
+    expect("reasoning_effort" in out).toBe(false);
+  });
+
+  it("also covers the coding-plan variants", () => {
+    const t = makeOpenAICompatibleReasoningTransform("zai-coding-plan");
+    expect(t({ reasoning_effort: "medium" })).toEqual({
+      thinking: { type: "enabled", clear_thinking: false },
+    });
+  });
+
+  it("is a no-op when thinking is off (no carrier present)", () => {
+    const t = makeOpenAICompatibleReasoningTransform("alibaba");
+    expect(t({ model: "qwen-plus" })).toEqual({ model: "qwen-plus" });
+  });
+
+  it("leaves reasoning_effort in place for native vendors (moonshot/minimax/xiaomi)", () => {
+    const t = makeOpenAICompatibleReasoningTransform("moonshot");
+    expect(t({ reasoning_effort: "medium", model: "kimi-k2.5" })).toEqual({
+      reasoning_effort: "medium",
+      model: "kimi-k2.5",
+    });
+  });
+});
 
 const LOCAL_VLLM_BASE_URL = "http://localhost:8000/v1";
 const LOCAL_VLLM_MODEL = "qwen3-coder";

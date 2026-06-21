@@ -9,6 +9,11 @@ import OllamaIcon from "@/browser/assets/icons/ollama.svg?react";
 import DeepSeekIcon from "@/browser/assets/icons/deepseek.svg?react";
 import AWSIcon from "@/browser/assets/icons/aws.svg?react";
 import GitHubIcon from "@/browser/assets/icons/github.svg?react";
+import ZaiIcon from "@/browser/assets/icons/zai.svg?react";
+import MoonshotIcon from "@/browser/assets/icons/moonshot.svg?react";
+import MinimaxIcon from "@/browser/assets/icons/minimax.svg?react";
+import XiaomiIcon from "@/browser/assets/icons/xiaomi.svg?react";
+import AlibabaIcon from "@/browser/assets/icons/alibaba.svg?react";
 import { GatewayIcon } from "@/browser/components/icons/GatewayIcon/GatewayIcon";
 import {
   PROVIDER_DEFINITIONS,
@@ -32,6 +37,18 @@ const PROVIDER_ICONS: Partial<Record<ProviderName, React.FC>> = {
   ollama: OllamaIcon,
   "mux-gateway": GatewayIcon,
   "github-copilot": GitHubIcon,
+  // OpenAI-compatible vendors. One icon per vendor; coding-plan / token-plan
+  // regional variants reuse the vendor icon.
+  zai: ZaiIcon,
+  "zai-coding-plan": ZaiIcon,
+  moonshot: MoonshotIcon,
+  minimax: MinimaxIcon,
+  "minimax-coding-plan": MinimaxIcon,
+  xiaomi: XiaomiIcon,
+  "xiaomi-token-plan-sgp": XiaomiIcon,
+  "xiaomi-token-plan-ams": XiaomiIcon,
+  alibaba: AlibabaIcon,
+  "alibaba-coding-plan": AlibabaIcon,
 };
 
 /**

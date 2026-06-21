@@ -420,3 +420,35 @@ describe("resolveProviderCredentials - apiKeyFile", () => {
     }
   });
 });
+
+describe("OpenAI-compatible vendor credential resolution", () => {
+  it.each([
+    ["zai", "ZHIPU_API_KEY"],
+    ["moonshot", "MOONSHOT_API_KEY"],
+    ["minimax", "MINIMAX_API_KEY"],
+    ["xiaomi", "XIAOMI_API_KEY"],
+    ["alibaba", "DASHSCOPE_API_KEY"],
+    ["alibaba-coding-plan", "ALIBABA_CODING_PLAN_API_KEY"],
+  ] as const)("resolves %s apiKey from its env var", (provider, envVar) => {
+    const result = resolveProviderCredentials(provider, {}, { [envVar]: "sk-test" });
+    expect(result.isConfigured).toBe(true);
+    expect(result.apiKeySource).toBe("env");
+  });
+
+  it("resolves the overridable baseUrl env var for vendor providers", () => {
+    const result = resolveProviderCredentials(
+      "moonshot",
+      {},
+      {
+        MOONSHOT_API_KEY: "sk-test",
+        MOONSHOT_BASE_URL: "https://proxy.moonshot.test/v1",
+      }
+    );
+    expect(result.baseUrl).toBe("https://proxy.moonshot.test/v1");
+    expect(result.baseUrlSource).toBe("env");
+  });
+
+  it("is unconfigured when no env var or config key is present", () => {
+    expect(resolveProviderCredentials("zai", {}, {}).isConfigured).toBe(false);
+  });
+});

@@ -1065,3 +1065,34 @@ describe("buildRequestHeaders", () => {
     expect(buildRequestHeaders("anthropic:claude-sonnet-4-5")).toBeUndefined();
   });
 });
+describe("buildProviderOptions - OpenAI-compatible vendor reasoning carrier", () => {
+  // GLM/Z.AI and DashScope/Alibaba emit a reasoningEffort carrier that the SDK maps to
+  // body reasoning_effort; transformRequestBody translates it per vendor. Thinking off
+  // emits nothing (no spurious body field).
+  test("zai emits a reasoningEffort carrier when thinking is on", () => {
+    expect(buildProviderOptions("zai:glm-4.6", "medium")).toEqual({
+      zai: { reasoningEffort: "medium" },
+    });
+    expect(buildProviderOptions("zai-coding-plan:glm-5.1", "high")).toEqual({
+      "zai-coding-plan": { reasoningEffort: "high" },
+    });
+  });
+
+  test("alibaba emits a reasoningEffort carrier when thinking is on", () => {
+    expect(buildProviderOptions("alibaba:qwq-plus", "medium")).toEqual({
+      alibaba: { reasoningEffort: "medium" },
+    });
+  });
+
+  test("thinking off emits no carrier for zai/alibaba", () => {
+    expect(buildProviderOptions("zai:glm-4.6", "off")).toEqual({});
+    expect(buildProviderOptions("alibaba:qwen-plus", "off")).toEqual({});
+  });
+
+  // Native vendors (moonshot/minimax/xiaomi) reason natively and need no carrier.
+  test("moonshot/minimax/xiaomi emit no carrier", () => {
+    expect(buildProviderOptions("moonshot:kimi-k2-thinking", "medium")).toEqual({});
+    expect(buildProviderOptions("minimax:MiniMax-M2", "medium")).toEqual({});
+    expect(buildProviderOptions("xiaomi:mimo-v2.5-pro", "medium")).toEqual({});
+  });
+});

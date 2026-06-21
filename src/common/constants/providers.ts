@@ -23,7 +23,19 @@ export type ProviderName =
   | "openrouter"
   | "github-copilot"
   | "bedrock"
-  | "ollama";
+  | "ollama"
+  // OpenAI-compatible vendors (all use @ai-sdk/openai-compatible). Each carries a
+  // defaultBaseUrl since createOpenAICompatible has no built-in default endpoint.
+  | "zai"
+  | "zai-coding-plan"
+  | "moonshot"
+  | "minimax"
+  | "minimax-coding-plan"
+  | "xiaomi"
+  | "xiaomi-token-plan-sgp"
+  | "xiaomi-token-plan-ams"
+  | "alibaba"
+  | "alibaba-coding-plan";
 
 interface ProviderDefinition {
   /** Display name for UI (proper casing) */
@@ -36,6 +48,13 @@ interface ProviderDefinition {
   requiresApiKey: boolean;
   /** Provider category for routing behavior */
   kind: "direct" | "gateway" | "local";
+  /**
+   * Default base URL for providers whose ai-sdk factory has no built-in default
+   * (e.g. @ai-sdk/openai-compatible). Used only when the user has not supplied a
+   * baseURL via config (`baseUrl`) or env (`<VENDOR>_BASE_URL`). Precedence:
+   * explicit config baseURL > env base URL > defaultBaseUrl.
+   */
+  defaultBaseUrl?: string;
   /** Gateways only: which direct providers this gateway routes to */
   routes?: ProviderName[];
   /** Transform canonical model identity into a gateway-specific model ID */
@@ -170,6 +189,92 @@ export const PROVIDER_DEFINITIONS = {
     factoryName: "createOllama",
     requiresApiKey: false, // Local service
     kind: "local",
+  },
+  // ---------------------------------------------------------------------------
+  // OpenAI-compatible vendors. These all use @ai-sdk/openai-compatible and carry
+  // a defaultBaseUrl (the factory has no built-in default). Reasoning that needs
+  // a non-standard request body field (e.g. DashScope enable_thinking, GLM
+  // thinking) is injected via transformRequestBody at provider creation.
+  // ---------------------------------------------------------------------------
+  zai: {
+    displayName: "Z.AI",
+    import: () => import("@ai-sdk/openai-compatible"),
+    factoryName: "createOpenAICompatible",
+    requiresApiKey: true,
+    kind: "direct",
+    defaultBaseUrl: "https://api.z.ai/api/paas/v4",
+  },
+  "zai-coding-plan": {
+    displayName: "Z.AI Coding Plan",
+    import: () => import("@ai-sdk/openai-compatible"),
+    factoryName: "createOpenAICompatible",
+    requiresApiKey: true,
+    kind: "direct",
+    defaultBaseUrl: "https://api.z.ai/api/coding/paas/v4",
+  },
+  moonshot: {
+    displayName: "Moonshot AI",
+    import: () => import("@ai-sdk/openai-compatible"),
+    factoryName: "createOpenAICompatible",
+    requiresApiKey: true,
+    kind: "direct",
+    defaultBaseUrl: "https://api.moonshot.ai/v1",
+  },
+  minimax: {
+    displayName: "MiniMax",
+    import: () => import("@ai-sdk/openai-compatible"),
+    factoryName: "createOpenAICompatible",
+    requiresApiKey: true,
+    kind: "direct",
+    defaultBaseUrl: "https://api.minimax.chat/v1",
+  },
+  "minimax-coding-plan": {
+    displayName: "MiniMax Coding Plan",
+    import: () => import("@ai-sdk/openai-compatible"),
+    factoryName: "createOpenAICompatible",
+    requiresApiKey: true,
+    kind: "direct",
+    defaultBaseUrl: "https://api.minimax.chat/v1",
+  },
+  xiaomi: {
+    displayName: "Xiaomi",
+    import: () => import("@ai-sdk/openai-compatible"),
+    factoryName: "createOpenAICompatible",
+    requiresApiKey: true,
+    kind: "direct",
+    defaultBaseUrl: "https://api.xiaomimimo.com/v1",
+  },
+  "xiaomi-token-plan-sgp": {
+    displayName: "Xiaomi (Singapore)",
+    import: () => import("@ai-sdk/openai-compatible"),
+    factoryName: "createOpenAICompatible",
+    requiresApiKey: true,
+    kind: "direct",
+    defaultBaseUrl: "https://token-plan-sgp.xiaomimimo.com/v1",
+  },
+  "xiaomi-token-plan-ams": {
+    displayName: "Xiaomi (Europe)",
+    import: () => import("@ai-sdk/openai-compatible"),
+    factoryName: "createOpenAICompatible",
+    requiresApiKey: true,
+    kind: "direct",
+    defaultBaseUrl: "https://token-plan-ams.xiaomimimo.com/v1",
+  },
+  alibaba: {
+    displayName: "Alibaba",
+    import: () => import("@ai-sdk/openai-compatible"),
+    factoryName: "createOpenAICompatible",
+    requiresApiKey: true,
+    kind: "direct",
+    defaultBaseUrl: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+  },
+  "alibaba-coding-plan": {
+    displayName: "Alibaba Coding Plan",
+    import: () => import("@ai-sdk/openai-compatible"),
+    factoryName: "createOpenAICompatible",
+    requiresApiKey: true,
+    kind: "direct",
+    defaultBaseUrl: "https://coding-intl.dashscope.aliyuncs.com/v1",
   },
 } as const satisfies Record<ProviderName, ProviderDefinition>;
 

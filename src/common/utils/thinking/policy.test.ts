@@ -763,3 +763,39 @@ describe("enforceThinkingPolicy with a minimum floor", () => {
     expect(enforceThinkingPolicy("anthropic:claude-sonnet-4-5", "off")).toBe("off");
   });
 });
+describe("OpenAI-compatible vendor reasoning recognition", () => {
+  // Recognized reasoning models floor to "medium" (thinking controls surface).
+  test.each([
+    ["zai:glm-4.6"],
+    ["zai:glm-5.1"],
+    ["zai:glm-5v-turbo"],
+    ["moonshot:kimi-k2-thinking"],
+    ["moonshot:kimi-k2.5"],
+    ["moonshot:kimi-k2-thinking-turbo"],
+    ["minimax:MiniMax-M2"],
+    ["minimax:MiniMax-M2.7"],
+    ["xiaomi:mimo-v2.5-pro"],
+    ["xiaomi:mimo-v2-flash"],
+    ["alibaba:qwen3-235b-a22b"],
+    ["alibaba:qwen-plus"],
+    ["alibaba:qwq-plus"],
+    ["alibaba:qwen-flash"],
+  ])("recognizes %s as reasoning (medium floor)", (model) => {
+    expect(getDefaultMinimumThinkingLevel(model)).toBe("medium");
+    expect(getThinkingPolicyForModel(model)).toContain("high");
+  });
+
+  // Non-reasoning variants must NOT be recognized — otherwise DashScope would receive
+  // a spurious enable_thinking injection for models that don't reason.
+  test.each([
+    ["alibaba:qwen3-coder-plus"],
+    ["alibaba:qwen3-coder-flash"],
+    ["alibaba:qwen3-max"],
+    ["alibaba:qwen-max"],
+    ["alibaba:qwen-vl-plus"],
+    ["alibaba:qwen2-5-7b-instruct"],
+    ["moonshot:kimi-k2-0905-preview"],
+  ])("does NOT recognize non-reasoning %s (off floor)", (model) => {
+    expect(getDefaultMinimumThinkingLevel(model)).toBe("off");
+  });
+});

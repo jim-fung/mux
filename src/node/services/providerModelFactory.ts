@@ -457,6 +457,32 @@ export function wrapFetchWithAnthropicCacheControl(
 
   return Object.assign(cachingFetch, baseFetch) as typeof fetch;
 }
+/**
+ * Build a request-body transform for built-in OpenAI-compatible vendors whose
+ * reasoning API expects a non-standard body field.
+ *
+ * The @ai-sdk/openai-compatible SDK only forwards a small set of recognized
+ * providerOptions keys (reasoningEffort -> body.reasoning_effort). We therefore
+ * emit reasoningEffort from buildProviderOptions as a "thinking is on" carrier
+ * and translate it here into the field each vendor actually understands:
+ *   - Z.AI/Zhipu (GLM): `thinking: { type: "enabled", clear_thinking: false }`
+ *   - DashScope (Alibaba): top-level `enable_thinking: true`
+ *
+ * When thinking is off the carrier is absent, so nothing is injected.
+ */
+export function makeOpenAICompatibleReasoningTransform(providerName: ProviderName) {
+  return (body: Record<string, unknown>): Record<string, unknown> => {
+    if (body.reasoning_effort == null) return body;
+    if (providerName === "zai" || providerName === "zai-coding-plan") {
+      delete body.reasoning_effort;
+      body.thinking = { type: "enabled", clear_thinking: false };
+    } else if (providerName === "alibaba" || providerName === "alibaba-coding-plan") {
+      delete body.reasoning_effort;
+      body.enable_thinking = true;
+    }
+    return body;
+  };
+}
 
 /**
  * Wrap fetch so any mux-gateway 401 response clears local credentials (best-effort).
@@ -1902,6 +1928,51 @@ export class ProviderModelFactory {
           fetch: providerFetch,
         });
         return Ok(provider.chat(outboundCopilotModelId));
+      }
+
+      // Built-in OpenAI-compatible vendors (zai, moonshot, minimax, xiaomi, alibaba, ...).
+      // Unlike dedicated SDKs, @ai-sdk/openai-compatible has no baked-in base URL, does not
+      // namespace providerOptions without an explicit `name`, and only forwards a small set
+      // of recognized reasoning keys. Handle them here with: a defaultBaseUrl fallback, an
+      // explicit SDK `name`, and a transformRequestBody that injects vendor-specific
+      // reasoning body fields (see makeOpenAICompatibleReasoningTransform).
+      {
+        const oaiCompatDef = PROVIDER_DEFINITIONS[providerName as ProviderName];
+        if (
+          oaiCompatDef?.kind === "direct" &&
+          oaiCompatDef.factoryName === "createOpenAICompatible"
+        ) {
+          const creds = resolveProviderCredentials(providerName as ProviderName, providerConfig);
+          if (oaiCompatDef.requiresApiKey && !creds.isConfigured) {
+            return Err({ type: "api_key_not_found", provider: providerName });
+          }
+          const resolvedApiKey = await this.resolveApiKey(creds.apiKey);
+          if (creds.apiKey && isOpReference(creds.apiKey) && !resolvedApiKey) {
+            return Err({ type: "api_key_not_found", provider: providerName });
+          }
+          // baseURL precedence: explicit config > env > defaultBaseUrl (PROVIDER_DEFINITIONS).
+          const baseURL =
+            providerConfig.baseURL ?? creds.baseUrl?.trim() ?? oaiCompatDef.defaultBaseUrl;
+          if (!baseURL) {
+            return Err({
+              type: "unknown",
+              raw: `No base URL configured for provider "${providerName}"`,
+            });
+          }
+          const providerFetch = getProviderFetch(providerConfig);
+          const muxAttributionHeaders = buildAppAttributionHeaders(providerConfig.headers);
+          const provider = createOpenAICompatible({
+            name: providerName,
+            baseURL,
+            ...(resolvedApiKey ? { apiKey: resolvedApiKey } : {}),
+            headers: { ...muxAttributionHeaders },
+            fetch: providerFetch,
+            transformRequestBody: makeOpenAICompatibleReasoningTransform(
+              providerName as ProviderName
+            ),
+          });
+          return Ok(provider(modelId));
+        }
       }
 
       // Generic handler for simple providers (standard API key + factory pattern)

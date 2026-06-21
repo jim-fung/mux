@@ -66,6 +66,10 @@ type ProviderOptions =
   | { openrouter: OpenRouterReasoningOptions }
   | { xai: XaiProviderOptions }
   | { "github-copilot": OpenAICompatibleGatewayProviderOptions }
+  // OpenAI-compatible vendor reasoning carrier: the SDK reads `reasoningEffort` under
+  // the provider's `name` key, so the key is dynamic (zai, alibaba, ...). The carrier
+  // is translated into a vendor-specific body field by transformRequestBody.
+  | Partial<Record<string, OpenAICompatibleGatewayProviderOptions>>
   | Record<string, never>; // Empty object for unsupported providers
 
 const OPENAI_REASONING_SUMMARY_UNSUPPORTED_MODELS = new Set<string>([
@@ -517,6 +521,33 @@ export function buildProviderOptions(
       },
     } satisfies { "github-copilot": OpenAICompatibleGatewayProviderOptions };
     log.debug("buildProviderOptions: Returning OpenAI-compatible gateway options", options);
+    return options;
+  }
+
+  // Built-in OpenAI-compatible vendors whose reasoning requires a vendor-specific body
+  // field (GLM/Z.AI, DashScope/Alibaba). We emit `reasoningEffort` as a carrier: the
+  // @ai-sdk/openai-compatible SDK maps it to body `reasoning_effort`, which
+  // makeOpenAICompatibleReasoningTransform (providerModelFactory) then translates into
+  // the field each vendor understands. Other vendors (moonshot/minimax/xiaomi) reason
+  // natively and need no carrier. Thinking off => no carrier => nothing injected.
+  if (
+    formatProvider === "zai" ||
+    formatProvider === "zai-coding-plan" ||
+    formatProvider === "alibaba" ||
+    formatProvider === "alibaba-coding-plan"
+  ) {
+    const reasoningEffort = OPENAI_REASONING_EFFORT[effectiveThinking];
+    if (!reasoningEffort) {
+      log.debug("buildProviderOptions: OAI-compat vendor thinking off", { formatProvider });
+      return {};
+    }
+    const options = {
+      [formatProvider]: { reasoningEffort },
+    };
+    log.debug("buildProviderOptions: OAI-compat vendor reasoning carrier", {
+      formatProvider,
+      reasoningEffort,
+    });
     return options;
   }
 
