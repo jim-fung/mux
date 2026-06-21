@@ -1,5 +1,4 @@
-<!-- Z.AI / Zhipu (GLM): AI sparkle mark (monochrome placeholder) -->
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
-  <path d="M12 1.5l2.9 7.6 7.6 2.9-7.6 2.9L12 22.5l-2.9-7.6L1.5 12l7.6-2.9z"/>
-  <path d="M18.5 1.5l1.1 2.9 2.9 1.1-2.9 1.1-1.1 2.9-1.1-2.9-2.9-1.1 2.9-1.1z"/>
+<!-- Source: OpenCode provider icon set (Z.AI / Zhipu (GLM) mark) -->
+<svg viewBox="0 0 40 40" xmlns="http://www.w3.org/2000/svg">
+<path d="M20.1312 7.50002L17.4088 11.1913H5.81625L8.5375 7.50002H20.1325H20.1312ZM34.0675 28.81L31.3475 32.5H19.795L22.5125 28.81H34.0675ZM35 7.50002L16.58 32.5H5L23.42 7.50002H35Z" fill="currentColor"/>
 </svg>
