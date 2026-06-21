@@ -20,7 +20,7 @@ import {
   resolveAIProviderHeaderSource,
   resolveOpenAIWebSocketResponsesUrl,
   wrapFetchWithAnthropicCacheControl,
-  makeOpenAICompatibleReasoningTransform,
+  makeOpenAICompatibleBodyTransform,
 } from "./providerModelFactory";
 import { MUX_ANTHROPIC_EFFORT_OVERRIDE_HEADER } from "@/common/utils/ai/providerOptions";
 import { hasLanguageModelCleanup } from "./languageModelCleanup";
@@ -29,11 +29,11 @@ import { CodexOauthService } from "./codexOauthService";
 import { PolicyService } from "./policyService";
 import { ProviderService } from "./providerService";
 
-describe("makeOpenAICompatibleReasoningTransform", () => {
+describe("makeOpenAICompatibleBodyTransform", () => {
   // The openai-compatible SDK surfaces reasoningEffort as body `reasoning_effort`.
   // Per-vendor transform translates that carrier into the field each API understands.
   it("translates the carrier to GLM thinking for zai", () => {
-    const t = makeOpenAICompatibleReasoningTransform("zai");
+    const t = makeOpenAICompatibleBodyTransform("zai");
     const out = t({ reasoning_effort: "medium", model: "glm-4.6", messages: [] });
     expect(out).toEqual({
       model: "glm-4.6",
@@ -43,7 +43,7 @@ describe("makeOpenAICompatibleReasoningTransform", () => {
   });
 
   it("translates the carrier to enable_thinking for alibaba (DashScope)", () => {
-    const t = makeOpenAICompatibleReasoningTransform("alibaba");
+    const t = makeOpenAICompatibleBodyTransform("alibaba");
     const out = t({ reasoning_effort: "high", model: "qwq-plus" });
     expect(out).toEqual({ model: "qwq-plus", enable_thinking: true });
     // reasoning_effort is stripped (DashScope rejects unknown params).
@@ -51,23 +51,117 @@ describe("makeOpenAICompatibleReasoningTransform", () => {
   });
 
   it("also covers the coding-plan variants", () => {
-    const t = makeOpenAICompatibleReasoningTransform("zai-coding-plan");
+    const t = makeOpenAICompatibleBodyTransform("zai-coding-plan");
     expect(t({ reasoning_effort: "medium" })).toEqual({
       thinking: { type: "enabled", clear_thinking: false },
     });
   });
 
   it("is a no-op when thinking is off (no carrier present)", () => {
-    const t = makeOpenAICompatibleReasoningTransform("alibaba");
+    const t = makeOpenAICompatibleBodyTransform("alibaba");
     expect(t({ model: "qwen-plus" })).toEqual({ model: "qwen-plus" });
   });
 
   it("leaves reasoning_effort in place for native vendors (moonshot/minimax/xiaomi)", () => {
-    const t = makeOpenAICompatibleReasoningTransform("moonshot");
+    const t = makeOpenAICompatibleBodyTransform("moonshot");
     expect(t({ reasoning_effort: "medium", model: "kimi-k2.5" })).toEqual({
       reasoning_effort: "medium",
       model: "kimi-k2.5",
     });
+  });
+
+  // Moonshot sanitizes tool JSON-Schemas: $ref siblings stripped + tuple items collapsed.
+  // The body shape is tools[].function.parameters (matches @ai-sdk/openai-compatible).
+  // Helper: pull tools[].function.parameters out of the transform result (typed as unknown).
+  const toolParams = (out: Record<string, unknown>, index = 0): Record<string, unknown> => {
+    const tools = out.tools as
+      | Array<{ function: { parameters: Record<string, unknown> } }>
+      | undefined;
+    return tools![index].function.parameters;
+  };
+
+  it("strips sibling keywords on a $ref node in Moonshot tool schemas", () => {
+    const t = makeOpenAICompatibleBodyTransform("moonshot");
+    const out = t({
+      model: "kimi-k2.5",
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "read_file",
+            parameters: {
+              type: "object",
+              properties: {
+                path: { $ref: "#/$defs/Path", description: "the path", title: "Path" },
+              },
+            },
+          },
+        },
+      ],
+    });
+    expect((toolParams(out).properties as Record<string, unknown>).path).toEqual({
+      $ref: "#/$defs/Path",
+    });
+  });
+
+  it("collapses tuple-style items arrays for Moonshot", () => {
+    const t = makeOpenAICompatibleBodyTransform("moonshot");
+    const out = t({
+      model: "kimi-k2.5",
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "coords",
+            parameters: { items: [{ type: "number" }, { type: "string" }] },
+          },
+        },
+      ],
+    });
+    expect(toolParams(out).items).toEqual({ type: "number" });
+  });
+
+  it("recurses into nested $ref inside properties and array items", () => {
+    const t = makeOpenAICompatibleBodyTransform("moonshot");
+    const out = t({
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "t",
+            parameters: {
+              properties: {
+                nested: {
+                  properties: { a: { $ref: "#/x", description: "d" } },
+                },
+              },
+            },
+          },
+        },
+      ],
+    });
+    const props = toolParams(out).properties as Record<string, unknown>;
+    const nested = props.nested as Record<string, unknown>;
+    expect((nested.properties as Record<string, unknown>).a).toEqual({ $ref: "#/x" });
+  });
+
+  it("leaves tool schemas untouched for non-Moonshot vendors", () => {
+    const t = makeOpenAICompatibleBodyTransform("zai");
+    const input = {
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "read_file",
+            parameters: {
+              properties: { path: { $ref: "#/Path", description: "kept" } },
+            },
+          },
+        },
+      ],
+    };
+    // zai does not sanitize schemas; $ref sibling is preserved.
+    expect(t(input)).toEqual(input);
   });
 });
 

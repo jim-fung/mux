@@ -458,28 +458,79 @@ export function wrapFetchWithAnthropicCacheControl(
   return Object.assign(cachingFetch, baseFetch) as typeof fetch;
 }
 /**
- * Build a request-body transform for built-in OpenAI-compatible vendors whose
- * reasoning API expects a non-standard body field.
+ * Sanitize a tool's JSON Schema for Moonshot (Kimi) compatibility.
  *
- * The @ai-sdk/openai-compatible SDK only forwards a small set of recognized
- * providerOptions keys (reasoningEffort -> body.reasoning_effort). We therefore
- * emit reasoningEffort from buildProviderOptions as a "thinking is on" carrier
- * and translate it here into the field each vendor actually understands:
- *   - Z.AI/Zhipu (GLM): `thinking: { type: "enabled", clear_thinking: false }`
- *   - DashScope (Alibaba): top-level `enable_thinking: true`
+ * Moonshot expands `$ref` before validation and rejects sibling keywords (e.g.
+ * `description`) on the same node as a `$ref`, so a `$ref` node is reduced to
+ * `{ $ref }` only. Moonshot also does not support tuple-style `items` arrays,
+ * requiring a single items schema — those are collapsed to the first element.
  *
- * When thinking is off the carrier is absent, so nothing is injected.
+ * Mirrors OpenCode's `sanitizeMoonshot` (transform.ts:1425). Recurses through
+ * `properties`, `items`, `anyOf`/`oneOf`/`allOf`, and `$defs`/`definitions`.
  */
-export function makeOpenAICompatibleReasoningTransform(providerName: ProviderName) {
+function sanitizeMoonshotSchema(node: unknown): unknown {
+  if (node === null || typeof node !== "object") return node;
+  if (Array.isArray(node)) return node.map(sanitizeMoonshotSchema);
+
+  const obj = node as Record<string, unknown>;
+  // $ref node: drop all sibling keywords — Moonshot rejects them.
+  if (typeof obj.$ref === "string") return { $ref: obj.$ref };
+
+  // Recurse into every child value first.
+  const result = Object.fromEntries(
+    Object.entries(obj).map(([key, value]) => [key, sanitizeMoonshotSchema(value)])
+  );
+  // Collapse tuple-style items arrays to a single schema object.
+  if (Array.isArray(result.items)) result.items = result.items[0] ?? {};
+  return result;
+}
+
+/**
+ * Build a per-vendor request-body transform for built-in OpenAI-compatible providers.
+ *
+ * Runs via the SDK's `transformRequestBody`, which receives the final serialized
+ * body, and applies two kinds of vendor-specific shaping:
+ *
+ * 1. **Reasoning-carrier translation** — the SDK only forwards a small set of
+ *    recognized providerOptions keys (reasoningEffort -> body.reasoning_effort),
+ *    so buildProviderOptions emits reasoningEffort as a "thinking is on" carrier
+ *    that we translate into the field each vendor understands:
+ *      - Z.AI/Zhipu (GLM): `thinking: { type: "enabled", clear_thinking: false }`
+ *      - DashScope (Alibaba): top-level `enable_thinking: true`
+ *    When thinking is off the carrier is absent, so nothing is injected.
+ *
+ * 2. **Moonshot (Kimi) tool-schema sanitize** — Moonshot rejects `$ref` sibling
+ *    keywords and tuple `items`; sanitize each tool's parameters (see
+ *    {@link sanitizeMoonshotSchema}). Runs whenever tools are present.
+ */
+export function makeOpenAICompatibleBodyTransform(providerName: ProviderName) {
+  const isMoonshot = providerName === "moonshot";
   return (body: Record<string, unknown>): Record<string, unknown> => {
-    if (body.reasoning_effort == null) return body;
-    if (providerName === "zai" || providerName === "zai-coding-plan") {
-      delete body.reasoning_effort;
-      body.thinking = { type: "enabled", clear_thinking: false };
-    } else if (providerName === "alibaba" || providerName === "alibaba-coding-plan") {
-      delete body.reasoning_effort;
-      body.enable_thinking = true;
+    // 1. Reasoning-carrier translation (zai / alibaba families).
+    if (body.reasoning_effort != null) {
+      if (providerName === "zai" || providerName === "zai-coding-plan") {
+        delete body.reasoning_effort;
+        body.thinking = { type: "enabled", clear_thinking: false };
+      } else if (providerName === "alibaba" || providerName === "alibaba-coding-plan") {
+        delete body.reasoning_effort;
+        body.enable_thinking = true;
+      }
+      // Native-reasoning vendors (moonshot/minimax/xiaomi) keep reasoning_effort as-is.
     }
+
+    // 2. Moonshot tool-schema sanitize over the function-parameters of each tool.
+    // The openai-compatible body shape is tools[].function.parameters (JSON Schema).
+    if (isMoonshot && Array.isArray(body.tools)) {
+      for (const tool of body.tools) {
+        if (isRecord(tool)) {
+          const fn = tool.function;
+          if (isRecord(fn) && fn.parameters != null) {
+            fn.parameters = sanitizeMoonshotSchema(fn.parameters);
+          }
+        }
+      }
+    }
+
     return body;
   };
 }
@@ -1935,7 +1986,7 @@ export class ProviderModelFactory {
       // namespace providerOptions without an explicit `name`, and only forwards a small set
       // of recognized reasoning keys. Handle them here with: a defaultBaseUrl fallback, an
       // explicit SDK `name`, and a transformRequestBody that injects vendor-specific
-      // reasoning body fields (see makeOpenAICompatibleReasoningTransform).
+      // reasoning body fields (see makeOpenAICompatibleBodyTransform).
       {
         const oaiCompatDef = PROVIDER_DEFINITIONS[providerName as ProviderName];
         if (
@@ -1967,9 +2018,7 @@ export class ProviderModelFactory {
             ...(resolvedApiKey ? { apiKey: resolvedApiKey } : {}),
             headers: { ...muxAttributionHeaders },
             fetch: providerFetch,
-            transformRequestBody: makeOpenAICompatibleReasoningTransform(
-              providerName as ProviderName
-            ),
+            transformRequestBody: makeOpenAICompatibleBodyTransform(providerName as ProviderName),
           });
           return Ok(provider(modelId));
         }
