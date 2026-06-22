@@ -194,6 +194,12 @@ const MODEL_DEFINITIONS = {
     providerModelId: "kimi-k2-thinking",
     aliases: ["kimi"],
   },
+  KIMI_K27_CODE: {
+    provider: "moonshot",
+    providerModelId: "kimi-k2.7-code",
+    // Distinct alias so bare `kimi` stays pinned to the thinking model.
+    aliases: ["kimi-code"],
+  },
   MINIMAX: {
     provider: "minimax",
     providerModelId: "MiniMax-M2",

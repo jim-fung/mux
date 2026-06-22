@@ -151,7 +151,7 @@ function getExplicitThinkingPolicy(modelString: string): ThinkingPolicy | null {
   if (
     // Z.AI/Zhipu GLM (all GLM-4.x/5.x are reasoning models)
     /^glm-[45]/.test(withoutProviderNamespace) ||
-    // Moonshot Kimi reasoning variants (kimi-k2-thinking*, kimi-k2.5/.6)
+    // Moonshot Kimi reasoning variants (kimi-k2-thinking*, kimi-k2.5/.6/.7)
     withoutProviderNamespace.startsWith("kimi-k2-thinking") ||
     /^kimi-k2\.[0-9]/.test(withoutProviderNamespace) ||
     // MiniMax M2.x / M3 (all reasoning)

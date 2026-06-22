@@ -617,6 +617,18 @@ export const modelsExtra: Record<string, ModelData> = {
     supports_function_calling: true,
     supports_reasoning: true,
   },
+  "kimi-k2.7-code": {
+    max_input_tokens: 262144,
+    max_output_tokens: 262144,
+    // Pricing mirrored from the kimi-k2.6 tier (the predecessor); exact k2.7
+    // per-token pricing is not published in Moonshot docs. 256K context window.
+    input_cost_per_token: 0.00000095,
+    output_cost_per_token: 0.000004,
+    litellm_provider: "moonshot",
+    mode: "chat",
+    supports_function_calling: true,
+    supports_reasoning: true,
+  },
 
   // --- MiniMax ---
   "MiniMax-M2": {

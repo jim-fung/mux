@@ -4100,6 +4100,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "| DeepSeek V4 Flash      | deepseek:deepseek-v4-flash    | `deepseek-flash`, `deepseek-v4-flash`                        |         |",
       "| Glm 4.6                | zai:glm-4.6                   | `glm`                                                        |         |",
       "| Kimi K2 Thinking       | moonshot:kimi-k2-thinking     | `kimi`                                                       |         |",
+      "| Kimi K2.7 Code         | moonshot:kimi-k2.7-code       | `kimi-code`                                                  |         |",
       "| MiniMax M2             | minimax:MiniMax-M2            | `minimax`                                                    |         |",
       "| Mimo V2.5 Pro          | xiaomi:mimo-v2.5-pro          | `mimo`                                                       |         |",
       "| Qwen3 Coder Plus       | alibaba:qwen3-coder-plus      | `qwen`                                                       |         |",
