@@ -321,6 +321,7 @@ export {
   ExperimentValueSchema,
   telemetry,
   TelemetryEventSchema,
+  headroom,
   ssh,
   terminal,
   tokenizer,

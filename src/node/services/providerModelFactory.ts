@@ -38,6 +38,8 @@ import {
 } from "@/common/utils/copilot/modelRouting";
 import { CopilotResponsesLanguageModel } from "@/node/services/copilot/copilotResponsesLanguageModel";
 import type { PolicyService } from "@/node/services/policyService";
+import type { HeadroomService } from "@/node/services/headroom/headroomService";
+import { createHeadroomCompressMiddleware } from "@/node/services/headroom/headroomCompressMiddleware";
 import type { ProviderService } from "@/node/services/providerService";
 import type { CodexOauthService } from "@/node/services/codexOauthService";
 import type { DevToolsService } from "@/node/services/devToolsService";
@@ -969,6 +971,8 @@ export class ProviderModelFactory {
   private readonly policyService?: PolicyService;
   private readonly devToolsService?: DevToolsService;
   codexOauthService?: CodexOauthService;
+  /** Injected after construction (setter pattern, like codexOauthService). */
+  headroomService?: HeadroomService;
 
   constructor(
     config: Config,
@@ -1068,6 +1072,36 @@ export class ProviderModelFactory {
         middleware: createDevToolsMiddleware(workspaceId, devToolsService),
       });
       moveLanguageModelCleanup(innerModel, model);
+    }
+
+    // Headroom compression middleware (middleware lever — provider-agnostic).
+    // Only attaches when headroom is enabled, the proxy is running, and the
+    // effective mode for this provider is "middleware". Fails open inside the
+    // middleware itself, so a proxy hiccup never blocks the request.
+    const headroomService = this.headroomService;
+    if (headroomService != null) {
+      const proxyBaseUrl = headroomService.getProxyBaseUrl();
+      if (proxyBaseUrl) {
+        const headroomCfg = headroomService.getConfig();
+        // result.data is guaranteed V3 (non-string) by the guard above.
+        const providerName = typeof result.data === "string" ? undefined : result.data.provider;
+        const modelId = typeof result.data === "string" ? undefined : result.data.modelId;
+        const effectiveMode =
+          providerName != null
+            ? (headroomCfg.perProvider[providerName] ?? headroomCfg.mode)
+            : headroomCfg.mode;
+        if (effectiveMode === "middleware") {
+          const innerModel = model;
+          model = wrapLanguageModel({
+            model,
+            middleware: createHeadroomCompressMiddleware({
+              proxyBaseUrl,
+              modelId,
+            }),
+          });
+          moveLanguageModelCleanup(innerModel, model);
+        }
+      }
     }
 
     return Ok(model);

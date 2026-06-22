@@ -16,6 +16,7 @@ import {
   ShieldCheck,
   Server,
   Lock,
+  Zap,
 } from "lucide-react";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useOnboardingPause } from "@/browser/features/SplashScreens/SplashScreenProvider";
@@ -37,6 +38,7 @@ import { ExperimentsSection } from "./Sections/ExperimentsSection";
 import { ServerAccessSection } from "./Sections/ServerAccessSection";
 import { KeybindsSection } from "./Sections/KeybindsSection";
 import { SecuritySection } from "./Sections/SecuritySection";
+import { HeadroomSection } from "./Sections/HeadroomSection";
 import type { SettingsSection } from "./types";
 
 const LEGACY_EXPERIMENT_SETTINGS_SECTION_IDS = new Set(["goals", "heartbeat"]);
@@ -113,6 +115,12 @@ const BASE_SECTIONS: SettingsSection[] = [
     label: "Keybinds",
     icon: <Keyboard className="h-4 w-4" />,
     component: KeybindsSection,
+  },
+  {
+    id: "headroom",
+    label: "Headroom",
+    icon: <Zap className="h-4 w-4" />,
+    component: HeadroomSection,
   },
 ];
 

@@ -19,6 +19,7 @@ import type { TaskSettings, SubagentAiDefaults } from "./tasks";
 import type { LayoutPresetsConfig } from "./uiLayouts";
 import type { ThinkingLevel } from "./thinking";
 import type { GoalDefaults } from "@/constants/goals";
+import type { HeadroomConfig } from "@/common/config/schemas/headroom";
 
 export type Workspace = z.infer<typeof WorkspaceConfigSchema>;
 
@@ -205,4 +206,7 @@ export interface ProjectsConfig {
 
   /** Optional 1Password account name used for desktop SDK account selection. */
   onePasswordAccountName?: string;
+
+  /** Headroom context-compression integration settings. */
+  headroom?: HeadroomConfig;
 }

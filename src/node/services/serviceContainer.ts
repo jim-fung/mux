@@ -38,6 +38,7 @@ import { BrowserBridgeTokenManager } from "@/node/services/browser/BrowserBridge
 import { BrowserControlService } from "@/node/services/browser/BrowserControlService";
 import { BrowserSessionStateHub } from "@/node/services/browser/BrowserSessionStateHub";
 import { DevToolsService } from "@/node/services/devToolsService";
+import { HeadroomService } from "@/node/services/headroom/headroomService";
 import { SessionTimingService } from "@/node/services/sessionTimingService";
 import { AnalyticsService } from "@/node/services/analytics/analyticsService";
 import { ExperimentsService } from "@/node/services/experimentsService";
@@ -132,6 +133,7 @@ export class ServiceContainer {
   public readonly telemetryService: TelemetryService;
   public readonly sessionTimingService: SessionTimingService;
   public readonly devToolsService: DevToolsService;
+  public readonly headroomService: HeadroomService;
   public readonly browserSessionDiscoveryService: AgentBrowserSessionDiscoveryService;
   public readonly browserBridgeTokenManager: BrowserBridgeTokenManager;
   public readonly browserBridgeServer: BrowserBridgeServer;
@@ -167,6 +169,7 @@ export class ServiceContainer {
     this.sessionTimingService = new SessionTimingService(config, this.telemetryService);
     this.analyticsService = new AnalyticsService(config);
     this.devToolsService = new DevToolsService(config);
+    this.headroomService = new HeadroomService(config);
     this.browserBridgeTokenManager = new BrowserBridgeTokenManager();
 
     // Desktop passes WorkspaceMcpOverridesService explicitly so AIService uses
@@ -201,6 +204,7 @@ export class ServiceContainer {
     this.historyService = core.historyService;
     this.aiService = core.aiService;
     this.aiService.setAnalyticsService(this.analyticsService);
+    this.aiService.setHeadroomService(this.headroomService);
     this.browserSessionDiscoveryService = new AgentBrowserSessionDiscoveryService({
       resolveWorkspaceCandidatePathsFn: async (workspaceId: string) => {
         const allWorkspaceMetadata = await config.getAllWorkspaceMetadata();
@@ -709,6 +713,13 @@ export class ServiceContainer {
     this.agentStatusService.start();
     stepDurationsMs["agentStatusService.start"] = Date.now() - agentStatusStartedAt;
 
+    // Headroom proxy: start lazily if enabled. Fire-and-forget — startup must
+    // never crash or block on an optional integration's external Python process.
+    // The proxy start() catches all errors internally and fails open.
+    void this.headroomService.start().catch((error: unknown) => {
+      log.warn("[headroom] start() failed (chat will continue uncompressed)", { error });
+    });
+
     // Dream launch sweep (PRD #3534): consolidate memory for workspaces idle
     // ≥24h with writes since their last run. Fire-and-forget after the await
     // chain — startup must never block or crash on background housekeeping.
@@ -784,6 +795,7 @@ export class ServiceContainer {
       memoryMetaService: this.memoryMetaService,
       memoryConsolidationService: this.memoryConsolidationService,
       devToolsService: this.devToolsService,
+      headroomService: this.headroomService,
       browserSessionDiscoveryService: this.browserSessionDiscoveryService,
       browserBridgeTokenManager: this.browserBridgeTokenManager,
       browserBridgeServer: this.browserBridgeServer,
@@ -857,5 +869,12 @@ export class ServiceContainer {
     this.serverAuthService.dispose();
     this.providerService.dispose();
     await this.backgroundProcessManager.terminateAll();
+
+    // Stop the headroom proxy process (kills the spawned child + process tree).
+    try {
+      this.headroomService.stop();
+    } catch (error: unknown) {
+      log.warn("[headroom] stop() failed during dispose", { error });
+    }
   }
 }

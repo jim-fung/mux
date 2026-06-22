@@ -8,6 +8,7 @@ import { CODER_ARCHIVE_BEHAVIORS } from "../coderArchiveBehavior";
 import { WORKTREE_ARCHIVE_BEHAVIORS } from "../worktreeArchiveBehavior";
 import { UserPreferencesSchema } from "./userPreferences";
 import { TaskSettingsSchema } from "./taskSettings";
+import { HeadroomConfigSchema } from "./headroom";
 import { HEARTBEAT_MAX_INTERVAL_MS, HEARTBEAT_MIN_INTERVAL_MS } from "@/constants/heartbeat";
 import { DEFAULT_GOAL_DEFAULTS } from "@/constants/goals";
 
@@ -17,6 +18,8 @@ export { UserPreferencesSchema } from "./userPreferences";
 export type { UserPreferences } from "./userPreferences";
 export { TaskSettingsSchema } from "./taskSettings";
 export type { TaskSettings } from "./taskSettings";
+export { HeadroomConfigSchema } from "./headroom";
+export type { HeadroomConfig, HeadroomMode } from "./headroom";
 
 export const AgentAiDefaultsEntrySchema = z.object({
   modelString: z.string().optional(),
@@ -155,6 +158,8 @@ export const AppConfigOnDiskSchema = z
     runtimeEnablement: RuntimeEnablementOverridesSchema.optional(),
     defaultRuntime: RuntimeEnablementIdSchema.optional(),
     onePasswordAccountName: z.string().optional(),
+    /** Headroom context-compression integration settings. */
+    headroom: HeadroomConfigSchema.optional(),
   })
   .passthrough();
 
