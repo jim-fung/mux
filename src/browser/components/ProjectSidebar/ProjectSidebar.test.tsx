@@ -267,6 +267,7 @@ function createProjectContextValue(
     updateColor: () => resolveVoidResult(),
     assignWorkspaceToSubProject: () => resolveVoidResult(),
     hasAnyProject: false,
+    muxHomeKind: null,
     resolveNewChatProjectPath: () => null,
     ...overrides,
   };
@@ -845,6 +846,7 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
     projectContextValue = createProjectContextValue({
       userProjects: new Map([["/projects/demo-project", { workspaces: [] }]]),
       hasAnyProject: true,
+      muxHomeKind: null,
       resolveNewChatProjectPath: () => "/projects/demo-project",
     });
 
@@ -948,6 +950,7 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
       updateColor: () => resolveVoidResult(),
       assignWorkspaceToSubProject: () => resolveVoidResult(),
       hasAnyProject: true,
+      muxHomeKind: null,
       resolveNewChatProjectPath: () => "/projects/demo-project",
     }));
 
@@ -1030,6 +1033,7 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
     projectContextValue = createProjectContextValue({
       userProjects: new Map([["/projects/demo-project", { workspaces: [] }]]),
       hasAnyProject: true,
+      muxHomeKind: null,
       resolveNewChatProjectPath: () => "/projects/demo-project",
     });
 
@@ -1080,6 +1084,7 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
     projectContextValue = createProjectContextValue({
       userProjects: new Map([["/projects/demo-project", { workspaces: [] }]]),
       hasAnyProject: true,
+      muxHomeKind: null,
       resolveNewChatProjectPath: () => "/projects/demo-project",
     });
 
@@ -1124,6 +1129,7 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
     projectContextValue = createProjectContextValue({
       userProjects: new Map([["/projects/demo-project", { workspaces: [] }]]),
       hasAnyProject: true,
+      muxHomeKind: null,
       resolveNewChatProjectPath: () => "/projects/demo-project",
     });
 
@@ -1217,6 +1223,7 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
       updateColor: () => resolveVoidResult(),
       assignWorkspaceToSubProject: () => resolveVoidResult(),
       hasAnyProject: true,
+      muxHomeKind: null,
       resolveNewChatProjectPath: () => "/projects/demo-project",
     }));
 
@@ -1260,6 +1267,7 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
     projectContextValue = createProjectContextValue({
       userProjects: new Map([["/projects/demo-project", { workspaces: [] }]]),
       hasAnyProject: true,
+      muxHomeKind: null,
       resolveNewChatProjectPath: () => "/projects/demo-project",
     });
 
@@ -1344,6 +1352,7 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
     projectContextValue = createProjectContextValue({
       userProjects: new Map([["/projects/demo-project", { workspaces: [] }]]),
       hasAnyProject: true,
+      muxHomeKind: null,
       resolveNewChatProjectPath: () => "/projects/demo-project",
     });
 
@@ -1392,6 +1401,7 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
     projectContextValue = createProjectContextValue({
       userProjects: new Map([["/projects/demo-project", { workspaces: [] }]]),
       hasAnyProject: true,
+      muxHomeKind: null,
       resolveNewChatProjectPath: () => "/projects/demo-project",
     });
 
@@ -1445,6 +1455,7 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
     projectContextValue = createProjectContextValue({
       userProjects: new Map([["/projects/demo-project", { workspaces: [] }]]),
       hasAnyProject: true,
+      muxHomeKind: null,
       resolveNewChatProjectPath: () => "/projects/demo-project",
     });
 
@@ -1488,6 +1499,7 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
     projectContextValue = createProjectContextValue({
       userProjects: new Map([["/projects/demo-project", { workspaces: [] }]]),
       hasAnyProject: true,
+      muxHomeKind: null,
       resolveNewChatProjectPath: () => "/projects/demo-project",
     });
     spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
@@ -1644,6 +1656,7 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
       updateColor: () => resolveVoidResult(),
       assignWorkspaceToSubProject: () => resolveVoidResult(),
       hasAnyProject: true,
+      muxHomeKind: null,
       resolveNewChatProjectPath: () => "/projects/demo-project",
     }));
 
@@ -2444,5 +2457,66 @@ describe("ProjectSidebar project actions menu", () => {
     await waitFor(() => {
       expect(view.queryByText("Empty")).toBeNull();
     });
+  });
+});
+
+describe("ProjectSidebar empty-state dev mux home hint", () => {
+  beforeEach(() => {
+    cleanupDom = installDom();
+    window.localStorage.clear();
+    projectContextValue = createProjectContextValue();
+    installProjectSidebarTestDoubles();
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+    // window.api is only ever set by the Electron-mode test below; make sure it
+    // can never leak into sibling tests that rely on browser/server mode.
+    delete window.api;
+    mock.restore();
+  });
+
+  function renderEmptySidebar() {
+    return render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={new Map()}
+        workspaceRecency={{}}
+      />
+    );
+  }
+
+  test("shows the dev-home hint in browser/server mode when using the isolated dev home", () => {
+    // Browser/server mode: window.api is absent (default in jsdom).
+    projectContextValue = createProjectContextValue({ muxHomeKind: "dev-default" });
+
+    const view = renderEmptySidebar();
+
+    expect(view.getByText("No projects")).toBeTruthy();
+    expect(view.queryByTestId("dev-home-hint")).not.toBeNull();
+  });
+
+  test("hides the dev-home hint when the production home is in use", () => {
+    projectContextValue = createProjectContextValue({ muxHomeKind: "prod-default" });
+
+    const view = renderEmptySidebar();
+
+    expect(view.getByText("No projects")).toBeTruthy();
+    expect(view.queryByTestId("dev-home-hint")).toBeNull();
+  });
+
+  test("hides the dev-home hint in Electron desktop mode even on the dev home", () => {
+    // Electron desktop mode: window.api is present (preload bridge), so the
+    // browser/server-specific hint must not appear.
+    window.api = { platform: "darwin", versions: {} };
+    projectContextValue = createProjectContextValue({ muxHomeKind: "dev-default" });
+
+    const view = renderEmptySidebar();
+
+    expect(view.getByText("No projects")).toBeTruthy();
+    expect(view.queryByTestId("dev-home-hint")).toBeNull();
   });
 });

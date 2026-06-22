@@ -9,6 +9,7 @@ import {
   type ReactNode,
 } from "react";
 import { useAPI } from "@/browser/contexts/API";
+import type { MuxHomeKind } from "@/common/constants/paths";
 import type { ProjectConfig } from "@/common/types/project";
 import type { BranchListResult } from "@/common/orpc/types";
 import type { z } from "zod";
@@ -104,6 +105,12 @@ export interface ProjectContext {
   ) => Promise<Result<void>>;
   /** Whether any project (user or system) is loaded. */
   hasAnyProject: boolean;
+  /**
+   * Which mux home the backend resolved ("prod-default" | "dev-default" | "custom"),
+   * or null before the first config fetch resolves. The empty project sidebar uses
+   * this to explain dev/prod home isolation rather than showing a bare "No projects".
+   */
+  muxHomeKind: MuxHomeKind | null;
   /** Resolve the target project for a new-chat deep link. Tries explicit selectors, then falls back to default. */
   resolveNewChatProjectPath: (selector: NewChatProjectSelector) => string | null;
 }
@@ -142,6 +149,8 @@ export function ProjectProvider(props: { children: ReactNode }) {
   const [loading, setLoading] = useState(true);
   const [loaded, setLoaded] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
+  // Resolved once on connect; the mux home never changes for a running server.
+  const [muxHomeKind, setMuxHomeKind] = useState<MuxHomeKind | null>(null);
   const [projectCreateInitialPath, setProjectCreateInitialPath] = useState<string | undefined>();
   const [isProjectCreateModalOpen, setProjectCreateModalOpen] = useState(false);
   const [workspaceModalState, setWorkspaceModalState] = useState<WorkspaceModalState>({
@@ -221,6 +230,30 @@ export function ProjectProvider(props: { children: ReactNode }) {
       cancelled = true;
     };
   }, [refreshProjects]);
+  // Resolve which mux home the backend is using. This is static for the lifetime
+  // of a running server, so we fetch it once on connect rather than per render.
+  // The empty project sidebar uses it to distinguish the isolated ~/.mux-dev
+  // development home (by-design empty) from a genuinely-empty production home.
+  useEffect(() => {
+    if (!api) {
+      return;
+    }
+    let cancelled = false;
+    api.config
+      .getConfig()
+      .then((config) => {
+        if (!cancelled) {
+          setMuxHomeKind(config.muxHomeKind ?? null);
+        }
+      })
+      .catch((error) => {
+        // Non-fatal: the hint simply stays hidden if we can't read the home kind.
+        console.error("Failed to load mux home kind:", error);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [api]);
 
   useEffect(() => {
     const onConfigChanged = api?.config?.onConfigChanged;
@@ -565,6 +598,7 @@ export function ProjectProvider(props: { children: ReactNode }) {
       systemProjectPath,
       resolveProjectPath,
       hasAnyProject,
+      muxHomeKind,
       resolveNewChatProjectPath,
       getProjectConfig,
       loading,
@@ -598,6 +632,7 @@ export function ProjectProvider(props: { children: ReactNode }) {
       systemProjectPath,
       resolveProjectPath,
       hasAnyProject,
+      muxHomeKind,
       resolveNewChatProjectPath,
       getProjectConfig,
       loading,

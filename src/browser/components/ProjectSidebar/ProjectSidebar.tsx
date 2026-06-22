@@ -731,6 +731,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   // Get project state and operations from context
   const {
     userProjects,
+    muxHomeKind,
     openProjectCreateModal: onAddProject,
     removeProject: onRemoveProject,
     updateDisplayName,
@@ -1924,6 +1925,26 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                 {sortedProjectPaths.length === 0 && multiProjectWorkspaces.length === 0 ? (
                   <div className="px-4 py-8 text-center">
                     <p className="text-muted mb-4 text-[13px]">No projects</p>
+                    {/*
+                      In browser/server mode the dev server resolves an isolated
+                      ~/.mux-dev home (NODE_ENV=development), which is empty by
+                      default. Explain that here so the by-design isolation is
+                      never mistaken for a missing-config bug. Suppressed when the
+                      user has pointed the server at a custom MUX_ROOT (they know).
+                    */}
+                    {muxHomeKind === "dev-default" &&
+                    typeof window !== "undefined" &&
+                    !window.api ? (
+                      <p
+                        data-testid="dev-home-hint"
+                        className="text-muted mx-auto mb-4 max-w-[260px] text-[12px] leading-relaxed"
+                      >
+                        The dev server uses an isolated{" "}
+                        <code className="text-[11px]">~/.mux-dev</code> home. To reuse your main
+                        projects, relaunch with <code className="text-[11px]">MUX_ROOT=~/.mux</code>
+                        .
+                      </p>
+                    ) : null}
                     <button
                       onClick={() => onAddProject()}
                       className="bg-accent hover:bg-accent-dark cursor-pointer rounded border-none px-4 py-2 text-[13px] text-white transition-colors duration-200"

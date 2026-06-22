@@ -99,6 +99,24 @@ export function getMuxHome(): string {
   const suffix = process.env.NODE_ENV === "development" ? "-dev" : "";
   return join(homedir(), baseName + suffix);
 }
+/**
+ * Classify the resolved mux home so the UI can distinguish the isolated
+ * development home (~/.mux-dev) from the production home (~/.mux) and from an
+ * explicitly-overridden MUX_ROOT. Mirrors the env logic in {@link getMuxHome}.
+ *
+ * Server-side only: the browser learns its mux home kind from the backend via
+ * config.getConfig(), never by inspecting process.env directly.
+ */
+export type MuxHomeKind = "prod-default" | "dev-default" | "custom";
+
+export function getMuxHomeKind(): MuxHomeKind {
+  // eslint-disable-next-line no-restricted-syntax, no-restricted-globals
+  if (process.env.MUX_ROOT) {
+    return "custom";
+  }
+  // eslint-disable-next-line no-restricted-syntax, no-restricted-globals
+  return process.env.NODE_ENV === "development" ? "dev-default" : "prod-default";
+}
 
 /**
  * Get the directory where workspace git worktrees are stored.

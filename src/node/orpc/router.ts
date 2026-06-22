@@ -115,7 +115,7 @@ import {
   type SubagentTranscriptArtifactIndexEntry,
 } from "@/node/services/subagentTranscriptArtifacts";
 import { getErrorMessage } from "@/common/utils/errors";
-import { CHAT_FILE_NAME, CHAT_ARCHIVE_FILE_NAME } from "@/common/constants/paths";
+import { CHAT_FILE_NAME, CHAT_ARCHIVE_FILE_NAME, getMuxHomeKind } from "@/common/constants/paths";
 import {
   shouldUseRuntimeWorkflowProjectIO,
   WorkflowDefinitionStore,
@@ -1109,6 +1109,9 @@ export const router = (authToken?: string) => {
             heartbeatDefaultIntervalMs: config.heartbeatDefaultIntervalMs ?? undefined,
             goalDefaults: normalizeGoalDefaults(config.goalDefaults ?? DEFAULT_GOAL_DEFAULTS),
             onePasswordAccountName: config.onePasswordAccountName ?? null,
+            // Report which mux home the backend resolved so the browser can
+            // surface dev/prod home isolation (see getMuxHomeKind).
+            muxHomeKind: getMuxHomeKind(),
           };
         }),
       onConfigChanged: t
@@ -2726,6 +2729,105 @@ export const router = (authToken?: string) => {
             input.targetPath,
             input.editorConfig
           );
+        }),
+    },
+    headroom: {
+      getStatus: t
+        .input(schemas.headroom.getStatus.input)
+        .output(schemas.headroom.getStatus.output)
+        .handler(({ context }) => {
+          const status = context.headroomService.getStatus();
+          return {
+            enabled: status.enabled,
+            installed: status.installed,
+            provisioning: status.provisioning,
+            proxyRunning: status.proxyRunning,
+            proxyBaseUrl: status.proxyBaseUrl,
+            port: status.port,
+            runtimeMethod: status.runtimeMethod,
+            lastError: status.lastError,
+          };
+        }),
+      getStats: t
+        .input(schemas.headroom.getStats.input)
+        .output(schemas.headroom.getStats.output)
+        .handler(async ({ context }) => {
+          const stats = await context.headroomService.getStats();
+          return {
+            totalRequests: stats?.total_requests ?? null,
+            tokensSaved: stats?.tokens_saved ?? null,
+            savingsPercent: stats?.savings_percent ?? null,
+            persistentTokensSaved: stats?.persistent_savings?.total_tokens_saved ?? null,
+            persistentRequests: stats?.persistent_savings?.total_requests ?? null,
+          };
+        }),
+      provision: t
+        .input(schemas.headroom.provision.input)
+        .output(schemas.headroom.provision.output)
+        .handler(async ({ context }) => {
+          const status = await context.headroomService.provision();
+          return {
+            enabled: status.enabled,
+            installed: status.installed,
+            provisioning: status.provisioning,
+            proxyRunning: status.proxyRunning,
+            proxyBaseUrl: status.proxyBaseUrl,
+            port: status.port,
+            runtimeMethod: status.runtimeMethod,
+            lastError: status.lastError,
+          };
+        }),
+      restart: t
+        .input(schemas.headroom.restart.input)
+        .output(schemas.headroom.restart.output)
+        .handler(async ({ context }) => {
+          const status = await context.headroomService.restart();
+          return {
+            enabled: status.enabled,
+            installed: status.installed,
+            provisioning: status.provisioning,
+            proxyRunning: status.proxyRunning,
+            proxyBaseUrl: status.proxyBaseUrl,
+            port: status.port,
+            runtimeMethod: status.runtimeMethod,
+            lastError: status.lastError,
+          };
+        }),
+      setConfig: t
+        .input(schemas.headroom.setConfig.input)
+        .output(schemas.headroom.setConfig.output)
+        .handler(async ({ context, input }) => {
+          await context.config.editConfig((config) => {
+            const current = config.headroom ?? {
+              enabled: false,
+              autoProvision: true,
+              mode: "off",
+              perProvider: {},
+              includeMl: false,
+              proxyBaseUrl: null,
+              telemetry: false,
+              outputShaper: false,
+              memory: { enabled: false },
+            };
+            const updated = { ...current };
+            if (input.enabled != null) updated.enabled = input.enabled;
+            if (input.autoProvision != null) updated.autoProvision = input.autoProvision;
+            if (input.mode != null) updated.mode = input.mode;
+            if (input.includeMl != null) updated.includeMl = input.includeMl;
+            if (input.proxyBaseUrl !== undefined) updated.proxyBaseUrl = input.proxyBaseUrl;
+            if (input.telemetry != null) updated.telemetry = input.telemetry;
+            if (input.outputShaper != null) updated.outputShaper = input.outputShaper;
+            if (input.memoryEnabled != null) {
+              updated.memory = { ...updated.memory, enabled: input.memoryEnabled };
+            }
+            config.headroom = updated;
+            return config;
+          });
+
+          // Restart the proxy to pick up config changes (e.g. enabled toggled).
+          await context.headroomService.restart().catch(() => {
+            // Restart failures are non-fatal — the config was already saved.
+          });
         }),
     },
     secrets: {

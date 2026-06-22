@@ -929,6 +929,72 @@ export const mcp = {
   },
 };
 
+/** Headroom integration (context compression proxy). */
+export const headroom = {
+  getStatus: {
+    input: z.void(),
+    output: z.object({
+      enabled: z.boolean(),
+      installed: z.boolean(),
+      provisioning: z.enum(["not-installed", "provisioning", "installed", "failed"]),
+      proxyRunning: z.boolean(),
+      proxyBaseUrl: z.string().nullable(),
+      port: z.number().nullable(),
+      runtimeMethod: z.enum(["uv", "python3-venv", "none"]),
+      lastError: z.string().nullable(),
+    }),
+  },
+  getStats: {
+    input: z.void(),
+    output: z.object({
+      totalRequests: z.number().nullable(),
+      tokensSaved: z.number().nullable(),
+      savingsPercent: z.number().nullable(),
+      persistentTokensSaved: z.number().nullable(),
+      persistentRequests: z.number().nullable(),
+    }),
+  },
+  provision: {
+    input: z.void(),
+    output: z.object({
+      enabled: z.boolean(),
+      installed: z.boolean(),
+      provisioning: z.enum(["not-installed", "provisioning", "installed", "failed"]),
+      proxyRunning: z.boolean(),
+      proxyBaseUrl: z.string().nullable(),
+      port: z.number().nullable(),
+      runtimeMethod: z.enum(["uv", "python3-venv", "none"]),
+      lastError: z.string().nullable(),
+    }),
+  },
+  restart: {
+    input: z.void(),
+    output: z.object({
+      enabled: z.boolean(),
+      installed: z.boolean(),
+      provisioning: z.enum(["not-installed", "provisioning", "installed", "failed"]),
+      proxyRunning: z.boolean(),
+      proxyBaseUrl: z.string().nullable(),
+      port: z.number().nullable(),
+      runtimeMethod: z.enum(["uv", "python3-venv", "none"]),
+      lastError: z.string().nullable(),
+    }),
+  },
+  setConfig: {
+    input: z.object({
+      enabled: z.boolean().nullish(),
+      autoProvision: z.boolean().nullish(),
+      mode: z.enum(["off", "middleware", "proxy"]).nullish(),
+      includeMl: z.boolean().nullish(),
+      proxyBaseUrl: z.string().nullable().nullish(),
+      telemetry: z.boolean().nullish(),
+      outputShaper: z.boolean().nullish(),
+      memoryEnabled: z.boolean().nullish(),
+    }),
+    output: z.void(),
+  },
+};
+
 /**
  * Secrets store.
  *
@@ -2230,6 +2296,10 @@ export const config = {
       heartbeatDefaultIntervalMs: z.number().optional(),
       goalDefaults: GoalDefaultsConfigSchema,
       onePasswordAccountName: z.string().nullish(),
+      // Resolved mux home classification. The browser cannot read MUX_ROOT/
+      // NODE_ENV directly, so the backend reports which home it is using. The
+      // empty project sidebar uses this to explain dev/prod home isolation.
+      muxHomeKind: z.enum(["prod-default", "dev-default", "custom"]).optional(),
     }),
   },
   saveConfig: {
