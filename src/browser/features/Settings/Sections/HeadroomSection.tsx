@@ -6,9 +6,15 @@
  */
 
 import { useEffect, useState } from "react";
-import { ChevronDown, ExternalLink } from "lucide-react";
-import type { HeadroomAdvancedConfig } from "@/common/config/schemas/headroom";
+import { ChevronDown, ExternalLink, RotateCcw } from "lucide-react";
+import type {
+  HeadroomAdvancedConfig,
+  HeadroomWorkspaceOverride,
+} from "@/common/config/schemas/headroom";
+import { HeadroomWorkspaceEditor } from "./HeadroomWorkspaceEditor";
 import { HEADROOM_ADVANCED_DEFAULTS } from "@/common/config/schemas/headroom";
+import { formatProxyCommand } from "@/common/config/headroomProxyCommand";
+import { HEADROOM_PRESETS } from "@/constants/headroomPresets";
 import { Button } from "@/browser/components/Button/Button";
 import { Switch } from "@/browser/components/Switch/Switch";
 import {
@@ -52,6 +58,35 @@ const MODE_OPTIONS = [
   { value: "proxy", label: "Proxy (Anthropic + OpenAI chat)" },
 ];
 
+/** Validate the in-progress tuning draft + custom-env text. Returns human errors;
+ *  empty array means apply is safe. Bounds mirror the HeadroomAdvancedConfig schema. */
+function validateTuning(adv: HeadroomAdvancedConfig, envText: string): string[] {
+  const errors: string[] = [];
+  if (adv.budgetUsd != null && adv.budgetUsd < 0) {
+    errors.push("Daily budget must be 0 or greater.");
+  }
+  if (adv.llmlingua && (adv.llmlinguaRate < 0.05 || adv.llmlinguaRate > 1)) {
+    errors.push("LLMLingua keep rate must be between 5% and 100%.");
+  }
+  if (adv.outputHoldout < 0 || adv.outputHoldout > 0.5) {
+    errors.push("Output holdout must be between 0% and 50%.");
+  }
+  const seen = new Set<string>();
+  for (const line of envText.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const eqIdx = trimmed.indexOf("=");
+    if (eqIdx <= 0) {
+      errors.push(`Env line missing "KEY=": "${trimmed}".`);
+      continue;
+    }
+    const key = trimmed.slice(0, eqIdx).trim();
+    if (seen.has(key)) errors.push(`Duplicate env key: "${key}".`);
+    seen.add(key);
+  }
+  return errors;
+}
+
 async function doRestart(
   api: ReturnType<typeof useAPI>["api"],
   setStatus: (s: HeadroomStatus) => void
@@ -75,6 +110,11 @@ export function HeadroomSection() {
   const [mcpLoading, setMcpLoading] = useState(false);
   const [mcpRegistered, setMcpRegistered] = useState(false);
   const [showTuning, setShowTuning] = useState(false);
+  const [showPreview, setShowPreview] = useState(false);
+  const [workspaceOverrides, setWorkspaceOverrides] = useState<
+    Array<{ workspaceId: string; title: string | null; override: HeadroomWorkspaceOverride }>
+  >([]);
+  const [expandedWorkspace, setExpandedWorkspace] = useState<string | null>(null);
   const [tuningDraft, setTuningDraft] = useState<HeadroomAdvancedConfig>(
     HEADROOM_ADVANCED_DEFAULTS
   );
@@ -103,6 +143,7 @@ export function HeadroomSection() {
         setPerProvider(s.perProvider as Record<string, "off" | "middleware" | "proxy">);
       const st = await api.headroom.getStats();
       setStats(st);
+      setWorkspaceOverrides(await api.headroom.listWorkspaceHeadroomOverrides());
     } catch {
       // Non-fatal — just show stale status
     } finally {
@@ -189,6 +230,23 @@ export function HeadroomSection() {
     setTuningDraft((prev) => ({ ...prev, [key]: value }));
   }
 
+  /** Merge a preset's patch into the draft (no auto-apply). */
+  function applyPreset(patch: Partial<HeadroomAdvancedConfig>) {
+    setTuningDraft((prev) => ({ ...prev, ...patch }));
+  }
+
+  /** Reset a group of fields to their Headroom defaults. */
+  function resetGroup(fields: Array<keyof HeadroomAdvancedConfig>) {
+    setTuningDraft((prev) => {
+      const next = { ...prev };
+      const defaults = HEADROOM_ADVANCED_DEFAULTS as Record<string, unknown>;
+      for (const field of fields) {
+        (next as Record<string, unknown>)[field] = defaults[field];
+      }
+      return next;
+    });
+  }
+
   /** Parse a KEY=VALUE-per-line textarea into a record. */
   function parseEnvText(text: string): Record<string, string> {
     const record: Record<string, string> = {};
@@ -256,6 +314,22 @@ export function HeadroomSection() {
   const lastError = status?.lastError ?? null;
   const runtimeMethod = status?.runtimeMethod ?? "none";
   const currentMode = status?.mode ?? "off";
+
+  // Effective advanced config for the live command preview + validation. Merges
+  // the customEnv/extraArgs textareas so the preview reflects un-applied edits.
+  // React Compiler memoizes these derived values.
+  const previewAdvanced: HeadroomAdvancedConfig = {
+    ...tuningDraft,
+    customEnv: parseEnvText(customEnvText),
+    extraArgs: extraArgsText.trim() ? extraArgsText.trim().split(/\s+/) : [],
+  };
+  const tuningErrors = validateTuning(previewAdvanced, customEnvText);
+  const previewCommand = formatProxyCommand({
+    telemetry: status?.telemetry ?? false,
+    outputShaper: status?.outputShaper ?? false,
+    memoryEnabled: status?.memoryEnabled ?? false,
+    advanced: previewAdvanced,
+  });
 
   return (
     <div className="space-y-6">
@@ -486,10 +560,54 @@ export function HeadroomSection() {
         </button>
         {showTuning && (
           <div className="mt-4 space-y-5">
+            {" "}
+            {/* Presets — merge a named starting point into the draft (no auto-apply) */}
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-muted text-xs">Presets:</span>
+              {HEADROOM_PRESETS.map((preset) => (
+                <Button
+                  key={preset.id}
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => applyPreset(preset.patch)}
+                  title={preset.description}
+                >
+                  {preset.label}
+                </Button>
+              ))}
+            </div>
+            {/* Live command preview — recomputed from the draft via the shared
+                buildProxyCommand so it can never drift from what start() spawns */}
+            <div>
+              <button
+                type="button"
+                onClick={() => setShowPreview((v) => !v)}
+                className="text-muted hover:text-foreground text-xs underline underline-offset-2"
+              >
+                {showPreview ? "Hide" : "Show"} effective command
+              </button>
+              {showPreview && (
+                <pre className="bg-background border-border-medium mt-2 max-h-32 overflow-auto rounded border p-2 font-mono text-xs break-all whitespace-pre-wrap">
+                  {previewCommand}
+                </pre>
+              )}
+            </div>
             {/* Context management */}
             <div className="space-y-3">
-              <div className="text-muted text-xs font-medium tracking-wide uppercase">
-                Context management
+              <div className="flex items-center justify-between gap-4">
+                <div className="text-muted text-xs font-medium tracking-wide uppercase">
+                  Context management
+                </div>
+                <button
+                  type="button"
+                  onClick={() =>
+                    resetGroup(["intelligentContext", "intelligentScoring", "compressFirst"])
+                  }
+                  className="text-muted hover:text-foreground inline-flex items-center gap-1 text-xs"
+                  aria-label="Reset Context management to defaults"
+                >
+                  <RotateCcw className="h-3 w-3" /> Reset
+                </button>
               </div>
               <div className="flex items-center justify-between gap-4">
                 <div className="flex-1">
@@ -532,11 +650,20 @@ export function HeadroomSection() {
                 />
               </div>
             </div>
-
             {/* Compression & cache */}
             <div className="space-y-3">
-              <div className="text-muted text-xs font-medium tracking-wide uppercase">
-                Compression &amp; cache
+              <div className="flex items-center justify-between gap-4">
+                <div className="text-muted text-xs font-medium tracking-wide uppercase">
+                  Compression &amp; cache
+                </div>
+                <button
+                  type="button"
+                  onClick={() => resetGroup(["optimize", "semanticCache"])}
+                  className="text-muted hover:text-foreground inline-flex items-center gap-1 text-xs"
+                  aria-label="Reset Compression & cache to defaults"
+                >
+                  <RotateCcw className="h-3 w-3" /> Reset
+                </button>
               </div>
               <div className="flex items-center justify-between gap-4">
                 <div className="flex-1">
@@ -565,11 +692,20 @@ export function HeadroomSection() {
                 />
               </div>
             </div>
-
             {/* LLMLingua */}
             <div className="space-y-3">
-              <div className="text-muted text-xs font-medium tracking-wide uppercase">
-                ML compression (LLMLingua)
+              <div className="flex items-center justify-between gap-4">
+                <div className="text-muted text-xs font-medium tracking-wide uppercase">
+                  ML compression (LLMLingua)
+                </div>
+                <button
+                  type="button"
+                  onClick={() => resetGroup(["llmlingua", "llmlinguaDevice", "llmlinguaRate"])}
+                  className="text-muted hover:text-foreground inline-flex items-center gap-1 text-xs"
+                  aria-label="Reset ML compression (LLMLingua) to defaults"
+                >
+                  <RotateCcw className="h-3 w-3" /> Reset
+                </button>
               </div>
               <div className="bg-background-secondary border-border-medium rounded-lg border p-3">
                 <div className="flex items-center justify-between gap-4">
@@ -632,11 +768,20 @@ export function HeadroomSection() {
                 </div>
               )}
             </div>
-
             {/* Cost & output */}
             <div className="space-y-3">
-              <div className="text-muted text-xs font-medium tracking-wide uppercase">
-                Cost &amp; output
+              <div className="flex items-center justify-between gap-4">
+                <div className="text-muted text-xs font-medium tracking-wide uppercase">
+                  Cost &amp; output
+                </div>
+                <button
+                  type="button"
+                  onClick={() => resetGroup(["budgetUsd", "outputHoldout"])}
+                  className="text-muted hover:text-foreground inline-flex items-center gap-1 text-xs"
+                  aria-label="Reset Cost & output to defaults"
+                >
+                  <RotateCcw className="h-3 w-3" /> Reset
+                </button>
               </div>
               <label className="text-foreground flex items-center justify-between gap-4 text-sm">
                 Daily budget (USD)
@@ -676,11 +821,20 @@ export function HeadroomSection() {
                 </div>
               </div>
             </div>
-
             {/* Diagnostics */}
             <div className="space-y-3">
-              <div className="text-muted text-xs font-medium tracking-wide uppercase">
-                Diagnostics
+              <div className="flex items-center justify-between gap-4">
+                <div className="text-muted text-xs font-medium tracking-wide uppercase">
+                  Diagnostics
+                </div>
+                <button
+                  type="button"
+                  onClick={() => resetGroup(["contextTool", "logLevel"])}
+                  className="text-muted hover:text-foreground inline-flex items-center gap-1 text-xs"
+                  aria-label="Reset Diagnostics to defaults"
+                >
+                  <RotateCcw className="h-3 w-3" /> Reset
+                </button>
               </div>
               <label className="text-foreground flex items-center justify-between gap-4 text-sm">
                 Context tool
@@ -717,7 +871,6 @@ export function HeadroomSection() {
                 </Select>
               </label>
             </div>
-
             {/* Power-user overrides */}
             <div className="space-y-3">
               <div className="text-muted text-xs font-medium tracking-wide uppercase">
@@ -750,17 +903,26 @@ export function HeadroomSection() {
                 />
               </div>
             </div>
-
             {/* Info note */}
             <p className="text-muted text-xs leading-relaxed">
               Per-algorithm weights (SmartCrusher, CacheAligner, scoring) are library-only and
               cannot be set through the proxy. The toggles above expose everything the proxy
               supports. Use the overrides box for anything else.
             </p>
-
-            {/* Apply */}
+            {/* Validation + Apply */}
+            {tuningErrors.length > 0 && (
+              <div className="text-xs text-red-500">
+                {tuningErrors.map((err) => (
+                  <div key={err}>{err}</div>
+                ))}
+              </div>
+            )}
             <div className="flex justify-end">
-              <Button onClick={() => void applyTuning()} disabled={tuningApplying} size="sm">
+              <Button
+                onClick={() => void applyTuning()}
+                disabled={tuningApplying || tuningErrors.length > 0}
+                size="sm"
+              >
                 {tuningApplying ? "Applying..." : "Apply & restart"}
               </Button>
             </div>
@@ -801,6 +963,54 @@ export function HeadroomSection() {
             </div>
           ))}
         </div>
+      </div>
+
+      {/* Per-workspace overrides — overview + inline editor. Surfaces workspaces
+          that diverge from the global routing so Settings stays the single source
+          of truth across all workspaces. */}
+      <div>
+        <h3 className="text-foreground mb-2 text-sm font-medium">Per-workspace overrides</h3>
+        <p className="text-muted mb-4 text-xs leading-relaxed">
+          Workspaces below override the global Headroom routing (enabled / mode / per-provider).
+          Click one to edit it inline.
+        </p>
+        {workspaceOverrides.length === 0 ? (
+          <p className="text-muted text-xs">No workspaces currently override the global config.</p>
+        ) : (
+          <div className="space-y-2">
+            {workspaceOverrides.map((entry) => (
+              <div
+                key={entry.workspaceId}
+                className="bg-background-secondary border-border-medium rounded-lg border p-3"
+              >
+                <button
+                  type="button"
+                  onClick={() =>
+                    setExpandedWorkspace(
+                      expandedWorkspace === entry.workspaceId ? null : entry.workspaceId
+                    )
+                  }
+                  className="text-foreground flex w-full items-center justify-between gap-4 text-sm"
+                >
+                  <span className="min-w-0 flex-1 truncate">
+                    {entry.title ?? entry.workspaceId}
+                  </span>
+                  <ChevronDown
+                    className={
+                      "h-4 w-4 shrink-0 transition-transform " +
+                      (expandedWorkspace === entry.workspaceId ? "" : "-rotate-90")
+                    }
+                  />
+                </button>
+                {expandedWorkspace === entry.workspaceId && (
+                  <div className="border-border-medium mt-3 border-t pt-3">
+                    <HeadroomWorkspaceEditor workspaceId={entry.workspaceId} />
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );

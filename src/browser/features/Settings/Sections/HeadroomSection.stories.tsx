@@ -57,6 +57,11 @@ function mockHeadroomApi(status: Record<string, unknown>): APIClient["headroom"]
     learn: () => Promise.resolve({ output: "" }),
     registerMcp: () => Promise.resolve({ success: false, command: null }),
     installLlmlingua: () => Promise.resolve({ success: true, message: "" }),
+    previewCommand: () => Promise.resolve({ argv: ["proxy", "--host", "127.0.0.1"], env: {} }),
+    listWorkspaceHeadroomOverrides: () => Promise.resolve([]),
+    getWorkspaceHeadroom: () => Promise.resolve(null),
+    setWorkspaceHeadroom: () => Promise.resolve(undefined),
+    clearWorkspaceHeadroom: () => Promise.resolve(undefined),
   } as unknown as APIClient["headroom"];
 }
 
