@@ -1234,6 +1234,33 @@ export class ProviderModelFactory {
         providerConfig = { ...providerConfig, baseURL: forcedBaseUrl };
       }
 
+      // Headroom transparent-proxy lever: when effective mode is "proxy" for
+      // this provider and the proxy is running, rewrite baseURL to point at the
+      // local headroom proxy (which compresses + forwards to the real upstream).
+      // Guarded: only anthropic (/v1/messages) and OpenAI-compatible
+      // (/v1/chat/completions) are supported — OpenAI Responses/WebSocket,
+      // Google, and Bedrock are NOT (the proxy can't forward their wire formats).
+      const headroomService = this.headroomService;
+      if (headroomService != null) {
+        const proxyBaseUrl = headroomService.getProxyBaseUrl();
+        if (proxyBaseUrl) {
+          const headroomCfg = headroomService.getConfig();
+          const effectiveHeadroomMode = headroomCfg.perProvider[providerName] ?? headroomCfg.mode;
+          if (effectiveHeadroomMode === "proxy") {
+            // Pre-compute the wire format for the built-in OpenAI provider so we
+            // can gate: chat-completions is proxy-safe, Responses/WebSocket is not.
+            const openaiWireFormat = muxProviderOptions?.openai?.wireFormat ?? "responses";
+            const supportsProxyMode =
+              providerName === "anthropic" ||
+              providerIsCustomOpenAICompatible ||
+              (providerName === "openai" && openaiWireFormat === "chatCompletions");
+            if (supportsProxyMode) {
+              providerConfig = { ...providerConfig, baseURL: proxyBaseUrl };
+            }
+          }
+        }
+      }
+
       // Inject app attribution headers (used by OpenRouter and other compatible platforms).
       // We never overwrite user-provided values (case-insensitive header matching).
       providerConfig = {
