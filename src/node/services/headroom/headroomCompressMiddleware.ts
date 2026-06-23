@@ -22,6 +22,7 @@ import type {
   LanguageModelV3Middleware,
 } from "@ai-sdk/provider";
 import { HeadroomClient } from "./headroomClient";
+import { log } from "@/node/services/log";
 
 /**
  * A V3 prompt message is structurally { role, content: ContentPart[] }.
@@ -231,6 +232,20 @@ export function createHeadroomCompressMiddleware(
           prompt,
           result.messages
         ) as typeof params.prompt;
+
+        // Track CCR hashes for observability. The proxy stores originals keyed
+        // by these hashes; the model can retrieve full content on demand via
+        // the proxy lever (/v1/messages) or the MCP server (Phase 3). The
+        // middleware lever alone cannot execute a retrieve tool (tool execution
+        // runs at the streamText orchestration level, above doStream).
+        if (result.ccr_hashes && result.ccr_hashes.length > 0) {
+          log.debug("[headroom] compression applied", {
+            hashes: result.ccr_hashes.length,
+            tokensBefore: result.tokens_before,
+            tokensAfter: result.tokens_after,
+            tokensSaved: result.tokens_saved,
+          });
+        }
 
         return { ...params, prompt: compressedPrompt };
       } catch {

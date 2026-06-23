@@ -5,18 +5,19 @@
  * compressed-text back-mapping. No real LLM or proxy calls — fetch is mocked.
  */
 
+import { beforeEach, describe, expect, it } from "bun:test";
+import type { LanguageModelV3CallOptions, LanguageModelV3Prompt } from "@ai-sdk/provider";
 import { jest } from "@jest/globals";
 
 // Mock fetch so tests never hit the network.
-const mockFetch = jest.fn() as jest.MockedFunction<typeof fetch>;
+const mockFetch = jest.fn() as unknown as jest.MockedFunction<typeof fetch>;
 global.fetch = mockFetch as unknown as typeof fetch;
 
 import { createHeadroomCompressMiddleware } from "@/node/services/headroom/headroomCompressMiddleware";
 
-function makeParams(prompt: unknown[]) {
+function makeParams(prompt: LanguageModelV3Prompt): LanguageModelV3CallOptions {
   return {
     prompt,
-    model: "test-model" as never,
     maxOutputTokens: 1024,
     temperature: 0.7,
   };
@@ -121,7 +122,7 @@ describe("createHeadroomCompressMiddleware", () => {
           role: "assistant",
           content: [
             { type: "text", text: "I will read the file now." },
-            { type: "tool-call", toolCallId: "tc1", toolName: "read", args: {} },
+            { type: "tool-call", toolCallId: "tc1", toolName: "read", input: {} },
           ],
         },
       ]) as never,

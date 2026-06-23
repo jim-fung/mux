@@ -79,6 +79,25 @@ export class HeadroomClient {
     return (await res.json()) as HeadroomCompressResponse;
   }
 
+  /**
+   * POST /v1/retrieve — fetch original (uncompressed) content by CCR hash.
+   * Used when the model needs the full text of a compressed message it received.
+   * Returns the original content, or null if the hash is unknown/expired.
+   */
+  async retrieve(ccrHash: string): Promise<string | null> {
+    const res = await fetch(`${this.baseUrl}/v1/retrieve`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ hash: ccrHash }),
+      ...withTimeout(COMPRESS_TIMEOUT_MS),
+    });
+    if (!res.ok) {
+      throw new Error(`Headroom retrieve failed: ${res.status} ${res.statusText}`);
+    }
+    const data = (await res.json()) as { content?: string };
+    return data.content ?? null;
+  }
+
   /** GET /health — liveness probe. */
   async health(): Promise<HeadroomHealth> {
     const res = await fetch(`${this.baseUrl}/health`, {

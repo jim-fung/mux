@@ -13,12 +13,15 @@
  */
 
 import { EventEmitter } from "node:events";
+import { spawn } from "node:child_process";
 import type { Config } from "@/node/config";
-import type { HeadroomConfig } from "@/common/config/schemas/headroom";
+import type { HeadroomConfig, HeadroomAdvancedConfig } from "@/common/config/schemas/headroom";
+import { HEADROOM_ADVANCED_DEFAULTS } from "@/common/config/schemas/headroom";
 import { log } from "@/node/services/log";
 import {
   getHeadroomBinary,
   getHeadroomVenvPath,
+  installHeadroomExtra,
   isHeadroomInstalled,
   provisionHeadroom,
   resolveProvisioningMethod,
@@ -39,6 +42,16 @@ export interface HeadroomStatus {
   /** Description of the provisioning method available, for UI display. */
   runtimeMethod: HeadroomRuntimeMethod;
   lastError: string | null;
+  /** Live config values for UI toggle binding (not hardcoded). */
+  mode: string;
+  autoProvision: boolean;
+  includeMl: boolean;
+  outputShaper: boolean;
+  telemetry: boolean;
+  memoryEnabled: boolean;
+  perProvider: Record<string, string>;
+  /** Fine-grained proxy knobs from the Advanced settings panel. */
+  advanced: HeadroomAdvancedConfig;
 }
 
 export class HeadroomService extends EventEmitter {
@@ -65,6 +78,7 @@ export class HeadroomService extends EventEmitter {
         telemetry: false,
         outputShaper: false,
         memory: { enabled: false },
+        advanced: HEADROOM_ADVANCED_DEFAULTS,
       }
     );
   }
@@ -134,10 +148,28 @@ export class HeadroomService extends EventEmitter {
   /** Launch the proxy process (if not already using an external URL). */
   private async launchProxy(cfg: HeadroomConfig): Promise<void> {
     const headroomPath = getHeadroomBinary(getHeadroomVenvPath());
+
+    // Collect upstream target URLs from the providers config so the proxy knows
+    // where to forward compressed requests. Without this, proxy mode breaks on
+    // providers with custom baseURLs (gateways, self-hosted, proxies).
+    const providersConfig = this.config.loadProvidersConfig() ?? {};
+    const openaiConfig = providersConfig.openai as
+      | { baseUrl?: string; baseURL?: string }
+      | undefined;
+    const anthropicConfig = providersConfig.anthropic as
+      | { baseUrl?: string; baseURL?: string }
+      | undefined;
+    const openaiTargetUrl = openaiConfig?.baseUrl ?? openaiConfig?.baseURL ?? undefined;
+    const anthropicBaseUrl = anthropicConfig?.baseUrl ?? anthropicConfig?.baseURL ?? undefined;
+
     await this.proxy.start({
       headroomPath,
       telemetry: cfg.telemetry,
       outputShaper: cfg.outputShaper,
+      memoryEnabled: cfg.memory.enabled,
+      openaiTargetUrl,
+      anthropicBaseUrl,
+      advanced: cfg.advanced,
     });
   }
 
@@ -191,6 +223,14 @@ export class HeadroomService extends EventEmitter {
       port: info?.port ?? null,
       runtimeMethod: resolveProvisioningMethod(),
       lastError: this.lastError,
+      mode: cfg.mode,
+      autoProvision: cfg.autoProvision,
+      includeMl: cfg.includeMl,
+      outputShaper: cfg.outputShaper,
+      telemetry: cfg.telemetry,
+      memoryEnabled: cfg.memory.enabled,
+      perProvider: cfg.perProvider,
+      advanced: cfg.advanced,
     };
   }
 
@@ -205,6 +245,67 @@ export class HeadroomService extends EventEmitter {
       log.debug("[headroom] failed to fetch stats", { error: String(err) });
       return null;
     }
+  }
+
+  /**
+   * Lazy-install the headroom-ai llmlingua extra (triggered when the user enables
+   * LLMLingua in the Advanced panel). Returns a success/message pair for the UI.
+   * Idempotent — safe to call when already installed.
+   */
+  async installLlmlingua(): Promise<{ success: boolean; message: string }> {
+    try {
+      await installHeadroomExtra("llmlingua");
+      return { success: true, message: "LLMLingua installed successfully." };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      log.warn("[headroom] llmlingua install failed", { error: message });
+      return { success: false, message };
+    }
+  }
+
+  /**
+   * Run `headroom learn` to mine past sessions for failure patterns and write
+   * corrections to AGENTS.md. Returns the CLI stdout (preview in dry-run mode).
+   * @param apply When true, runs with --apply to write corrections to disk.
+   */
+  async learn(apply: boolean): Promise<string> {
+    const headroomPath = getHeadroomBinary(getHeadroomVenvPath());
+    if (!isHeadroomInstalled()) {
+      throw new Error("Headroom is not installed. Provision it first via the settings UI.");
+    }
+    return new Promise<string>((resolve, reject) => {
+      const args = ["learn"];
+      if (apply) args.push("--apply");
+      const child = spawn(headroomPath, args, {
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env },
+        timeout: 120_000,
+      });
+      const chunks: string[] = [];
+      child.stdout?.on("data", (d: Buffer) => chunks.push(d.toString()));
+      child.stderr?.on("data", (d: Buffer) => chunks.push(d.toString()));
+      child.on("close", (code) => {
+        const output = chunks.join("");
+        if (code === 0) {
+          resolve(output);
+        } else {
+          reject(
+            new Error(`headroom learn failed (exit ${code ?? "unknown"}): ${output.slice(0, 500)}`)
+          );
+        }
+      });
+      child.on("error", reject);
+    });
+  }
+
+  /**
+   * Get the MCP server config for the headroom MCP server (headroom_compress,
+   * headroom_retrieve, headroom_stats tools). Returns the stdio command to register.
+   */
+  getMcpServerConfig(): { transport: "stdio"; command: string } | null {
+    if (!isHeadroomInstalled()) return null;
+    const headroomPath = getHeadroomBinary(getHeadroomVenvPath());
+    return { transport: "stdio", command: `${headroomPath} mcp` };
   }
 
   /**
