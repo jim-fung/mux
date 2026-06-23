@@ -15,9 +15,15 @@
 import { EventEmitter } from "node:events";
 import { spawn } from "node:child_process";
 import type { Config } from "@/node/config";
-import type { HeadroomConfig, HeadroomAdvancedConfig } from "@/common/config/schemas/headroom";
+import type {
+  HeadroomConfig,
+  HeadroomAdvancedConfig,
+  HeadroomWorkspaceOverride,
+} from "@/common/config/schemas/headroom";
 import { HEADROOM_ADVANCED_DEFAULTS } from "@/common/config/schemas/headroom";
+import { resolveHeadroomConfig } from "./headroomConfigResolver";
 import { log } from "@/node/services/log";
+import { shellQuote } from "@/common/utils/shell";
 import {
   getHeadroomBinary,
   getHeadroomVenvPath,
@@ -27,7 +33,7 @@ import {
   resolveProvisioningMethod,
   type HeadroomRuntimeMethod,
 } from "./headroomProvisioner";
-import { HeadroomProxyProcess } from "./headroomProxyProcess";
+import { HeadroomProxyPool, type PoolLaunchContext } from "./headroomProxyPool";
 import { HeadroomClient } from "./headroomClient";
 
 export type HeadroomProvisioningState = "not-installed" | "provisioning" | "installed" | "failed";
@@ -55,13 +61,26 @@ export interface HeadroomStatus {
 }
 
 export class HeadroomService extends EventEmitter {
-  private readonly proxy: HeadroomProxyProcess = new HeadroomProxyProcess();
+  /**
+   * Pool of headroom proxy processes, keyed by process-config digest. The global
+   * default is one member; a workspace whose effective process config differs gets
+   * its own process. Idle-eviction + a size cap bound total RAM. Replaces the old
+   * single-process field — HeadroomProxyProcess itself is unchanged.
+   */
+  private readonly pool: HeadroomProxyPool;
   private provisioningState: HeadroomProvisioningState = "not-installed";
   private lastError: string | null = null;
   private started = false;
+  /** Single-flight guard: concurrent restart() calls share one in-flight run. */
+  private restartInFlight: Promise<HeadroomStatus> | null = null;
+  /** Single-flight guard: concurrent provision() calls share one in-flight run. */
+  private provisionInFlight: Promise<HeadroomStatus> | null = null;
 
   constructor(private readonly config: Config) {
     super();
+    // The pool resolves the spawn context lazily, so it only needs headroom
+    // installed when a process is actually about to start.
+    this.pool = new HeadroomProxyPool(() => this.resolveLaunchContext());
   }
 
   /** Read the current headroom config (live, from disk). */
@@ -82,6 +101,104 @@ export class HeadroomService extends EventEmitter {
       }
     );
   }
+  /** Enumerate workspaces that have a Headroom override (sparse map, for the
+   *  Settings overview). Title is best-effort from workspace metadata. */
+  listWorkspaceOverrides(): Array<{
+    workspaceId: string;
+    title: string | null;
+    override: HeadroomWorkspaceOverride;
+  }> {
+    const config = this.config.loadConfigOrDefault();
+    const out: Array<{
+      workspaceId: string;
+      title: string | null;
+      override: HeadroomWorkspaceOverride;
+    }> = [];
+    for (const projectConfig of config.projects.values()) {
+      for (const ws of projectConfig.workspaces) {
+        if (ws.headroom && ws.id) {
+          out.push({
+            workspaceId: ws.id,
+            title: ws.title ?? ws.name ?? null,
+            override: ws.headroom,
+          });
+        }
+      }
+    }
+    return out;
+  }
+
+  /** Read the raw per-workspace override, or null when the workspace has none. */
+  getWorkspaceOverride(workspaceId: string): HeadroomWorkspaceOverride | null {
+    const found = this.config.findWorkspace(workspaceId);
+    if (!found) return null;
+    const config = this.config.loadConfigOrDefault();
+    const projectConfig = config.projects.get(found.projectPath);
+    const workspaceEntry =
+      projectConfig?.workspaces.find((ws) => ws.id === workspaceId) ??
+      projectConfig?.workspaces.find((ws) => ws.path === found.workspacePath);
+    return workspaceEntry?.headroom ?? null;
+  }
+
+  /**
+   * Resolve the effective HeadroomConfig for a workspace by layering its sparse
+   * override on the global config. The ProviderModelFactory calls this per
+   * model-build so routing (enabled / mode / perProvider) can differ per workspace
+   * on the shared global proxy. `workspaceId == null` returns the global config.
+   */
+  getEffectiveConfig(workspaceId: string | null): HeadroomConfig {
+    const global = this.getConfig();
+    if (!workspaceId) return global;
+    return resolveHeadroomConfig(global, this.getWorkspaceOverride(workspaceId));
+  }
+
+  /** Write the per-workspace override. All-null drops the record (mirrors the
+   *  goalDefaults sparse pattern so "no override" is the canonical state). */
+  async setWorkspaceOverride(
+    workspaceId: string,
+    override: HeadroomWorkspaceOverride
+  ): Promise<void> {
+    const found = this.config.findWorkspace(workspaceId);
+    if (!found) return;
+    const config = this.config.loadConfigOrDefault();
+    const projectConfig = config.projects.get(found.projectPath);
+    const workspaceEntry =
+      projectConfig?.workspaces.find((ws) => ws.id === workspaceId) ??
+      projectConfig?.workspaces.find((ws) => ws.path === found.workspacePath);
+    if (!workspaceEntry) return;
+
+    const allNull = Object.values(override).every((v) => v == null);
+    if (allNull) {
+      if (workspaceEntry.headroom == null) return;
+      delete workspaceEntry.headroom;
+    } else {
+      workspaceEntry.headroom = {
+        enabled: override.enabled ?? null,
+        mode: override.mode ?? null,
+        perProvider: override.perProvider ?? null,
+        outputShaper: override.outputShaper ?? null,
+        telemetry: override.telemetry ?? null,
+        memoryEnabled: override.memoryEnabled ?? null,
+        includeMl: override.includeMl ?? null,
+        advanced: override.advanced ?? null,
+      };
+    }
+    await this.config.saveConfig(config);
+  }
+
+  /** Remove the per-workspace override entirely (resolves back to global). */
+  async clearWorkspaceOverride(workspaceId: string): Promise<void> {
+    await this.setWorkspaceOverride(workspaceId, {
+      enabled: null,
+      mode: null,
+      perProvider: null,
+      outputShaper: null,
+      telemetry: null,
+      memoryEnabled: null,
+      includeMl: null,
+      advanced: null,
+    });
+  }
 
   /**
    * Start the service: provision if needed, then launch the proxy.
@@ -96,15 +213,17 @@ export class HeadroomService extends EventEmitter {
 
     this.started = true;
 
-    // If the user configured an external proxyBaseUrl, we don't manage a process.
+    // If the user configured an external proxyBaseUrl, we don't manage processes.
     if (cfg.proxyBaseUrl) {
       log.info("[headroom] using external proxy", { baseUrl: cfg.proxyBaseUrl });
       return;
     }
 
+    // Pre-warm the global-default pool entry so the very first request is served.
+    // Per-workspace entries start lazily on first use (getOrStart).
     try {
       await this.ensureInstalled(cfg.includeMl);
-      await this.launchProxy(cfg);
+      await this.pool.startEntry(cfg);
     } catch (err) {
       this.lastError = err instanceof Error ? err.message : String(err);
       log.warn("[headroom] failed to start proxy (chat will continue uncompressed)", {
@@ -114,10 +233,11 @@ export class HeadroomService extends EventEmitter {
     }
   }
 
-  /** Stop the proxy process. Called from ServiceContainer.dispose(). */
-  stop(): void {
+  /** Stop all proxy processes. Called from ServiceContainer.dispose(). */
+  async stop(): Promise<void> {
     this.started = false;
-    this.proxy.stop();
+    this.pool.dispose();
+    await this.pool.stopAll();
   }
 
   /** Ensure headroom is installed (provision if autoProvision is on). */
@@ -145,13 +265,17 @@ export class HeadroomService extends EventEmitter {
     return result.headroomPath;
   }
 
-  /** Launch the proxy process (if not already using an external URL). */
-  private async launchProxy(cfg: HeadroomConfig): Promise<void> {
-    const headroomPath = getHeadroomBinary(getHeadroomVenvPath());
-
-    // Collect upstream target URLs from the providers config so the proxy knows
-    // where to forward compressed requests. Without this, proxy mode breaks on
-    // providers with custom baseURLs (gateways, self-hosted, proxies).
+  /**
+   * Resolve the spawn context the pool needs (binary path + upstream URLs).
+   * Returns null when headroom isn't installed yet — the pool then defers the
+   * start until a later call finds it installed.
+   */
+  private resolveLaunchContext(): PoolLaunchContext | null {
+    const venvPath = getHeadroomVenvPath();
+    if (!isHeadroomInstalled(venvPath)) return null;
+    const headroomPath = getHeadroomBinary(venvPath);
+    // Collect upstream target URLs so the proxy forwards compressed requests to the
+    // right endpoint (defaults to api.openai.com / api.anthropic.com when unset).
     const providersConfig = this.config.loadProvidersConfig() ?? {};
     const openaiConfig = providersConfig.openai as
       | { baseUrl?: string; baseURL?: string }
@@ -161,16 +285,7 @@ export class HeadroomService extends EventEmitter {
       | undefined;
     const openaiTargetUrl = openaiConfig?.baseUrl ?? openaiConfig?.baseURL ?? undefined;
     const anthropicBaseUrl = anthropicConfig?.baseUrl ?? anthropicConfig?.baseURL ?? undefined;
-
-    await this.proxy.start({
-      headroomPath,
-      telemetry: cfg.telemetry,
-      outputShaper: cfg.outputShaper,
-      memoryEnabled: cfg.memory.enabled,
-      openaiTargetUrl,
-      anthropicBaseUrl,
-      advanced: cfg.advanced,
-    });
+    return { headroomPath, openaiTargetUrl, anthropicBaseUrl };
   }
 
   /**
@@ -178,6 +293,18 @@ export class HeadroomService extends EventEmitter {
    * Returns the final status.
    */
   async provision(): Promise<HeadroomStatus> {
+    // Single-flight: a rapid double-click on "Provision" must not spawn two
+    // parallel pip/uv installs against the same venv.
+    if (this.provisionInFlight) return this.provisionInFlight;
+    this.provisionInFlight = this.doProvision();
+    try {
+      return await this.provisionInFlight;
+    } finally {
+      this.provisionInFlight = null;
+    }
+  }
+
+  private async doProvision(): Promise<HeadroomStatus> {
     const cfg = this.getConfig();
     try {
       this.provisioningState = "provisioning";
@@ -190,9 +317,9 @@ export class HeadroomService extends EventEmitter {
         headroomPath: result.headroomPath,
       });
 
-      // If already started but proxy wasn't running, try to launch now.
-      if (this.started && !this.proxy.isRunning && !cfg.proxyBaseUrl) {
-        await this.launchProxy(cfg);
+      // If already started but the global proxy wasn't running, start it now.
+      if (this.started && !this.pool.getInfo(cfg) && !cfg.proxyBaseUrl) {
+        await this.pool.startEntry(cfg);
       }
     } catch (err) {
       this.provisioningState = "failed";
@@ -202,23 +329,36 @@ export class HeadroomService extends EventEmitter {
     return this.getStatus();
   }
 
-  /** Get the proxy base URL for the factory to connect to (null if not running). */
+  /**
+   * Get the proxy base URL for the GLOBAL config's process (null if not running).
+   * Kept for callers that don't have a workspace in scope. The factory uses
+   * getProxyBaseUrlForConfig(effective) for per-workspace routing.
+   */
   getProxyBaseUrl(): string | null {
     const cfg = this.getConfig();
     if (!cfg.enabled) return null;
     if (cfg.proxyBaseUrl) return cfg.proxyBaseUrl;
-    return this.proxy.info?.baseUrl ?? null;
+    return this.pool.getInfo(cfg)?.baseUrl ?? null;
   }
 
-  /** Current status snapshot for the UI. */
+  /** Get the proxy base URL for a specific effective config (per-workspace pool
+   *  routing). Lazily starts the matching process on first sight; returns null
+   *  until that process is healthy (the request fails open). */
+  getProxyBaseUrlForConfig(effective: HeadroomConfig): string | null {
+    if (!effective.enabled) return null;
+    if (effective.proxyBaseUrl) return effective.proxyBaseUrl;
+    return this.pool.getOrStart(effective);
+  }
+
+  /** Current status snapshot for the UI (reflects the global-default process). */
   getStatus(): HeadroomStatus {
     const cfg = this.getConfig();
-    const info = this.proxy.info;
+    const info = this.pool.getInfo(cfg);
     return {
       enabled: cfg.enabled,
       installed: isHeadroomInstalled(),
       provisioning: this.provisioningState,
-      proxyRunning: this.proxy.isRunning,
+      proxyRunning: info != null,
       proxyBaseUrl: cfg.proxyBaseUrl ?? info?.baseUrl ?? null,
       port: info?.port ?? null,
       runtimeMethod: resolveProvisioningMethod(),
@@ -234,7 +374,7 @@ export class HeadroomService extends EventEmitter {
     };
   }
 
-  /** Fetch live stats from the proxy (null if unavailable). */
+  /** Fetch live stats from the global proxy (null if unavailable). */
   async getStats(): Promise<HeadroomStats | null> {
     const baseUrl = this.getProxyBaseUrl();
     if (!baseUrl) return null;
@@ -305,22 +445,43 @@ export class HeadroomService extends EventEmitter {
   getMcpServerConfig(): { transport: "stdio"; command: string } | null {
     if (!isHeadroomInstalled()) return null;
     const headroomPath = getHeadroomBinary(getHeadroomVenvPath());
-    return { transport: "stdio", command: `${headroomPath} mcp` };
+    // MCP stdio servers run the command string through `bash -c`, so the binary
+    // path must be shell-quoted: a path with spaces (common on Windows user
+    // dirs) would otherwise split the executable from the `mcp` argument.
+    return { transport: "stdio", command: `${shellQuote(headroomPath)} mcp` };
   }
 
   /**
    * Restart the proxy (e.g. after config change). Safe to call when not running.
    */
   async restart(): Promise<HeadroomStatus> {
-    this.proxy.stop();
+    // Single-flight: overlapping setConfig→restart calls (each UI toggle writes
+    // config then restarts) must not race on the proxy process.
+    if (this.restartInFlight) return this.restartInFlight;
+    this.restartInFlight = this.doRestart();
+    try {
+      return await this.restartInFlight;
+    } finally {
+      this.restartInFlight = null;
+    }
+  }
+
+  private async doRestart(): Promise<HeadroomStatus> {
     const cfg = this.getConfig();
     if (cfg.enabled && !cfg.proxyBaseUrl) {
       try {
         await this.ensureInstalled(cfg.includeMl);
-        await this.launchProxy(cfg);
+        // Restart the global-default entry. Per-workspace entries with a different
+        // process config are lazily restarted on next use; the old entry is evicted
+        // so a stale config can't linger (stop+start re-reads the current config).
+        await this.pool.restartEntry(cfg);
+        this.lastError = null;
       } catch (err) {
         this.lastError = err instanceof Error ? err.message : String(err);
       }
+    } else {
+      // Disabled or external proxy: stop any pooled processes we were managing.
+      await this.pool.stopAll();
     }
     return this.getStatus();
   }

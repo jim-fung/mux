@@ -1,4 +1,5 @@
 import { RuntimeConfigSchema } from "@/common/orpc/schemas/runtime";
+import { HeadroomWorkspaceOverrideSchema } from "@/common/config/schemas/headroom";
 import { WorkspaceMCPOverridesSchema } from "@/common/orpc/schemas/mcp";
 import {
   BestOfGroupSchema,
@@ -109,6 +110,11 @@ export const WorkspaceConfigSchema = z.object({
   goalDefaults: WorkspaceGoalDefaultsOverrideSchema.optional().meta({
     description:
       "Per-workspace overrides for goal creation defaults. Sparse; each null field follows the global `goalDefaults`.",
+  }),
+  headroom: HeadroomWorkspaceOverrideSchema.optional().meta({
+    description:
+      "Per-workspace Headroom routing override (enabled / mode / perProvider). " +
+      "Sparse; each null field follows the global `headroom` config.",
   }),
   parentWorkspaceId: z.string().optional().meta({
     description:

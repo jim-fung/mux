@@ -71,6 +71,7 @@ import {
 } from "@/common/types/uiLayouts";
 import { normalizeUserPreferences } from "@/common/config/schemas/userPreferences";
 import { HEADROOM_ADVANCED_DEFAULTS } from "@/common/config/schemas/headroom";
+import { buildProxyCommand } from "@/node/services/headroom/headroomProxyProcess";
 import { normalizeAgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { isValidModelFormat, normalizeSelectedModel } from "@/common/utils/ai/models";
 import { sanitizeModelFallbacks } from "@/common/utils/ai/modelFallbacks";
@@ -2846,6 +2847,20 @@ export const router = (authToken?: string) => {
           });
           return { success: true, command: config.command };
         }),
+      previewCommand: t
+        .input(schemas.headroom.previewCommand.input)
+        .output(schemas.headroom.previewCommand.output)
+        .handler(({ input }) => {
+          // Pure projection of the spec onto the proxy argv/env — no service state.
+          // buildProxyCommand is the same function start() uses, so this can never
+          // drift from the command that actually spawns.
+          return buildProxyCommand({
+            telemetry: input.telemetry ?? false,
+            outputShaper: input.outputShaper ?? false,
+            memoryEnabled: input.memoryEnabled ?? false,
+            advanced: input.advanced,
+          });
+        }),
       setConfig: t
         .input(schemas.headroom.setConfig.input)
         .output(schemas.headroom.setConfig.output)
@@ -2888,6 +2903,39 @@ export const router = (authToken?: string) => {
           await context.headroomService.restart().catch(() => {
             // Restart failures are non-fatal — the config was already saved.
           });
+        }),
+      listWorkspaceHeadroomOverrides: t
+        .input(schemas.headroom.listWorkspaceHeadroomOverrides.input)
+        .output(schemas.headroom.listWorkspaceHeadroomOverrides.output)
+        .handler(({ context }) => {
+          return context.headroomService.listWorkspaceOverrides();
+        }),
+      getWorkspaceHeadroom: t
+        .input(schemas.headroom.getWorkspaceHeadroom.input)
+        .output(schemas.headroom.getWorkspaceHeadroom.output)
+        .handler(({ context, input }) => {
+          const svc = context.headroomService;
+          const eff = svc.getEffectiveConfig(input.workspaceId);
+          return {
+            override: svc.getWorkspaceOverride(input.workspaceId),
+            effective: {
+              enabled: eff.enabled,
+              mode: eff.mode,
+              perProvider: eff.perProvider,
+            },
+          };
+        }),
+      setWorkspaceHeadroom: t
+        .input(schemas.headroom.setWorkspaceHeadroom.input)
+        .output(schemas.headroom.setWorkspaceHeadroom.output)
+        .handler(async ({ context, input }) => {
+          await context.headroomService.setWorkspaceOverride(input.workspaceId, input.override);
+        }),
+      clearWorkspaceHeadroom: t
+        .input(schemas.headroom.clearWorkspaceHeadroom.input)
+        .output(schemas.headroom.clearWorkspaceHeadroom.output)
+        .handler(async ({ context, input }) => {
+          await context.headroomService.clearWorkspaceOverride(input.workspaceId);
         }),
     },
     secrets: {

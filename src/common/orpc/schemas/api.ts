@@ -14,7 +14,11 @@ import {
   SendMessageErrorSchema,
 } from "./errors";
 import { BranchListResultSchema, FilePartSchema, MuxMessageSchema } from "./message";
-import { HeadroomAdvancedConfigSchema } from "@/common/config/schemas/headroom";
+import {
+  HeadroomAdvancedConfigSchema,
+  HeadroomModeSchema,
+  HeadroomWorkspaceOverrideSchema,
+} from "@/common/config/schemas/headroom";
 import {
   GoalClearInputSchema,
   GoalBoardAddUpcomingInputSchema,
@@ -1023,6 +1027,21 @@ export const headroom = {
       command: z.string().nullable(),
     }),
   },
+  /** Preview the exact `headroom proxy …` argv + env for a given spec. The UI
+   *  uses this to show a live command preview that can never drift from what
+   *  start() actually spawns (both route through buildProxyCommand). */
+  previewCommand: {
+    input: z.object({
+      telemetry: z.boolean().nullish(),
+      outputShaper: z.boolean().nullish(),
+      memoryEnabled: z.boolean().nullish(),
+      advanced: HeadroomAdvancedConfigSchema,
+    }),
+    output: z.object({
+      argv: z.array(z.string()),
+      env: z.record(z.string(), z.string()),
+    }),
+  },
   setConfig: {
     input: z.object({
       enabled: z.boolean().nullish(),
@@ -1036,6 +1055,42 @@ export const headroom = {
       memoryEnabled: z.boolean().nullish(),
       advanced: HeadroomAdvancedConfigSchema.nullish(),
     }),
+    output: z.void(),
+  },
+  /** List workspaces that have a Headroom override (for the Settings overview). */
+  listWorkspaceHeadroomOverrides: {
+    input: z.void(),
+    output: z.array(
+      z.object({
+        workspaceId: z.string(),
+        title: z.string().nullable(),
+        override: HeadroomWorkspaceOverrideSchema,
+      })
+    ),
+  },
+  /** Read the per-workspace Headroom override (sparse) + resolved effective routing. */
+  getWorkspaceHeadroom: {
+    input: z.object({ workspaceId: z.string() }),
+    output: z.object({
+      override: HeadroomWorkspaceOverrideSchema.nullable(),
+      effective: z.object({
+        enabled: z.boolean(),
+        mode: HeadroomModeSchema,
+        perProvider: z.record(z.string(), HeadroomModeSchema),
+      }),
+    }),
+  },
+  /** Write the per-workspace Headroom override (all-null clears it). */
+  setWorkspaceHeadroom: {
+    input: z.object({
+      workspaceId: z.string(),
+      override: HeadroomWorkspaceOverrideSchema,
+    }),
+    output: z.void(),
+  },
+  /** Remove the per-workspace Headroom override. */
+  clearWorkspaceHeadroom: {
+    input: z.object({ workspaceId: z.string() }),
     output: z.void(),
   },
 };

@@ -85,6 +85,39 @@ export const HEADROOM_ADVANCED_DEFAULTS: HeadroomAdvancedConfig = {
   extraArgs: [],
 };
 
+/**
+ * Per-workspace Headroom override, layered on the global HeadroomConfig.
+ *
+ * Sparse like the goalDefaults/heartbeat pattern: each field is nullable and
+ * `null` means "follow the global default". When every field is null the whole
+ * record is dropped from config.json so a workspace is indistinguishable from one
+ * that never had an override.
+ *
+ * Phase 1 surfaces only routing-level fields (enabled / mode / perProvider) — these
+ * resolve per-request at model-build time on the shared global proxy, no new
+ * process needed. Process-level knobs (advanced, telemetry, etc.) require the
+ * proxy pool (Phase 2) and will be added there.
+ */
+export const HeadroomWorkspaceOverrideSchema = z.object({
+  /** Overrides the global enabled flag for this workspace. null = inherit. */
+  enabled: z.boolean().nullable(),
+  /** Overrides the global routing mode. null = inherit. */
+  mode: HeadroomModeSchema.nullable(),
+  /** Overrides the global per-provider map. null = inherit. */
+  perProvider: z.record(z.string(), HeadroomModeSchema).nullable(),
+  // --- Process-level fields (require the proxy pool — Phase 2). A workspace
+  //     whose process config differs from the global default gets its own proxy
+  //     process. Each replaces wholesale; null = inherit the global value.
+  outputShaper: z.boolean().nullable(),
+  telemetry: z.boolean().nullable(),
+  memoryEnabled: z.boolean().nullable(),
+  includeMl: z.boolean().nullable(),
+  /** Replaces the global advanced block wholesale when set. null = inherit. */
+  advanced: HeadroomAdvancedConfigSchema.nullable(),
+});
+
+export type HeadroomWorkspaceOverride = z.infer<typeof HeadroomWorkspaceOverrideSchema>;
+
 export const HeadroomConfigSchema = z.object({
   /** Master switch. When false, no proxy is started and no middleware is attached. */
   enabled: z.boolean().default(false),

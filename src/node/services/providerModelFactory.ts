@@ -1080,9 +1080,12 @@ export class ProviderModelFactory {
     // middleware itself, so a proxy hiccup never blocks the request.
     const headroomService = this.headroomService;
     if (headroomService != null) {
-      const proxyBaseUrl = headroomService.getProxyBaseUrl();
+      const headroomCfg = headroomService.getEffectiveConfig(workspaceId ?? null);
+      // Per-workspace routing: resolve the proxy process for THIS effective config.
+      // Lazily starts a pooled process when the workspace diverges on advanced/
+      // telemetry/etc.; returns null until healthy (the request fails open).
+      const proxyBaseUrl = headroomService.getProxyBaseUrlForConfig(headroomCfg);
       if (proxyBaseUrl) {
-        const headroomCfg = headroomService.getConfig();
         // result.data is guaranteed V3 (non-string) by the guard above.
         const providerName = typeof result.data === "string" ? undefined : result.data.provider;
         const modelId = typeof result.data === "string" ? undefined : result.data.modelId;
@@ -1090,7 +1093,7 @@ export class ProviderModelFactory {
           providerName != null
             ? (headroomCfg.perProvider[providerName] ?? headroomCfg.mode)
             : headroomCfg.mode;
-        if (effectiveMode === "middleware") {
+        if (headroomCfg.enabled && effectiveMode === "middleware") {
           const innerModel = model;
           model = wrapLanguageModel({
             model,
@@ -1110,7 +1113,7 @@ export class ProviderModelFactory {
   private async _createModelCore(
     modelString: string,
     muxProviderOptions?: MuxProviderOptions,
-    opts?: { agentInitiated?: boolean; routeContext?: RouteContext }
+    opts?: { agentInitiated?: boolean; workspaceId?: string; routeContext?: RouteContext }
   ): Promise<Result<LanguageModel, SendMessageError>> {
     try {
       // Route resolution is centralized here so every caller gets identical,
@@ -1244,9 +1247,9 @@ export class ProviderModelFactory {
       if (headroomService != null) {
         const proxyBaseUrl = headroomService.getProxyBaseUrl();
         if (proxyBaseUrl) {
-          const headroomCfg = headroomService.getConfig();
+          const headroomCfg = headroomService.getEffectiveConfig(opts?.workspaceId ?? null);
           const effectiveHeadroomMode = headroomCfg.perProvider[providerName] ?? headroomCfg.mode;
-          if (effectiveHeadroomMode === "proxy") {
+          if (headroomCfg.enabled && effectiveHeadroomMode === "proxy") {
             // Pre-compute the wire format for the built-in OpenAI provider so we
             // can gate: chat-completions is proxy-safe, Responses/WebSocket is not.
             const openaiWireFormat = muxProviderOptions?.openai?.wireFormat ?? "responses";
