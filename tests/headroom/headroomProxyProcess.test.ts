@@ -17,7 +17,8 @@ jest.mock("node:child_process", () => ({
   spawn: (...args: unknown[]) => mockSpawn(...args),
 }));
 
-import { HeadroomProxyProcess, applyAdvanced } from "@/node/services/headroom/headroomProxyProcess";
+import { HeadroomProxyProcess } from "@/node/services/headroom/headroomProxyProcess";
+import { applyAdvanced } from "@/common/config/headroomProxyCommand";
 import { HEADROOM_ADVANCED_DEFAULTS } from "@/common/config/schemas/headroom";
 
 function makeFakeChild(portOutput?: string, immediateExit?: number) {

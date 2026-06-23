@@ -872,7 +872,7 @@ export class ServiceContainer {
 
     // Stop the headroom proxy process (kills the spawned child + process tree).
     try {
-      this.headroomService.stop();
+      await this.headroomService.stop();
     } catch (error: unknown) {
       log.warn("[headroom] stop() failed during dispose", { error });
     }

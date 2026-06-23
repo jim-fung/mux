@@ -51,6 +51,8 @@ export interface HeadroomStats {
 const COMPRESS_TIMEOUT_MS = 15_000;
 /** Short timeout for health checks during startup polling. */
 const HEALTH_TIMEOUT_MS = 3_000;
+/** Short timeout for stats fetches (a wedged proxy must not hang the UI). */
+const STATS_TIMEOUT_MS = 3_000;
 
 function withTimeout(timeoutMs: number): { signal: AbortSignal } {
   const controller = new AbortController();
@@ -111,7 +113,9 @@ export class HeadroomClient {
 
   /** GET /stats — detailed statistics. */
   async stats(): Promise<HeadroomStats> {
-    const res = await fetch(`${this.baseUrl}/stats`);
+    const res = await fetch(`${this.baseUrl}/stats`, {
+      ...withTimeout(STATS_TIMEOUT_MS),
+    });
     if (!res.ok) {
       throw new Error(`Headroom stats failed: ${res.status}`);
     }

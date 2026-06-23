@@ -224,7 +224,20 @@ export function createHeadroomCompressMiddleware(
 
         const result = await client.compress(openaiMessages, options.modelId);
 
-        if (!Array.isArray(result.messages) || result.messages.length === 0) {
+        if (
+          !Array.isArray(result.messages) ||
+          // The proxy must return exactly one compressed message per message we
+          // sent; a length mismatch would shift applyCompressedToV3's positional
+          // cursor and write compressed text into the wrong message. Bail
+          // (fail-open) rather than silently mis-align.
+          result.messages.length !== openaiMessages.length
+        ) {
+          if (Array.isArray(result.messages) && result.messages.length !== openaiMessages.length) {
+            log.warn("[headroom] compress returned a different message count; skipping", {
+              sent: openaiMessages.length,
+              received: result.messages.length,
+            });
+          }
           return params;
         }
 
@@ -248,9 +261,13 @@ export function createHeadroomCompressMiddleware(
         }
 
         return { ...params, prompt: compressedPrompt };
-      } catch {
+      } catch (err) {
         // Fail-open: never block the request. The proxy may be down or slow;
         // the user's chat must continue with the original (uncompressed) prompt.
+        // Logged at debug so transient degradation is observable without noise.
+        log.debug("[headroom] compression failed; sending uncompressed prompt", {
+          error: String(err),
+        });
         return params;
       }
     },

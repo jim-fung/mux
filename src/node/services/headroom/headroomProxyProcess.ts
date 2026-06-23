@@ -8,6 +8,7 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
+import { createServer } from "node:net";
 import { log } from "@/node/services/log";
 import {
   type HeadroomAdvancedConfig,
@@ -19,6 +20,8 @@ import { HeadroomClient } from "./headroomClient";
 const STARTUP_TIMEOUT_MS = 30_000;
 /** Interval between health-check polls during startup. */
 const HEALTH_POLL_INTERVAL_MS = 1_000;
+/** Grace period (ms) after SIGTERM before escalating to SIGKILL on stop(). */
+const SIGKILL_GRACE_MS = 3_000;
 
 export interface StartProxyOptions {
   headroomPath: string;
@@ -33,6 +36,11 @@ export interface StartProxyOptions {
   anthropicBaseUrl?: string;
   /** Fine-grained proxy knobs from the Advanced settings panel. */
   advanced?: HeadroomAdvancedConfig;
+  /**
+   * Invoked once if the proxy exits unexpectedly after a healthy start (a crash,
+   * not an intentional stop()). Used by HeadroomService to relaunch.
+   */
+  onUnexpectedExit?: () => void;
 }
 
 export interface ProxyProcessInfo {
@@ -48,6 +56,14 @@ export class HeadroomProxyProcess {
   /** Set when the process exits before health-check succeeds. Survives child
    *  nulling by the exit handler so waitForHealth can detect the crash. */
   private startupExited = false;
+  /** True between a successful health-check and the next exit — distinguishes a
+   *  post-startup crash (worth auto-restarting) from a startup failure. */
+  private healthy = false;
+  /** True once stop() has been called, so the exit handler can tell an
+   *  intentional shutdown apart from an unexpected crash. */
+  private intentionallyStopped = false;
+  /** Crash callback supplied via start(); fired once on an unexpected exit. */
+  private onUnexpectedExit?: () => void;
 
   get isRunning(): boolean {
     return this.child != null && !this.child.killed;
@@ -72,36 +88,38 @@ export class HeadroomProxyProcess {
     }
 
     this.startupExited = false;
+    this.healthy = false;
+    this.intentionallyStopped = false;
+    this.onUnexpectedExit = options.onUnexpectedExit;
 
-    const port = options.port ?? 0; // 0 = random ephemeral port (headroom picks one)
-    // headroom uses --port to bind a specific port; for a random port we pass 0.
-    const actualPort = port === 0 ? 0 : port;
+    // Allocate a free loopback port ourselves and pass it to headroom explicitly.
+    // This avoids scraping the proxy's stdout for the bound port (brittle if headroom
+    // changes its log format); an explicit --port also makes detectPort trivial.
+    const requested = options.port;
+    const actualPort = requested && requested > 0 ? requested : await getFreePort();
 
-    const args = ["proxy", "--host", "127.0.0.1", "--port", String(actualPort)];
-    if (!options.telemetry) {
-      args.push("--no-telemetry");
-    }
-
-    const env: NodeJS.ProcessEnv = { ...process.env };
-    if (options.outputShaper) {
-      env.HEADROOM_OUTPUT_SHAPER = "1";
-    }
-    if (options.memoryEnabled) {
-      env.HEADROOM_MEMORY_ENABLED = "1";
-    }
-    // Pass real upstream URLs so the proxy forwards to the correct endpoint
-    // (defaults to api.openai.com / api.anthropic.com when not set).
+    // buildProxyCommand is the single source of truth for the headroom argv + env
+    // deltas — the previewCommand endpoint reuses it so the UI can never drift.
+    const cmd = buildProxyCommand(
+      {
+        telemetry: options.telemetry ?? false,
+        outputShaper: options.outputShaper ?? false,
+        memoryEnabled: options.memoryEnabled ?? false,
+        advanced: options.advanced ?? HEADROOM_ADVANCED_DEFAULTS,
+      },
+      String(actualPort)
+    );
+    const args = cmd.argv;
+    const env: NodeJS.ProcessEnv = { ...process.env, ...cmd.env };
+    // Real upstream URLs so the proxy forwards to the correct endpoint (defaults to
+    // api.openai.com / api.anthropic.com when not set). These are runtime targets,
+    // not part of the previewable spec, so they stay here rather than buildProxyCommand.
     if (options.openaiTargetUrl) {
       env.OPENAI_TARGET_API_URL = options.openaiTargetUrl;
     }
     if (options.anthropicBaseUrl) {
       env.ANTHROPIC_BASE_URL = options.anthropicBaseUrl;
     }
-    if (!options.telemetry) {
-      env.HEADROOM_TELEMETRY = "off";
-    }
-
-    applyAdvanced(args, env, options.advanced ?? HEADROOM_ADVANCED_DEFAULTS);
 
     log.info("[headroom] spawning proxy", { headroomPath: options.headroomPath, port: actualPort });
 
@@ -120,6 +138,7 @@ export class HeadroomProxyProcess {
 
     // Health-check until ready.
     await this.waitForHealth();
+    this.healthy = true;
     log.info("[headroom] proxy healthy", { baseUrl: this.baseUrl });
 
     return {
@@ -186,10 +205,21 @@ export class HeadroomProxyProcess {
     if (!this.child) return;
     const onExit = (code: number | null) => {
       log.info("[headroom] proxy process exited", { code });
+      const wasHealthy = this.healthy;
       this.startupExited = true;
+      this.healthy = false;
       this.child = null;
       this.baseUrl = null;
       this.port = null;
+      // Only treat as a crash if the proxy had become healthy AND this wasn't an
+      // intentional stop(). Fires once (state is nulled above).
+      if (wasHealthy && !this.intentionallyStopped && this.onUnexpectedExit) {
+        try {
+          this.onUnexpectedExit();
+        } catch (err) {
+          log.warn("[headroom] unexpected-exit callback threw", { error: String(err) });
+        }
+      }
     };
     this.child.on("exit", onExit);
     this.child.on("error", (err) => {
@@ -204,18 +234,24 @@ export class HeadroomProxyProcess {
     });
   }
 
-  /** Kill the proxy process tree. Safe to call multiple times. */
-  stop(): void {
+  /**
+   * Stop the proxy: SIGTERM the process group, then escalate to SIGKILL if it
+   * hasn't exited within a short grace window. Safe to call multiple times.
+   * Marked intentionallyStopped so the exit handler doesn't treat this as a crash.
+   */
+  async stop(): Promise<void> {
     const child = this.child;
     if (!child) return;
+    const pid = child.pid;
 
-    log.info("[headroom] stopping proxy", { pid: child.pid });
+    this.intentionallyStopped = true;
+    log.info("[headroom] stopping proxy", { pid });
 
     try {
       // Kill the process group (detached: true means we can send to -pid).
-      if (child.pid != null) {
+      if (pid != null) {
         try {
-          process.kill(-child.pid, "SIGTERM");
+          process.kill(-pid, "SIGTERM");
         } catch {
           // Fallback to killing just the process if the group kill fails.
           child.kill("SIGTERM");
@@ -225,6 +261,22 @@ export class HeadroomProxyProcess {
       log.warn("[headroom] error during proxy stop", { error: String(err) });
     }
 
+    // Give the proxy a moment to exit gracefully, then force-kill the group.
+    const exited = await waitForExit(child, SIGKILL_GRACE_MS);
+    if (!exited && pid != null) {
+      log.warn("[headroom] proxy did not exit on SIGTERM; sending SIGKILL", { pid });
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // Already gone — nothing to do.
+        }
+      }
+    }
+
+    this.healthy = false;
     this.child = null;
     this.baseUrl = null;
     this.port = null;
@@ -235,57 +287,46 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/**
- * Map the Advanced settings block onto headroom proxy CLI flags + env vars.
- *
- * Flags are only pushed when the value DEVIATES from the Headroom default (the
- * proxy defaults already match our schema defaults), so default config produces a
- * clean proxy invocation with no noise.
- *
- * SECURITY AUDIT: customEnv / extraArgs are applied LAST so power-user overrides
- * win. The spawn uses an argv array (no shell), so there is no shell-injection
- * vector — values are passed verbatim to the headroom process. customEnv CAN set
- * upstream URLs / API keys; this is the intentional power-user surface and is
- * documented in the Advanced panel.
- */
-export function applyAdvanced(
-  args: string[],
-  env: NodeJS.ProcessEnv,
-  adv: HeadroomAdvancedConfig
-): void {
-  // Context-management toggles (push only the negation flag when disabled).
-  if (!adv.intelligentContext) args.push("--no-intelligent-context");
-  if (!adv.intelligentScoring) args.push("--no-intelligent-scoring");
-  if (!adv.compressFirst) args.push("--no-compress-first");
-
-  // Compression / cache toggles.
-  if (!adv.optimize) args.push("--no-optimize");
-  if (!adv.semanticCache) args.push("--no-cache");
-
-  // LLMLingua ML compression.
-  if (adv.llmlingua) {
-    args.push(
-      "--llmlingua",
-      "--llmlingua-device",
-      adv.llmlinguaDevice,
-      "--llmlingua-rate",
-      String(adv.llmlinguaRate)
-    );
-  }
-
-  // Daily budget cap (USD).
-  if (adv.budgetUsd != null) {
-    args.push("--budget", String(adv.budgetUsd));
-  }
-
-  // Env-only knobs.
-  if (adv.outputHoldout > 0) env.HEADROOM_OUTPUT_HOLDOUT = String(adv.outputHoldout);
-  env.HEADROOM_CONTEXT_TOOL = adv.contextTool;
-  env.HEADROOM_LOG_LEVEL = adv.logLevel;
-
-  // Power-user overrides — applied last so they take precedence over everything above.
-  for (const [key, value] of Object.entries(adv.customEnv)) {
-    env[key] = value;
-  }
-  args.push(...adv.extraArgs);
+/** Reserve an ephemeral loopback port by briefly listening, then releasing it. */
+function getFreePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = createServer();
+    server.unref();
+    server.on("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      if (addr == null || typeof addr === "string") {
+        server.close();
+        reject(new Error("Could not allocate a free port for the headroom proxy"));
+        return;
+      }
+      const port = addr.port;
+      server.close(() => resolve(port));
+    });
+  });
 }
+
+/** Resolve true once `child` exits, or false after `timeoutMs` with no exit. */
+function waitForExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    // Already exited.
+    if (child.exitCode != null || child.signalCode != null) {
+      resolve(true);
+      return;
+    }
+    const timer = setTimeout(() => resolve(false), timeoutMs);
+    // `.once` auto-removes on exit; resolve is idempotent so a late exit after a
+    // timeout (we then SIGKILL) is harmless.
+    child.once("exit", () => {
+      clearTimeout(timer);
+      resolve(true);
+    });
+  });
+}
+
+// Re-exported for callers that import the proxy command builder from the headroom
+// service surface. The canonical definition lives in src/common (shared with the
+// browser preview + previewCommand IPC endpoint) so the live spawn can never drift
+// from the preview.
+export { buildProxyCommand, type ProxyCommandSpec } from "@/common/config/headroomProxyCommand";
+import { buildProxyCommand } from "@/common/config/headroomProxyCommand";
