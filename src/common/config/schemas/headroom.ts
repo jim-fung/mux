@@ -24,6 +24,67 @@ export const HeadroomModeSchema = z.enum(["off", "middleware", "proxy"]);
 
 export type HeadroomMode = z.infer<typeof HeadroomModeSchema>;
 
+/**
+ * Fine-grained proxy settings surfaced in the Settings "Advanced" panel.
+ *
+ * These map 1:1 to real headroom proxy CLI flags / env vars (verified from the
+ * official Proxy + Configuration docs). Headroom's named per-algorithm weights
+ * (SmartCrusher / CacheAligner / IntelligentContext ScoringWeights) are
+ * library/SDK-only and cannot be driven through the proxy, so they are NOT here;
+ * power users can reach anything via customEnv / extraArgs.
+ */
+export const HeadroomAdvancedConfigSchema = z.object({
+  /** --no-intelligent-context disables it; default true uses IntelligentContextManager. */
+  intelligentContext: z.boolean().default(true),
+  /** --no-intelligent-scoring disables multi-factor importance scoring. */
+  intelligentScoring: z.boolean().default(true),
+  /** --no-compress-first skips trying deeper compression before dropping messages. */
+  compressFirst: z.boolean().default(true),
+  /** --no-optimize disables optimization entirely (passthrough mode). */
+  optimize: z.boolean().default(true),
+  /** --no-cache disables semantic caching. */
+  semanticCache: z.boolean().default(true),
+  /** --llmlingua enables LLMLingua-2 ML compression (~2GB, ~1GB RAM, 10-30s cold start). */
+  llmlingua: z.boolean().default(false),
+  /** --llmlingua-device auto|cuda|cpu|mps. */
+  llmlinguaDevice: z.enum(["auto", "cuda", "cpu", "mps"]).default("auto"),
+  /** --llmlingua-rate: fraction to KEEP (0-1, e.g. 0.3 keeps 30%). */
+  llmlinguaRate: z.number().min(0).max(1).default(0.3),
+  /** --budget: daily spend cap in USD (null = no cap). */
+  budgetUsd: z.number().nullable().default(null),
+  /** HEADROOM_OUTPUT_HOLDOUT: fraction (0-1) of conversations left unshaped as control. */
+  outputHoldout: z.number().min(0).max(1).default(0),
+  /** HEADROOM_CONTEXT_TOOL: rtk (default) or lean-ctx. */
+  contextTool: z.enum(["rtk", "lean-ctx"]).default("rtk"),
+  /** HEADROOM_LOG_LEVEL. */
+  logLevel: z.enum(["DEBUG", "INFO", "WARNING", "ERROR"]).default("INFO"),
+  /** Free-form KEY=VALUE env overrides applied last (power users win). Applied via
+   *  argv-less spawn, so values are passed through as-is (no shell expansion). */
+  customEnv: z.record(z.string(), z.string()).default({}),
+  /** Extra CLI args appended verbatim to the headroom proxy command (for future flags). */
+  extraArgs: z.array(z.string()).default([]),
+});
+
+export type HeadroomAdvancedConfig = z.infer<typeof HeadroomAdvancedConfigSchema>;
+
+/** All advanced defaults populated explicitly (avoids TS2769 on nested .default()). */
+export const HEADROOM_ADVANCED_DEFAULTS: HeadroomAdvancedConfig = {
+  intelligentContext: true,
+  intelligentScoring: true,
+  compressFirst: true,
+  optimize: true,
+  semanticCache: true,
+  llmlingua: false,
+  llmlinguaDevice: "auto",
+  llmlinguaRate: 0.3,
+  budgetUsd: null,
+  outputHoldout: 0,
+  contextTool: "rtk",
+  logLevel: "INFO",
+  customEnv: {},
+  extraArgs: [],
+};
+
 export const HeadroomConfigSchema = z.object({
   /** Master switch. When false, no proxy is started and no middleware is attached. */
   enabled: z.boolean().default(false),
@@ -51,6 +112,8 @@ export const HeadroomConfigSchema = z.object({
       enabled: z.boolean().default(false),
     })
     .default({ enabled: false }),
+  /** Fine-grained proxy knobs surfaced in the Advanced settings panel. */
+  advanced: HeadroomAdvancedConfigSchema.default(HEADROOM_ADVANCED_DEFAULTS),
 });
 
 export type HeadroomConfig = z.infer<typeof HeadroomConfigSchema>;
