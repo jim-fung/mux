@@ -17,6 +17,19 @@ jest.mock("node:child_process", () => ({
   spawn: (...args: unknown[]) => mockSpawn(...args),
 }));
 
+// getFreePort() opens a real socket via node:net — mock it so the port-0 path is
+// deterministic (the production code allocates the port itself now, then passes it
+// to headroom explicitly rather than scraping stdout).
+jest.mock("node:net", () => ({
+  createServer: () => ({
+    unref: () => {},
+    on: () => {},
+    listen: (_port: number, _host: string, cb: () => void) => cb(),
+    address: () => ({ port: 9123 }),
+    close: (cb: () => void) => cb?.(),
+  }),
+}));
+
 import { HeadroomProxyProcess } from "@/node/services/headroom/headroomProxyProcess";
 import { applyAdvanced } from "@/common/config/headroomProxyCommand";
 import { HEADROOM_ADVANCED_DEFAULTS } from "@/common/config/schemas/headroom";
@@ -37,6 +50,11 @@ function makeFakeChild(portOutput?: string, immediateExit?: number) {
       if (immediateExit != null && event === "exit") {
         setTimeout(() => cb(immediateExit), 5);
       }
+    },
+    // once is used by waitForExit / stop(); alias to on so the lifecycle tests
+    // exercise the real stop() path instead of crashing on a missing method.
+    once: (event: string, cb: (...a: unknown[]) => void) => {
+      (handlers[event] ??= []).push(cb);
     },
     kill: jest.fn(),
     killed: false,
@@ -86,8 +104,8 @@ describe("HeadroomProxyProcess", () => {
     );
   });
 
-  it("detects the port from stdout when port is 0", async () => {
-    const { child } = makeFakeChild("Starting headroom proxy on port 9123");
+  it("allocates a free loopback port when port is 0", async () => {
+    const { child } = makeFakeChild();
     mockSpawn.mockReturnValue(child);
     mockFetch.mockResolvedValue({
       ok: true,
@@ -99,7 +117,7 @@ describe("HeadroomProxyProcess", () => {
     const info = await proxy.start({ headroomPath: "/fake/headroom", port: 0 });
 
     expect(info.port).toBe(9123);
-    proxy.stop();
+    await proxy.stop();
   });
 
   it("stop() is safe to call when not running", () => {
@@ -120,8 +138,8 @@ describe("HeadroomProxyProcess", () => {
 
     const proxy = new HeadroomProxyProcess();
     await proxy.start({ headroomPath: "/fake/headroom", port: 8787 });
-    proxy.stop();
-    proxy.stop(); // second call is a no-op
+    await proxy.stop();
+    await proxy.stop(); // second call is a no-op
     expect(proxy.isRunning).toBe(false);
   });
 

@@ -21,7 +21,14 @@ type Story = StoryObj<typeof meta>;
  * headroom namespace, so stories inject one here to exercise the panel with
  * realistic status data.
  */
-function mockHeadroomApi(status: Record<string, unknown>): APIClient["headroom"] {
+function mockHeadroomApi(
+  status: Record<string, unknown>,
+  workspaceOverrides: Array<{
+    workspaceId: string;
+    title: string | null;
+    override: Record<string, unknown>;
+  }> = []
+): APIClient["headroom"] {
   const full = {
     enabled: true,
     installed: true,
@@ -58,7 +65,7 @@ function mockHeadroomApi(status: Record<string, unknown>): APIClient["headroom"]
     registerMcp: () => Promise.resolve({ success: false, command: null }),
     installLlmlingua: () => Promise.resolve({ success: true, message: "" }),
     previewCommand: () => Promise.resolve({ argv: ["proxy", "--host", "127.0.0.1"], env: {} }),
-    listWorkspaceHeadroomOverrides: () => Promise.resolve([]),
+    listWorkspaceHeadroomOverrides: () => Promise.resolve(workspaceOverrides),
     getWorkspaceHeadroom: () => Promise.resolve(null),
     setWorkspaceHeadroom: () => Promise.resolve(undefined),
     clearWorkspaceHeadroom: () => Promise.resolve(undefined),
@@ -66,8 +73,11 @@ function mockHeadroomApi(status: Record<string, unknown>): APIClient["headroom"]
 }
 
 /** Setup a settings client with a headroom namespace injected. */
-function setupHeadroomStory(status: Record<string, unknown>): APIClient {
-  return { ...setupSettingsStory({}), headroom: mockHeadroomApi(status) };
+function setupHeadroomStory(
+  status: Record<string, unknown>,
+  workspaceOverrides?: Parameters<typeof mockHeadroomApi>[1]
+): APIClient {
+  return { ...setupSettingsStory({}), headroom: mockHeadroomApi(status, workspaceOverrides) };
 }
 
 /**
@@ -109,6 +119,50 @@ export const AdvancedPanel: Story = {
   },
 };
 
+/** All-null sparse override shape reused across stories. */
+const SPARSE_NULL = {
+  enabled: null,
+  mode: null,
+  perProvider: null,
+  outputShaper: null,
+  telemetry: null,
+  memoryEnabled: null,
+  includeMl: null,
+  advanced: null,
+};
+
+/**
+ * The Per-workspace overrides overview with two seeded workspaces. Verifies the
+ * list renders populated entries so global Settings stays the single overview.
+ */
+export const WorkspaceOverrides: Story = {
+  render: () => (
+    <SettingsSectionStory
+      setup={() =>
+        setupHeadroomStory({}, [
+          {
+            workspaceId: "ws1",
+            title: "feature/auth",
+            override: Object.assign({}, SPARSE_NULL, { enabled: false }),
+          },
+          {
+            workspaceId: "ws2",
+            title: "bugfix/cache",
+            override: Object.assign({}, SPARSE_NULL, { mode: "proxy" }),
+          },
+        ])
+      }
+    >
+      <HeadroomSection />
+    </SettingsSectionStory>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByText("Per-workspace overrides");
+    await canvas.findByText("feature/auth");
+    await canvas.findByText("bugfix/cache");
+  },
+};
 /** Fixed-width decorator forcing a phone-width render (test-runner ignores
  *  chromatic modes + globals.viewport, so the play must force narrow itself). */
 function PhoneWidthDecorator(Story: ComponentType) {
