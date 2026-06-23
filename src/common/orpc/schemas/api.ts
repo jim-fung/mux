@@ -14,6 +14,7 @@ import {
   SendMessageErrorSchema,
 } from "./errors";
 import { BranchListResultSchema, FilePartSchema, MuxMessageSchema } from "./message";
+import { HeadroomAdvancedConfigSchema } from "@/common/config/schemas/headroom";
 import {
   GoalClearInputSchema,
   GoalBoardAddUpcomingInputSchema,
@@ -942,6 +943,14 @@ export const headroom = {
       port: z.number().nullable(),
       runtimeMethod: z.enum(["uv", "python3-venv", "none"]),
       lastError: z.string().nullable(),
+      mode: z.string(),
+      autoProvision: z.boolean(),
+      includeMl: z.boolean(),
+      outputShaper: z.boolean(),
+      telemetry: z.boolean(),
+      memoryEnabled: z.boolean(),
+      perProvider: z.record(z.string(), z.string()),
+      advanced: HeadroomAdvancedConfigSchema,
     }),
   },
   getStats: {
@@ -965,6 +974,14 @@ export const headroom = {
       port: z.number().nullable(),
       runtimeMethod: z.enum(["uv", "python3-venv", "none"]),
       lastError: z.string().nullable(),
+      mode: z.string(),
+      autoProvision: z.boolean(),
+      includeMl: z.boolean(),
+      outputShaper: z.boolean(),
+      telemetry: z.boolean(),
+      memoryEnabled: z.boolean(),
+      perProvider: z.record(z.string(), z.string()),
+      advanced: HeadroomAdvancedConfigSchema,
     }),
   },
   restart: {
@@ -978,6 +995,32 @@ export const headroom = {
       port: z.number().nullable(),
       runtimeMethod: z.enum(["uv", "python3-venv", "none"]),
       lastError: z.string().nullable(),
+      mode: z.string(),
+      autoProvision: z.boolean(),
+      includeMl: z.boolean(),
+      outputShaper: z.boolean(),
+      telemetry: z.boolean(),
+      memoryEnabled: z.boolean(),
+      perProvider: z.record(z.string(), z.string()),
+      advanced: HeadroomAdvancedConfigSchema,
+    }),
+  },
+  learn: {
+    input: z.object({ apply: z.boolean().default(false) }),
+    output: z.object({ output: z.string() }),
+  },
+  installLlmlingua: {
+    input: z.void(),
+    output: z.object({
+      success: z.boolean(),
+      message: z.string(),
+    }),
+  },
+  registerMcp: {
+    input: z.void(),
+    output: z.object({
+      success: z.boolean(),
+      command: z.string().nullable(),
     }),
   },
   setConfig: {
@@ -985,11 +1028,13 @@ export const headroom = {
       enabled: z.boolean().nullish(),
       autoProvision: z.boolean().nullish(),
       mode: z.enum(["off", "middleware", "proxy"]).nullish(),
+      perProvider: z.record(z.string(), z.enum(["off", "middleware", "proxy"])).nullish(),
       includeMl: z.boolean().nullish(),
       proxyBaseUrl: z.string().nullable().nullish(),
       telemetry: z.boolean().nullish(),
       outputShaper: z.boolean().nullish(),
       memoryEnabled: z.boolean().nullish(),
+      advanced: HeadroomAdvancedConfigSchema.nullish(),
     }),
     output: z.void(),
   },

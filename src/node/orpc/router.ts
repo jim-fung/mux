@@ -70,6 +70,7 @@ import {
   normalizeLayoutPresetsConfig,
 } from "@/common/types/uiLayouts";
 import { normalizeUserPreferences } from "@/common/config/schemas/userPreferences";
+import { HEADROOM_ADVANCED_DEFAULTS } from "@/common/config/schemas/headroom";
 import { normalizeAgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { isValidModelFormat, normalizeSelectedModel } from "@/common/utils/ai/models";
 import { sanitizeModelFallbacks } from "@/common/utils/ai/modelFallbacks";
@@ -2746,6 +2747,14 @@ export const router = (authToken?: string) => {
             port: status.port,
             runtimeMethod: status.runtimeMethod,
             lastError: status.lastError,
+            mode: status.mode,
+            autoProvision: status.autoProvision,
+            includeMl: status.includeMl,
+            outputShaper: status.outputShaper,
+            telemetry: status.telemetry,
+            memoryEnabled: status.memoryEnabled,
+            perProvider: status.perProvider,
+            advanced: status.advanced,
           };
         }),
       getStats: t
@@ -2775,6 +2784,14 @@ export const router = (authToken?: string) => {
             port: status.port,
             runtimeMethod: status.runtimeMethod,
             lastError: status.lastError,
+            mode: status.mode,
+            autoProvision: status.autoProvision,
+            includeMl: status.includeMl,
+            outputShaper: status.outputShaper,
+            telemetry: status.telemetry,
+            memoryEnabled: status.memoryEnabled,
+            perProvider: status.perProvider,
+            advanced: status.advanced,
           };
         }),
       restart: t
@@ -2791,7 +2808,43 @@ export const router = (authToken?: string) => {
             port: status.port,
             runtimeMethod: status.runtimeMethod,
             lastError: status.lastError,
+            mode: status.mode,
+            autoProvision: status.autoProvision,
+            includeMl: status.includeMl,
+            outputShaper: status.outputShaper,
+            telemetry: status.telemetry,
+            memoryEnabled: status.memoryEnabled,
+            perProvider: status.perProvider,
+            advanced: status.advanced,
           };
+        }),
+      learn: t
+        .input(schemas.headroom.learn.input)
+        .output(schemas.headroom.learn.output)
+        .handler(async ({ context, input }) => {
+          const output = await context.headroomService.learn(input.apply);
+          return { output };
+        }),
+      installLlmlingua: t
+        .input(schemas.headroom.installLlmlingua.input)
+        .output(schemas.headroom.installLlmlingua.output)
+        .handler(async ({ context }) => {
+          return context.headroomService.installLlmlingua();
+        }),
+      registerMcp: t
+        .input(schemas.headroom.registerMcp.input)
+        .output(schemas.headroom.registerMcp.output)
+        .handler(async ({ context }) => {
+          const config = context.headroomService.getMcpServerConfig();
+          if (!config) {
+            return { success: false, command: null };
+          }
+          // Register as a global MCP server (stdio transport).
+          await context.mcpConfigService.addServer("headroom", {
+            transport: "stdio",
+            command: config.command,
+          });
+          return { success: true, command: config.command };
         }),
       setConfig: t
         .input(schemas.headroom.setConfig.input)
@@ -2808,6 +2861,7 @@ export const router = (authToken?: string) => {
               telemetry: false,
               outputShaper: false,
               memory: { enabled: false },
+              advanced: HEADROOM_ADVANCED_DEFAULTS,
             };
             const updated = { ...current };
             if (input.enabled != null) updated.enabled = input.enabled;
@@ -2819,6 +2873,12 @@ export const router = (authToken?: string) => {
             if (input.outputShaper != null) updated.outputShaper = input.outputShaper;
             if (input.memoryEnabled != null) {
               updated.memory = { ...updated.memory, enabled: input.memoryEnabled };
+            }
+            if (input.perProvider != null) {
+              updated.perProvider = input.perProvider;
+            }
+            if (input.advanced != null) {
+              updated.advanced = input.advanced;
             }
             config.headroom = updated;
             return config;
