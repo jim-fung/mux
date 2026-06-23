@@ -9,6 +9,10 @@
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { log } from "@/node/services/log";
+import {
+  type HeadroomAdvancedConfig,
+  HEADROOM_ADVANCED_DEFAULTS,
+} from "@/common/config/schemas/headroom";
 import { HeadroomClient } from "./headroomClient";
 
 /** Max time to wait for the proxy to become healthy after spawn. */
@@ -22,6 +26,13 @@ export interface StartProxyOptions {
   port?: number;
   telemetry?: boolean;
   outputShaper?: boolean;
+  memoryEnabled?: boolean;
+  /** Real upstream OpenAI API URL (for custom gateways/self-hosted). */
+  openaiTargetUrl?: string;
+  /** Real upstream Anthropic API URL (for custom gateways/self-hosted). */
+  anthropicBaseUrl?: string;
+  /** Fine-grained proxy knobs from the Advanced settings panel. */
+  advanced?: HeadroomAdvancedConfig;
 }
 
 export interface ProxyProcessInfo {
@@ -34,6 +45,9 @@ export class HeadroomProxyProcess {
   private child: ChildProcess | null = null;
   private baseUrl: string | null = null;
   private port: number | null = null;
+  /** Set when the process exits before health-check succeeds. Survives child
+   *  nulling by the exit handler so waitForHealth can detect the crash. */
+  private startupExited = false;
 
   get isRunning(): boolean {
     return this.child != null && !this.child.killed;
@@ -57,6 +71,8 @@ export class HeadroomProxyProcess {
       throw new Error("Proxy process already running");
     }
 
+    this.startupExited = false;
+
     const port = options.port ?? 0; // 0 = random ephemeral port (headroom picks one)
     // headroom uses --port to bind a specific port; for a random port we pass 0.
     const actualPort = port === 0 ? 0 : port;
@@ -70,9 +86,22 @@ export class HeadroomProxyProcess {
     if (options.outputShaper) {
       env.HEADROOM_OUTPUT_SHAPER = "1";
     }
+    if (options.memoryEnabled) {
+      env.HEADROOM_MEMORY_ENABLED = "1";
+    }
+    // Pass real upstream URLs so the proxy forwards to the correct endpoint
+    // (defaults to api.openai.com / api.anthropic.com when not set).
+    if (options.openaiTargetUrl) {
+      env.OPENAI_TARGET_API_URL = options.openaiTargetUrl;
+    }
+    if (options.anthropicBaseUrl) {
+      env.ANTHROPIC_BASE_URL = options.anthropicBaseUrl;
+    }
     if (!options.telemetry) {
       env.HEADROOM_TELEMETRY = "off";
     }
+
+    applyAdvanced(args, env, options.advanced ?? HEADROOM_ADVANCED_DEFAULTS);
 
     log.info("[headroom] spawning proxy", { headroomPath: options.headroomPath, port: actualPort });
 
@@ -138,7 +167,7 @@ export class HeadroomProxyProcess {
     const deadline = Date.now() + STARTUP_TIMEOUT_MS;
 
     while (true) {
-      if (this.child?.killed || this.child?.exitCode != null) {
+      if (this.startupExited || this.child?.killed || this.child?.exitCode != null) {
         throw new Error("Proxy process exited during startup");
       }
       if (Date.now() > deadline) {
@@ -157,6 +186,7 @@ export class HeadroomProxyProcess {
     if (!this.child) return;
     const onExit = (code: number | null) => {
       log.info("[headroom] proxy process exited", { code });
+      this.startupExited = true;
       this.child = null;
       this.baseUrl = null;
       this.port = null;
@@ -203,4 +233,59 @@ export class HeadroomProxyProcess {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Map the Advanced settings block onto headroom proxy CLI flags + env vars.
+ *
+ * Flags are only pushed when the value DEVIATES from the Headroom default (the
+ * proxy defaults already match our schema defaults), so default config produces a
+ * clean proxy invocation with no noise.
+ *
+ * SECURITY AUDIT: customEnv / extraArgs are applied LAST so power-user overrides
+ * win. The spawn uses an argv array (no shell), so there is no shell-injection
+ * vector — values are passed verbatim to the headroom process. customEnv CAN set
+ * upstream URLs / API keys; this is the intentional power-user surface and is
+ * documented in the Advanced panel.
+ */
+export function applyAdvanced(
+  args: string[],
+  env: NodeJS.ProcessEnv,
+  adv: HeadroomAdvancedConfig
+): void {
+  // Context-management toggles (push only the negation flag when disabled).
+  if (!adv.intelligentContext) args.push("--no-intelligent-context");
+  if (!adv.intelligentScoring) args.push("--no-intelligent-scoring");
+  if (!adv.compressFirst) args.push("--no-compress-first");
+
+  // Compression / cache toggles.
+  if (!adv.optimize) args.push("--no-optimize");
+  if (!adv.semanticCache) args.push("--no-cache");
+
+  // LLMLingua ML compression.
+  if (adv.llmlingua) {
+    args.push(
+      "--llmlingua",
+      "--llmlingua-device",
+      adv.llmlinguaDevice,
+      "--llmlingua-rate",
+      String(adv.llmlinguaRate)
+    );
+  }
+
+  // Daily budget cap (USD).
+  if (adv.budgetUsd != null) {
+    args.push("--budget", String(adv.budgetUsd));
+  }
+
+  // Env-only knobs.
+  if (adv.outputHoldout > 0) env.HEADROOM_OUTPUT_HOLDOUT = String(adv.outputHoldout);
+  env.HEADROOM_CONTEXT_TOOL = adv.contextTool;
+  env.HEADROOM_LOG_LEVEL = adv.logLevel;
+
+  // Power-user overrides — applied last so they take precedence over everything above.
+  for (const [key, value] of Object.entries(adv.customEnv)) {
+    env[key] = value;
+  }
+  args.push(...adv.extraArgs);
 }

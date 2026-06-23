@@ -171,6 +171,65 @@ export function provisionHeadroom(options: ProvisionOptions = {}): Promise<Provi
   });
 }
 
+/**
+ * Install an additional headroom-ai extra (e.g. llmlingua) into the existing
+ * venv. Does NOT recreate the venv — used for lazy installs from the Advanced
+ * panel (LLMLingua toggle). Idempotent: pip is a no-op if already installed.
+ *
+ * @param extra Extra name, e.g. llmlingua or ml. Becomes headroom-ai[<extra>].
+ * @param onProgress Progress callback for UI display.
+ * @throws if headroom isn't installed yet or the runtime is unavailable.
+ */
+export function installHeadroomExtra(
+  extra: string,
+  onProgress: (message: string) => void = () => undefined
+): Promise<void> {
+  const venvPath = getHeadroomVenvPath();
+  return new Promise<void>((resolve, reject) => {
+    if (!isHeadroomInstalled(venvPath)) {
+      reject(new Error("Headroom is not installed yet. Provision it first."));
+      return;
+    }
+    const method = resolveProvisioningMethod();
+    if (method === "none") {
+      reject(new Error("Neither 'uv' nor 'python3' found on PATH."));
+      return;
+    }
+
+    const pkg = "headroom-ai[" + extra + "]";
+    const label = "Installing " + pkg + " with " + method;
+    onProgress(label);
+    log.info("[headroom] installing extra", { extra, method });
+
+    const cmd =
+      method === "uv"
+        ? { binary: "uv", args: ["pip", "install", "--python", venvPath, pkg] }
+        : {
+            binary:
+              process.platform === "win32"
+                ? path.join(venvPath, "Scripts", "pip.exe")
+                : path.join(venvPath, "bin", "pip"),
+            args: ["install", pkg],
+          };
+
+    const child = spawn(cmd.binary, cmd.args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env },
+    });
+    collectOutput(child, label);
+    child.on("close", (code) => {
+      if (code === 0) {
+        log.info("[headroom] extra install complete", { extra });
+        onProgress("Done");
+        resolve();
+      } else {
+        reject(new Error(label + " failed (exit " + (code ?? "unknown") + ")"));
+      }
+    });
+    child.on("error", reject);
+  });
+}
+
 /** Capture stdout/stderr from a spawned process into the log for debugging. */
 function collectOutput(child: ChildProcess, label: string): void {
   const chunks: string[] = [];
