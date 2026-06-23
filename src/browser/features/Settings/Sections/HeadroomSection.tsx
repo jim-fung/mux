@@ -6,7 +6,9 @@
  */
 
 import { useEffect, useState } from "react";
-import { ExternalLink } from "lucide-react";
+import { ChevronDown, ExternalLink } from "lucide-react";
+import type { HeadroomAdvancedConfig } from "@/common/config/schemas/headroom";
+import { HEADROOM_ADVANCED_DEFAULTS } from "@/common/config/schemas/headroom";
 import { Button } from "@/browser/components/Button/Button";
 import { Switch } from "@/browser/components/Switch/Switch";
 import {
@@ -17,6 +19,7 @@ import {
   SelectValue,
 } from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import { useAPI } from "@/browser/contexts/API";
+import { SUPPORTED_PROVIDERS, PROVIDER_DISPLAY_NAMES } from "@/common/constants/providers";
 
 interface HeadroomStatus {
   enabled: boolean;
@@ -27,6 +30,14 @@ interface HeadroomStatus {
   port: number | null;
   runtimeMethod: string;
   lastError: string | null;
+  mode: string;
+  autoProvision: boolean;
+  includeMl: boolean;
+  outputShaper: boolean;
+  telemetry: boolean;
+  memoryEnabled: boolean;
+  perProvider: Record<string, string>;
+  advanced: HeadroomAdvancedConfig;
 }
 
 interface HeadroomStats {
@@ -56,12 +67,40 @@ export function HeadroomSection() {
   const [stats, setStats] = useState<HeadroomStats | null>(null);
   const [loading, setLoading] = useState(true);
   const [provisioning, setProvisioning] = useState(false);
+  const [perProvider, setPerProvider] = useState<Record<string, "off" | "middleware" | "proxy">>(
+    {}
+  );
+  const [learnOutput, setLearnOutput] = useState<string | null>(null);
+  const [learnLoading, setLearnLoading] = useState(false);
+  const [mcpLoading, setMcpLoading] = useState(false);
+  const [mcpRegistered, setMcpRegistered] = useState(false);
+  const [showTuning, setShowTuning] = useState(false);
+  const [tuningDraft, setTuningDraft] = useState<HeadroomAdvancedConfig>(
+    HEADROOM_ADVANCED_DEFAULTS
+  );
+  const [customEnvText, setCustomEnvText] = useState("");
+  const [extraArgsText, setExtraArgsText] = useState("");
+  const [tuningApplying, setTuningApplying] = useState(false);
+  const [llmlinguaInstalling, setLlmlinguaInstalling] = useState(false);
+  const [llmlinguaMessage, setLlmlinguaMessage] = useState<string | null>(null);
 
   async function refreshStatus() {
     if (!api) return;
     try {
       const s = await api.headroom.getStatus();
       setStatus(s);
+      // Sync the tuning draft from live config (only when not actively editing).
+      if (s.advanced) {
+        setTuningDraft(s.advanced);
+        setCustomEnvText(
+          Object.entries(s.advanced.customEnv)
+            .map(([k, v]) => k + "=" + v)
+            .join("\n")
+        );
+        setExtraArgsText(s.advanced.extraArgs.join(" "));
+      }
+      if (s.perProvider)
+        setPerProvider(s.perProvider as Record<string, "off" | "middleware" | "proxy">);
       const st = await api.headroom.getStats();
       setStats(st);
     } catch {
@@ -117,6 +156,96 @@ export function HeadroomSection() {
     await refreshStatus();
   }
 
+  async function handleLearn(apply: boolean) {
+    if (!api) return;
+    setLearnLoading(true);
+    try {
+      const result = await api.headroom.learn({ apply });
+      setLearnOutput(result.output);
+    } catch (err) {
+      setLearnOutput(`Error: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setLearnLoading(false);
+    }
+  }
+
+  async function handleRegisterMcp() {
+    if (!api) return;
+    setMcpLoading(true);
+    try {
+      const result = await api.headroom.registerMcp();
+      setMcpRegistered(result.success);
+    } catch {
+      setMcpRegistered(false);
+    } finally {
+      setMcpLoading(false);
+    }
+  }
+
+  function updateTuning<K extends keyof HeadroomAdvancedConfig>(
+    key: K,
+    value: HeadroomAdvancedConfig[K]
+  ) {
+    setTuningDraft((prev) => ({ ...prev, [key]: value }));
+  }
+
+  /** Parse a KEY=VALUE-per-line textarea into a record. */
+  function parseEnvText(text: string): Record<string, string> {
+    const record: Record<string, string> = {};
+    for (const line of text.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const eqIdx = trimmed.indexOf("=");
+      if (eqIdx > 0) {
+        record[trimmed.slice(0, eqIdx).trim()] = trimmed.slice(eqIdx + 1);
+      }
+    }
+    return record;
+  }
+
+  async function applyTuning() {
+    if (!api) return;
+    setTuningApplying(true);
+    try {
+      const merged: HeadroomAdvancedConfig = {
+        ...tuningDraft,
+        customEnv: parseEnvText(customEnvText),
+        extraArgs: extraArgsText.trim() ? extraArgsText.trim().split(/\s+/) : [],
+      };
+      await api.headroom.setConfig({ advanced: merged });
+      await refreshStatus();
+    } finally {
+      setTuningApplying(false);
+    }
+  }
+
+  async function handleLlmlinguaToggle(enabled: boolean) {
+    if (!api) return;
+    if (enabled) {
+      setLlmlinguaInstalling(true);
+      setLlmlinguaMessage(null);
+      try {
+        const result = await api.headroom.installLlmlingua();
+        if (!result.success) {
+          setLlmlinguaMessage(result.message);
+          return; // Don't toggle on if install failed.
+        }
+      } finally {
+        setLlmlinguaInstalling(false);
+      }
+    }
+    updateTuning("llmlingua", enabled);
+  }
+
+  async function setProviderMode(provider: string, mode: "off" | "middleware" | "proxy") {
+    if (!api) return;
+    const updated = { ...perProvider, [provider]: mode };
+    // Remove "off" entries to keep the map sparse (they fall back to global mode)
+    if (mode === "off") delete updated[provider];
+    setPerProvider(updated);
+    await api.headroom.setConfig({ perProvider: updated });
+  }
+
   if (loading) {
     return <div className="text-muted p-4 text-sm">Loading...</div>;
   }
@@ -126,7 +255,7 @@ export function HeadroomSection() {
   const enabled = status?.enabled ?? false;
   const lastError = status?.lastError ?? null;
   const runtimeMethod = status?.runtimeMethod ?? "none";
-  const currentMode = enabled ? "middleware" : "off";
+  const currentMode = status?.mode ?? "off";
 
   return (
     <div className="space-y-6">
@@ -200,6 +329,48 @@ export function HeadroomSection() {
         </div>
       </div>
 
+      {/* Tools & learning (only when installed) */}
+      {installed && (
+        <div className="bg-background-secondary border-border-medium space-y-3 rounded-lg border p-4">
+          <div className="text-foreground text-sm font-medium">Tools &amp; Memory</div>
+          <div className="flex flex-wrap gap-2">
+            <Button
+              onClick={() => void handleLearn(false)}
+              disabled={learnLoading}
+              variant="secondary"
+              size="sm"
+            >
+              {learnLoading ? "Analyzing..." : "Preview Learn"}
+            </Button>
+            <Button
+              onClick={() => void handleLearn(true)}
+              disabled={learnLoading}
+              variant="secondary"
+              size="sm"
+            >
+              Apply Learn
+            </Button>
+            <Button
+              onClick={() => void handleRegisterMcp()}
+              disabled={mcpLoading}
+              variant="secondary"
+              size="sm"
+            >
+              {mcpLoading
+                ? "Registering..."
+                : mcpRegistered
+                  ? "MCP Registered"
+                  : "Register MCP Tools"}
+            </Button>
+          </div>
+          {learnOutput && (
+            <pre className="bg-background border-border-medium mt-2 max-h-40 overflow-auto rounded border p-2 text-xs whitespace-pre-wrap">
+              {learnOutput}
+            </pre>
+          )}
+        </div>
+      )}
+
       {/* Compression mode */}
       <div className="flex items-center justify-between gap-4">
         <div className="flex-1">
@@ -265,7 +436,7 @@ export function HeadroomSection() {
               </div>
             </div>
             <Switch
-              checked={false}
+              checked={status?.includeMl ?? false}
               onCheckedChange={(v) => void toggleSubSetting("includeMl", v)}
               aria-label="ML compression"
             />
@@ -279,7 +450,7 @@ export function HeadroomSection() {
               </div>
             </div>
             <Switch
-              checked={false}
+              checked={status?.outputShaper ?? false}
               onCheckedChange={(v) => void toggleSubSetting("outputShaper", v)}
               aria-label="Output token shaping"
             />
@@ -293,11 +464,342 @@ export function HeadroomSection() {
               </div>
             </div>
             <Switch
-              checked={false}
+              checked={status?.telemetry ?? false}
               onCheckedChange={(v) => void toggleSubSetting("telemetry", v)}
               aria-label="Telemetry"
             />
           </div>
+        </div>
+      </div>
+
+      {/* Compression tuning (collapsible) */}
+      <div>
+        <button
+          type="button"
+          onClick={() => setShowTuning((v) => !v)}
+          className="text-foreground flex w-full items-center gap-1 text-sm font-medium"
+        >
+          <ChevronDown
+            className={"h-4 w-4 transition-transform " + (showTuning ? "" : "-rotate-90")}
+          />
+          Compression tuning
+        </button>
+        {showTuning && (
+          <div className="mt-4 space-y-5">
+            {/* Context management */}
+            <div className="space-y-3">
+              <div className="text-muted text-xs font-medium tracking-wide uppercase">
+                Context management
+              </div>
+              <div className="flex items-center justify-between gap-4">
+                <div className="flex-1">
+                  <div className="text-foreground text-sm">Intelligent context</div>
+                  <div className="text-muted text-xs">
+                    Multi-factor scoring (recency, similarity, errors). Disable to use oldest-first
+                    RollingWindow.
+                  </div>
+                </div>
+                <Switch
+                  checked={tuningDraft.intelligentContext}
+                  onCheckedChange={(v) => updateTuning("intelligentContext", v)}
+                  aria-label="Intelligent context"
+                />
+              </div>
+              <div className="flex items-center justify-between gap-4">
+                <div className="flex-1">
+                  <div className="text-foreground text-sm">Importance scoring</div>
+                  <div className="text-muted text-xs">
+                    Multi-factor message scoring. Disable for faster, simpler drops.
+                  </div>
+                </div>
+                <Switch
+                  checked={tuningDraft.intelligentScoring}
+                  onCheckedChange={(v) => updateTuning("intelligentScoring", v)}
+                  aria-label="Importance scoring"
+                />
+              </div>
+              <div className="flex items-center justify-between gap-4">
+                <div className="flex-1">
+                  <div className="text-foreground text-sm">Compress before dropping</div>
+                  <div className="text-muted text-xs">
+                    Try deeper compression before dropping messages from context.
+                  </div>
+                </div>
+                <Switch
+                  checked={tuningDraft.compressFirst}
+                  onCheckedChange={(v) => updateTuning("compressFirst", v)}
+                  aria-label="Compress before dropping"
+                />
+              </div>
+            </div>
+
+            {/* Compression & cache */}
+            <div className="space-y-3">
+              <div className="text-muted text-xs font-medium tracking-wide uppercase">
+                Compression &amp; cache
+              </div>
+              <div className="flex items-center justify-between gap-4">
+                <div className="flex-1">
+                  <div className="text-foreground text-sm">Optimization</div>
+                  <div className="text-muted text-xs">
+                    Apply compression transforms. Disable for passthrough (no changes).
+                  </div>
+                </div>
+                <Switch
+                  checked={tuningDraft.optimize}
+                  onCheckedChange={(v) => updateTuning("optimize", v)}
+                  aria-label="Optimization"
+                />
+              </div>
+              <div className="flex items-center justify-between gap-4">
+                <div className="flex-1">
+                  <div className="text-foreground text-sm">Semantic cache</div>
+                  <div className="text-muted text-xs">
+                    Cache similar queries to skip redundant processing.
+                  </div>
+                </div>
+                <Switch
+                  checked={tuningDraft.semanticCache}
+                  onCheckedChange={(v) => updateTuning("semanticCache", v)}
+                  aria-label="Semantic cache"
+                />
+              </div>
+            </div>
+
+            {/* LLMLingua */}
+            <div className="space-y-3">
+              <div className="text-muted text-xs font-medium tracking-wide uppercase">
+                ML compression (LLMLingua)
+              </div>
+              <div className="bg-background-secondary border-border-medium rounded-lg border p-3">
+                <div className="flex items-center justify-between gap-4">
+                  <div className="flex-1">
+                    <div className="text-foreground text-sm">Enable LLMLingua-2</div>
+                    <div className="text-muted text-xs">
+                      ML-based text compression for maximum savings.
+                    </div>
+                  </div>
+                  <Switch
+                    checked={tuningDraft.llmlingua}
+                    onCheckedChange={(v) => void handleLlmlinguaToggle(v)}
+                    disabled={llmlinguaInstalling}
+                    aria-label="Enable LLMLingua"
+                  />
+                </div>
+                <div className="text-muted mt-2 text-xs">
+                  Adds ~2GB of dependencies (torch, transformers), 10-30s cold start, and ~1GB RAM.
+                  Enable only when maximum compression justifies the cost.
+                  {llmlinguaInstalling && " Installing..."}
+                  {llmlinguaMessage && <span className="text-red-500"> {llmlinguaMessage}</span>}
+                </div>
+              </div>
+              {tuningDraft.llmlingua && (
+                <div className="space-y-2">
+                  <label className="text-foreground flex items-center justify-between gap-4 text-sm">
+                    Device
+                    <Select
+                      value={tuningDraft.llmlinguaDevice}
+                      onValueChange={(v) =>
+                        updateTuning("llmlinguaDevice", v as "auto" | "cuda" | "cpu" | "mps")
+                      }
+                    >
+                      <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-8 w-[120px] cursor-pointer rounded-md border px-3 text-xs">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="auto">auto</SelectItem>
+                        <SelectItem value="cuda">cuda</SelectItem>
+                        <SelectItem value="cpu">cpu</SelectItem>
+                        <SelectItem value="mps">mps</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </label>
+                  <label className="text-foreground flex items-center justify-between gap-4 text-sm">
+                    Keep rate
+                    <span className="text-muted counter-nums text-xs">
+                      {Math.round(tuningDraft.llmlinguaRate * 100)}%
+                    </span>
+                  </label>
+                  <input
+                    type="range"
+                    min={0.05}
+                    max={1}
+                    step={0.05}
+                    value={tuningDraft.llmlinguaRate}
+                    onChange={(e) => updateTuning("llmlinguaRate", parseFloat(e.target.value))}
+                    className="w-full"
+                  />
+                </div>
+              )}
+            </div>
+
+            {/* Cost & output */}
+            <div className="space-y-3">
+              <div className="text-muted text-xs font-medium tracking-wide uppercase">
+                Cost &amp; output
+              </div>
+              <label className="text-foreground flex items-center justify-between gap-4 text-sm">
+                Daily budget (USD)
+                <input
+                  type="number"
+                  min={0}
+                  step={1}
+                  value={tuningDraft.budgetUsd ?? ""}
+                  placeholder="No cap"
+                  onChange={(e) =>
+                    updateTuning(
+                      "budgetUsd",
+                      e.target.value === "" ? null : parseFloat(e.target.value)
+                    )
+                  }
+                  className="border-border-medium bg-background-secondary text-foreground h-8 w-[100px] rounded-md border px-2 text-sm"
+                />
+              </label>
+              <div>
+                <label className="text-foreground mb-1 flex items-center justify-between gap-4 text-sm">
+                  Output holdout (control group)
+                  <span className="text-muted counter-nums text-xs">
+                    {Math.round(tuningDraft.outputHoldout * 100)}%
+                  </span>
+                </label>
+                <input
+                  type="range"
+                  min={0}
+                  max={0.5}
+                  step={0.05}
+                  value={tuningDraft.outputHoldout}
+                  onChange={(e) => updateTuning("outputHoldout", parseFloat(e.target.value))}
+                  className="w-full"
+                />
+                <div className="text-muted mt-1 text-xs">
+                  Fraction of conversations left unshaped to measure real output savings.
+                </div>
+              </div>
+            </div>
+
+            {/* Diagnostics */}
+            <div className="space-y-3">
+              <div className="text-muted text-xs font-medium tracking-wide uppercase">
+                Diagnostics
+              </div>
+              <label className="text-foreground flex items-center justify-between gap-4 text-sm">
+                Context tool
+                <Select
+                  value={tuningDraft.contextTool}
+                  onValueChange={(v) => updateTuning("contextTool", v as "rtk" | "lean-ctx")}
+                >
+                  <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-8 w-[120px] cursor-pointer rounded-md border px-3 text-xs">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="rtk">rtk</SelectItem>
+                    <SelectItem value="lean-ctx">lean-ctx</SelectItem>
+                  </SelectContent>
+                </Select>
+              </label>
+              <label className="text-foreground flex items-center justify-between gap-4 text-sm">
+                Log level
+                <Select
+                  value={tuningDraft.logLevel}
+                  onValueChange={(v) =>
+                    updateTuning("logLevel", v as "DEBUG" | "INFO" | "WARNING" | "ERROR")
+                  }
+                >
+                  <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-8 w-[120px] cursor-pointer rounded-md border px-3 text-xs">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="DEBUG">DEBUG</SelectItem>
+                    <SelectItem value="INFO">INFO</SelectItem>
+                    <SelectItem value="WARNING">WARNING</SelectItem>
+                    <SelectItem value="ERROR">ERROR</SelectItem>
+                  </SelectContent>
+                </Select>
+              </label>
+            </div>
+
+            {/* Power-user overrides */}
+            <div className="space-y-3">
+              <div className="text-muted text-xs font-medium tracking-wide uppercase">
+                Power-user overrides
+              </div>
+              <div>
+                <label className="text-foreground mb-1 block text-sm">
+                  Custom env vars (KEY=VALUE per line)
+                </label>
+                <textarea
+                  value={customEnvText}
+                  onChange={(e) => setCustomEnvText(e.target.value)}
+                  rows={3}
+                  placeholder={
+                    "HEADROOM_SAVINGS_PATH=/custom/path\nOPENAI_TARGET_API_URL=https://..."
+                  }
+                  className="border-border-medium bg-background-secondary text-foreground w-full rounded-md border p-2 font-mono text-xs"
+                />
+              </div>
+              <div>
+                <label className="text-foreground mb-1 block text-sm">
+                  Extra CLI args (whitespace-separated)
+                </label>
+                <input
+                  type="text"
+                  value={extraArgsText}
+                  onChange={(e) => setExtraArgsText(e.target.value)}
+                  placeholder="--log-file /tmp/headroom.jsonl"
+                  className="border-border-medium bg-background-secondary text-foreground w-full rounded-md border px-2 py-1 font-mono text-xs"
+                />
+              </div>
+            </div>
+
+            {/* Info note */}
+            <p className="text-muted text-xs leading-relaxed">
+              Per-algorithm weights (SmartCrusher, CacheAligner, scoring) are library-only and
+              cannot be set through the proxy. The toggles above expose everything the proxy
+              supports. Use the overrides box for anything else.
+            </p>
+
+            {/* Apply */}
+            <div className="flex justify-end">
+              <Button onClick={() => void applyTuning()} disabled={tuningApplying} size="sm">
+                {tuningApplying ? "Applying..." : "Apply & restart"}
+              </Button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Per-provider overrides */}
+      <div>
+        <h3 className="text-foreground mb-4 text-sm font-medium">Per-provider mode</h3>
+        <p className="text-muted mb-4 text-xs leading-relaxed">
+          Override the global mode for individual providers. &ldquo;Off&rdquo; falls back to the
+          global default. Proxy mode only works for Anthropic and OpenAI-compatible providers.
+        </p>
+        <div className="space-y-2">
+          {SUPPORTED_PROVIDERS.map((provider) => (
+            <div key={provider} className="flex items-center justify-between gap-4">
+              <div className="text-foreground min-w-0 flex-1 truncate text-sm">
+                {PROVIDER_DISPLAY_NAMES[provider] ?? provider}
+              </div>
+              <Select
+                value={perProvider[provider] ?? "off"}
+                onValueChange={(value) =>
+                  void setProviderMode(provider, value as "off" | "middleware" | "proxy")
+                }
+              >
+                <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-8 w-[180px] cursor-pointer rounded-md border px-3 text-xs transition-colors">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {MODE_OPTIONS.map((option) => (
+                    <SelectItem key={option.value} value={option.value}>
+                      {option.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          ))}
         </div>
       </div>
     </div>
