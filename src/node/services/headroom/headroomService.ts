@@ -20,7 +20,11 @@ import type {
   HeadroomAdvancedConfig,
   HeadroomWorkspaceOverride,
 } from "@/common/config/schemas/headroom";
-import { HEADROOM_ADVANCED_DEFAULTS, HeadroomConfigSchema } from "@/common/config/schemas/headroom";
+import {
+  HEADROOM_ADVANCED_DEFAULTS,
+  HEADROOM_MEMORY_DEFAULTS,
+  HeadroomConfigSchema,
+} from "@/common/config/schemas/headroom";
 import { resolveHeadroomConfig } from "./headroomConfigResolver";
 import { log } from "@/node/services/log";
 import { shellQuote } from "@/common/utils/shell";
@@ -97,7 +101,7 @@ export class HeadroomService extends EventEmitter {
         proxyBaseUrl: null,
         telemetry: false,
         outputShaper: false,
-        memory: { enabled: false },
+        memory: HEADROOM_MEMORY_DEFAULTS,
         advanced: HEADROOM_ADVANCED_DEFAULTS,
       };
     }
@@ -184,6 +188,9 @@ export class HeadroomService extends EventEmitter {
         outputShaper: override.outputShaper ?? null,
         telemetry: override.telemetry ?? null,
         memoryEnabled: override.memoryEnabled ?? null,
+        memoryTtlSeconds: override.memoryTtlSeconds ?? null,
+        memoryMaxEntries: override.memoryMaxEntries ?? null,
+        memoryCompressThresholdTokens: override.memoryCompressThresholdTokens ?? null,
         includeMl: override.includeMl ?? null,
         advanced: override.advanced ?? null,
       };
@@ -200,6 +207,9 @@ export class HeadroomService extends EventEmitter {
       outputShaper: null,
       telemetry: null,
       memoryEnabled: null,
+      memoryTtlSeconds: null,
+      memoryMaxEntries: null,
+      memoryCompressThresholdTokens: null,
       includeMl: null,
       advanced: null,
     });

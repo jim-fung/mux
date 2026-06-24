@@ -86,6 +86,38 @@ export const HEADROOM_ADVANCED_DEFAULTS: HeadroomAdvancedConfig = {
 };
 
 /**
+ * Cross-agent shared-context memory config. When enabled, subagent reports are
+ * compressed via the proxy's /v1/compress endpoint at delivery time and stored
+ * in an in-process KV store (SharedContextStore) keyed by task group. This
+ * reduces the token footprint of reports in the parent's chat.jsonl — savings
+ * persist through compaction/retention cycles. The full report is always
+ * persisted to disk (subagent-reports/<taskId>/report.json) as a fallback.
+ *
+ * These are client-side store knobs; they do NOT shape the proxy command and
+ * must NOT appear in headroomProcessKey().
+ */
+export const HeadroomMemoryConfigSchema = z.object({
+  /** Master switch for shared-context compression of subagent reports. */
+  enabled: z.boolean().default(false),
+  /** Time-to-live for store entries, in seconds. Expired entries are evicted. */
+  ttlSeconds: z.number().int().positive().default(3600),
+  /** Max entries in the in-memory store; LRU eviction when exceeded. */
+  maxEntries: z.number().int().positive().default(200),
+  /** Reports with an estimated token count below this are delivered uncompressed. */
+  compressThresholdTokens: z.number().int().positive().default(500),
+});
+
+export type HeadroomMemoryConfig = z.infer<typeof HeadroomMemoryConfigSchema>;
+
+/** Explicit defaults for the memory sub-object (avoids repeating the literal). */
+export const HEADROOM_MEMORY_DEFAULTS: HeadroomMemoryConfig = {
+  enabled: false,
+  ttlSeconds: 3600,
+  maxEntries: 200,
+  compressThresholdTokens: 500,
+};
+
+/**
  * Per-workspace Headroom override, layered on the global HeadroomConfig.
  *
  * Sparse like the goalDefaults/heartbeat pattern: each field is nullable and
@@ -111,6 +143,9 @@ export const HeadroomWorkspaceOverrideSchema = z.object({
   outputShaper: z.boolean().nullable(),
   telemetry: z.boolean().nullable(),
   memoryEnabled: z.boolean().nullable(),
+  memoryTtlSeconds: z.number().int().positive().nullable(),
+  memoryMaxEntries: z.number().int().positive().nullable(),
+  memoryCompressThresholdTokens: z.number().int().positive().nullable(),
   includeMl: z.boolean().nullable(),
   /** Replaces the global advanced block wholesale when set. null = inherit. */
   advanced: HeadroomAdvancedConfigSchema.nullable(),
@@ -139,12 +174,8 @@ export const HeadroomConfigSchema = z.object({
   telemetry: z.boolean().default(false),
   /** Enable output-token shaping (HEADROOM_OUTPUT_SHAPER) — trims verbosity. */
   outputShaper: z.boolean().default(false),
-  /** Cross-agent memory store enable/disable. */
-  memory: z
-    .object({
-      enabled: z.boolean().default(false),
-    })
-    .default({ enabled: false }),
+  /** Cross-agent shared-context memory store (report compression at delivery time). */
+  memory: HeadroomMemoryConfigSchema.default(HEADROOM_MEMORY_DEFAULTS),
   /** Fine-grained proxy knobs surfaced in the Advanced settings panel. */
   advanced: HeadroomAdvancedConfigSchema.default(HEADROOM_ADVANCED_DEFAULTS),
 });

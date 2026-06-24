@@ -32,6 +32,9 @@ const ALL_NULL: HeadroomWorkspaceOverride = {
   outputShaper: null,
   telemetry: null,
   memoryEnabled: null,
+  memoryTtlSeconds: null,
+  memoryMaxEntries: null,
+  memoryCompressThresholdTokens: null,
   includeMl: null,
   advanced: null,
 };

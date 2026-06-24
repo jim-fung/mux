@@ -25,8 +25,21 @@ export function resolveHeadroomConfig(
   if (override.perProvider != null) resolved.perProvider = override.perProvider;
   if (override.telemetry != null) resolved.telemetry = override.telemetry;
   if (override.outputShaper != null) resolved.outputShaper = override.outputShaper;
-  if (override.memoryEnabled != null)
-    resolved.memory = { ...resolved.memory, enabled: override.memoryEnabled };
+  if (
+    override.memoryEnabled != null ||
+    override.memoryTtlSeconds != null ||
+    override.memoryMaxEntries != null ||
+    override.memoryCompressThresholdTokens != null
+  ) {
+    resolved.memory = {
+      ...resolved.memory,
+      enabled: override.memoryEnabled ?? resolved.memory.enabled,
+      ttlSeconds: override.memoryTtlSeconds ?? resolved.memory.ttlSeconds,
+      maxEntries: override.memoryMaxEntries ?? resolved.memory.maxEntries,
+      compressThresholdTokens:
+        override.memoryCompressThresholdTokens ?? resolved.memory.compressThresholdTokens,
+    };
+  }
   if (override.includeMl != null) resolved.includeMl = override.includeMl;
   if (override.advanced != null) resolved.advanced = override.advanced;
   return resolved;

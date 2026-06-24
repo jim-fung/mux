@@ -2,7 +2,10 @@ import { describe, expect, it } from "bun:test";
 import { HeadroomProxyPool } from "@/node/services/headroom/headroomProxyPool";
 import type { HeadroomProxyProcess } from "@/node/services/headroom/headroomProxyProcess";
 import type { HeadroomConfig } from "@/common/config/schemas/headroom";
-import { HEADROOM_ADVANCED_DEFAULTS } from "@/common/config/schemas/headroom";
+import {
+  HEADROOM_ADVANCED_DEFAULTS,
+  HEADROOM_MEMORY_DEFAULTS,
+} from "@/common/config/schemas/headroom";
 
 const baseCfg: HeadroomConfig = {
   enabled: true,
@@ -13,7 +16,7 @@ const baseCfg: HeadroomConfig = {
   proxyBaseUrl: null,
   telemetry: false,
   outputShaper: false,
-  memory: { enabled: false },
+  memory: HEADROOM_MEMORY_DEFAULTS,
   advanced: HEADROOM_ADVANCED_DEFAULTS,
 };
 

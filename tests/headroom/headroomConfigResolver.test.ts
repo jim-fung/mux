@@ -15,7 +15,7 @@ const globalConfig: HeadroomConfig = {
   proxyBaseUrl: null,
   telemetry: false,
   outputShaper: false,
-  memory: { enabled: false },
+  memory: { enabled: false, ttlSeconds: 3600, maxEntries: 200, compressThresholdTokens: 500 },
   advanced: HEADROOM_ADVANCED_DEFAULTS,
 };
 
@@ -28,6 +28,9 @@ function overrideOf(partial: Partial<HeadroomWorkspaceOverride>): HeadroomWorksp
     outputShaper: null,
     telemetry: null,
     memoryEnabled: null,
+    memoryTtlSeconds: null,
+    memoryMaxEntries: null,
+    memoryCompressThresholdTokens: null,
     includeMl: null,
     advanced: null,
     ...partial,

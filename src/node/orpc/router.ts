@@ -70,7 +70,10 @@ import {
   normalizeLayoutPresetsConfig,
 } from "@/common/types/uiLayouts";
 import { normalizeUserPreferences } from "@/common/config/schemas/userPreferences";
-import { HEADROOM_ADVANCED_DEFAULTS } from "@/common/config/schemas/headroom";
+import {
+  HEADROOM_ADVANCED_DEFAULTS,
+  HEADROOM_MEMORY_DEFAULTS,
+} from "@/common/config/schemas/headroom";
 import { buildProxyCommand } from "@/node/services/headroom/headroomProxyProcess";
 import { normalizeAgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { isValidModelFormat, normalizeSelectedModel } from "@/common/utils/ai/models";
@@ -2875,7 +2878,7 @@ export const router = (authToken?: string) => {
               proxyBaseUrl: null,
               telemetry: false,
               outputShaper: false,
-              memory: { enabled: false },
+              memory: HEADROOM_MEMORY_DEFAULTS,
               advanced: HEADROOM_ADVANCED_DEFAULTS,
             };
             const updated = { ...current };
