@@ -196,6 +196,14 @@ const MODEL_DEFINITIONS = {
     providerModelId: "glm-5.1",
     aliases: ["glm-5.1"],
   },
+  // GLM-5-Turbo is Z.AI's OpenClaw-optimized tier (200K context, 128K output,
+  // text-only). Kept selectable alongside the flagship. Bare `glm` stays pinned
+  // to glm-5.2.
+  GLM_5_TURBO: {
+    provider: "zai",
+    providerModelId: "glm-5-turbo",
+    aliases: ["glm-5-turbo"],
+  },
   KIMI: {
     provider: "moonshot",
     providerModelId: "kimi-k2-thinking",
