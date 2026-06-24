@@ -3,9 +3,10 @@ import { HEADROOM_ADVANCED_DEFAULTS } from "@/common/config/schemas/headroom";
 
 /**
  * Named starting points for the Compression-tuning panel. Selecting a preset
- * merges its patch into the current draft (it does NOT auto-apply — the user still
- * hits "Apply & restart"). Presets only touch algorithm-level knobs; power-user
- * escapes (customEnv / extraArgs) are intentionally left untouched.
+ * merges its patch into the current draft and immediately persists + restarts
+ * the proxy (see HeadroomSection.applyPreset). Presets only touch algorithm-level
+ * knobs; power-user escapes (customEnv / extraArgs) are intentionally left
+ * untouched.
  */
 export interface HeadroomPreset {
   id: string;

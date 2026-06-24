@@ -6,7 +6,7 @@
  */
 
 import { useEffect, useState } from "react";
-import { ChevronDown, ExternalLink, RotateCcw } from "lucide-react";
+import { AlertCircle, CheckCircle2, ChevronDown, ExternalLink, Loader2, RotateCcw } from "lucide-react";
 import type {
   HeadroomAdvancedConfig,
   HeadroomWorkspaceOverride,
@@ -14,7 +14,7 @@ import type {
 import { HeadroomWorkspaceEditor } from "./HeadroomWorkspaceEditor";
 import { HEADROOM_ADVANCED_DEFAULTS } from "@/common/config/schemas/headroom";
 import { formatProxyCommand } from "@/common/config/headroomProxyCommand";
-import { HEADROOM_PRESETS } from "@/constants/headroomPresets";
+import { HEADROOM_PRESETS, type HeadroomPreset } from "@/constants/headroomPresets";
 import { Button } from "@/browser/components/Button/Button";
 import { Switch } from "@/browser/components/Switch/Switch";
 import {
@@ -121,6 +121,16 @@ export function HeadroomSection() {
   const [customEnvText, setCustomEnvText] = useState("");
   const [extraArgsText, setExtraArgsText] = useState("");
   const [tuningApplying, setTuningApplying] = useState(false);
+  // Preset quick-apply feedback: which preset is mid-apply (spinner + disable
+  // siblings), and the most recent success/error result keyed by preset id.
+  // The result persists until the next preset click so the user can see what
+  // happened without racing a timer.
+  const [presetApplyingId, setPresetApplyingId] = useState<string | null>(null);
+  const [presetResult, setPresetResult] = useState<{
+    id: string;
+    ok: boolean;
+    message?: string;
+  } | null>(null);
   const [llmlinguaInstalling, setLlmlinguaInstalling] = useState(false);
   const [llmlinguaMessage, setLlmlinguaMessage] = useState<string | null>(null);
 
@@ -230,9 +240,47 @@ export function HeadroomSection() {
     setTuningDraft((prev) => ({ ...prev, [key]: value }));
   }
 
-  /** Merge a preset's patch into the draft (no auto-apply). */
-  function applyPreset(patch: Partial<HeadroomAdvancedConfig>) {
-    setTuningDraft((prev) => ({ ...prev, ...patch }));
+  /**
+   * Persist the advanced tuning config and refresh status. Shared by the preset
+   * quick-apply path and the "Apply & restart" button so both report the same
+   * outcome. `setConfig` persists the config and restarts the proxy server-side.
+   */
+  async function persistAdvanced(
+    advanced: HeadroomAdvancedConfig
+  ): Promise<{ ok: true } | { ok: false; message: string }> {
+    if (!api) return { ok: false, message: "API unavailable" };
+    try {
+      await api.headroom.setConfig({ advanced });
+      await refreshStatus();
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, message: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  /**
+   * Apply a preset: merge its patch into the draft AND immediately persist +
+   * restart, surfacing inline success/error feedback on the clicked button.
+   * Presets only touch algorithm-level knobs; customEnv/extraArgs are carried
+   * through unchanged from the current draft.
+   */
+  async function applyPreset(preset: HeadroomPreset) {
+    if (!api || presetApplyingId) return;
+    const nextDraft = { ...tuningDraft, ...preset.patch };
+    setTuningDraft(nextDraft);
+    const merged: HeadroomAdvancedConfig = {
+      ...nextDraft,
+      customEnv: parseEnvText(customEnvText),
+      extraArgs: extraArgsText.trim() ? extraArgsText.trim().split(/\s+/) : [],
+    };
+    setPresetApplyingId(preset.id);
+    setPresetResult(null);
+    try {
+      const res = await persistAdvanced(merged);
+      setPresetResult({ id: preset.id, ...res });
+    } finally {
+      setPresetApplyingId(null);
+    }
   }
 
   /** Reset a group of fields to their Headroom defaults. */
@@ -270,8 +318,9 @@ export function HeadroomSection() {
         customEnv: parseEnvText(customEnvText),
         extraArgs: extraArgsText.trim() ? extraArgsText.trim().split(/\s+/) : [],
       };
-      await api.headroom.setConfig({ advanced: merged });
-      await refreshStatus();
+      // Route through persistAdvanced so a failure is caught instead of
+      // escaping as an unhandled rejection from the `void applyTuning()` caller.
+      await persistAdvanced(merged);
     } finally {
       setTuningApplying(false);
     }
@@ -561,20 +610,34 @@ export function HeadroomSection() {
         {showTuning && (
           <div className="mt-4 space-y-5">
             {" "}
-            {/* Presets — merge a named starting point into the draft (no auto-apply) */}
+            {/* Presets — merge a named starting point into the draft and persist +
+                restart immediately, with per-button success/error feedback. */}
             <div className="flex flex-wrap items-center gap-2">
               <span className="text-muted text-xs">Presets:</span>
-              {HEADROOM_PRESETS.map((preset) => (
-                <Button
-                  key={preset.id}
-                  variant="secondary"
-                  size="sm"
-                  onClick={() => applyPreset(preset.patch)}
-                  title={preset.description}
-                >
-                  {preset.label}
-                </Button>
-              ))}
+              {HEADROOM_PRESETS.map((preset) => {
+                const isApplying = presetApplyingId === preset.id;
+                const result =
+                  presetResult?.id === preset.id ? presetResult : null;
+                return (
+                  <Button
+                    key={preset.id}
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => void applyPreset(preset)}
+                    disabled={presetApplyingId !== null || tuningApplying}
+                    title={result && !result.ok ? result.message : preset.description}
+                  >
+                    {isApplying ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : result?.ok ? (
+                      <CheckCircle2 className="text-success h-3.5 w-3.5" />
+                    ) : result && !result.ok ? (
+                      <AlertCircle className="h-3.5 w-3.5 text-red-500" />
+                    ) : null}
+                    <span className="ml-1">{preset.label}</span>
+                  </Button>
+                );
+              })}
             </div>
             {/* Live command preview — recomputed from the draft via the shared
                 buildProxyCommand so it can never drift from what start() spawns */}
