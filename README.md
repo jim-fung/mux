@@ -43,6 +43,11 @@ Compared with the official Mux repo, this fork adds:
   - Per-provider routing controls
   - Advanced tuning and presets
   - Workspace-level overrides
+- **SharedContext for subagent report compression**
+  - Auto-compresses background subagent reports at delivery time via the Headroom proxy
+  - In-process store with TTL and LRU eviction
+  - Reduces parent context footprint across long delegation chains
+  - Fail-open: full report delivered uncompressed if the proxy is unavailable
 - **Dedicated Headroom Stats section in Settings**
   - Live compression totals
   - Tokens saved
@@ -74,6 +79,7 @@ This fork is aimed at users who want the Mux experience but need:
 - Better support for Chinese AI providers without custom provider setup
 - Built-in access to popular Chinese model families from the model picker
 - Stronger Headroom-based context compression controls
+- Lower token cost on multi-agent delegation via automatic report compression
 - Better visibility into Headroom behavior through a dedicated stats section
 
 ## Install
