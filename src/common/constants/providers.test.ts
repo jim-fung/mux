@@ -35,6 +35,12 @@ describe("Provider Registry", () => {
     expect(PROVIDER_DEFINITIONS["lm-studio"].kind).toBe("local");
   });
 
+  test("oMLX is registered as a built-in local provider", () => {
+    expect(SUPPORTED_PROVIDERS).toContain("omlx");
+    expect(PROVIDER_DEFINITIONS.omlx.kind).toBe("local");
+    expect(PROVIDER_DEFINITIONS.omlx.defaultBaseUrl).toBe("http://localhost:8000/v1");
+  });
+
   test("isValidProvider rejects invalid providers", () => {
     expect(isValidProvider("invalid")).toBe(false);
     expect(isValidProvider("")).toBe(false);

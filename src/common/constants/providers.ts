@@ -25,6 +25,7 @@ export type ProviderName =
   | "bedrock"
   | "ollama"
   | "lm-studio"
+  | "omlx"
   // OpenAI-compatible vendors (all use @ai-sdk/openai-compatible). Each carries a
   // defaultBaseUrl since createOpenAICompatible has no built-in default endpoint.
   | "zai"
@@ -198,6 +199,14 @@ export const PROVIDER_DEFINITIONS = {
     requiresApiKey: false, // Local service
     kind: "local",
     defaultBaseUrl: "http://localhost:1234/v1",
+  },
+  omlx: {
+    displayName: "oMLX",
+    import: () => import("@ai-sdk/openai-compatible"),
+    factoryName: "createOpenAICompatible",
+    requiresApiKey: false, // Local service
+    kind: "local",
+    defaultBaseUrl: "http://localhost:8000/v1",
   },
   // ---------------------------------------------------------------------------
   // OpenAI-compatible vendors. These all use @ai-sdk/openai-compatible and carry

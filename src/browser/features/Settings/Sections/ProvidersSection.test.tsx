@@ -239,6 +239,7 @@ describe("ProvidersSection", () => {
     expect(directHeading.parentElement?.textContent).toContain("OpenAI");
     expect(localHeading.parentElement?.textContent).toContain("Ollama");
     expect(localHeading.parentElement?.textContent).toContain("LM Studio");
+    expect(localHeading.parentElement?.textContent).toContain("oMLX");
     expect(customHeading.parentElement?.textContent).toContain("Acme OpenAI");
   });
 
@@ -252,6 +253,18 @@ describe("ProvidersSection", () => {
     expect(within(lmStudioCard).getByText("Base URL")).toBeTruthy();
     expect(within(lmStudioCard).queryByText("API Key")).toBeNull();
     expect(within(lmStudioCard).queryByText("API Key File")).toBeNull();
+  });
+
+  test("shows local-provider fields for oMLX without API key inputs", async () => {
+    const view = renderProvidersSection();
+    const omlxButton = await view.findByRole("button", { name: /oMLX/ });
+
+    fireEvent.click(omlxButton);
+
+    const omlxCard = getProviderCard(omlxButton);
+    expect(within(omlxCard).getByText("Base URL")).toBeTruthy();
+    expect(within(omlxCard).queryByText("API Key")).toBeNull();
+    expect(within(omlxCard).queryByText("API Key File")).toBeNull();
   });
 
   test("renders a custom provider display name with fallback icon support", async () => {

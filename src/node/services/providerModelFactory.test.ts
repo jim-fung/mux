@@ -675,6 +675,41 @@ describe("ProviderModelFactory.createModel", () => {
       }
     });
   });
+
+  it("creates built-in oMLX models after an explicit local opt-in", async () => {
+    await withTempConfig(async (config, factory) => {
+      config.saveProvidersConfig({
+        omlx: {
+          // oMLX stays unconfigured by default; opt-in via baseUrl points it at
+          // the built-in localhost endpoint.
+          baseUrl: "http://localhost:8000/v1",
+        },
+      });
+
+      const result = await factory.createModel(`omlx:${LOCAL_VLLM_MODEL}`);
+      expect(result.success).toBe(true);
+      if (!result.success) {
+        return;
+      }
+
+      expect((result.data as { provider?: unknown }).provider).toBe("omlx.chat");
+      expect(result.data.constructor.name).toBe("OpenAICompatibleChatLanguageModel");
+    });
+  });
+
+  it("keeps built-in oMLX unavailable until the user explicitly configures it", async () => {
+    await withTempConfig(async (_config, factory) => {
+      const result = await factory.createModel(`omlx:${LOCAL_VLLM_MODEL}`);
+
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error).toEqual({
+          type: "api_key_not_found",
+          provider: "omlx",
+        });
+      }
+    });
+  });
 });
 
 describe("ProviderModelFactory GitHub Copilot", () => {

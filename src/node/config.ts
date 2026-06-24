@@ -2270,6 +2270,9 @@ export class Config {
 //   },
 //   "lm-studio": {
 //     "baseUrl": "http://localhost:1234/v1"  // Optional - only needed for remote/custom URL
+//   },
+//   "omlx": {
+//     "baseUrl": "http://localhost:8000/v1"  // Optional - only needed for remote/custom URL
 //   }
 // }
 ${jsonString}`;

@@ -34,6 +34,9 @@ Compared with the official Mux repo, this fork adds:
   - MiniMax
   - Mimo
   - Qwen
+- **Built-in local LLM providers** (OpenAI-compatible, no API key required)
+  - LM Studio (`http://localhost:1234/v1`)
+  - oMLX (`http://localhost:8000/v1`)
 - **Headroom integration with an extensive configuration UI**
   - Provisioning and runtime controls
   - Middleware vs proxy modes

@@ -122,6 +122,16 @@ describe("hasAnyConfiguredProvider", () => {
     ).toBe(true);
   });
 
+  it("keeps oMLX unconfigured until the user opts in", () => {
+    expect(resolveProviderCredentials("omlx", {}, {}).isConfigured).toBe(false);
+    expect(
+      resolveProviderCredentials("omlx", { baseUrl: "http://localhost:8000/v1" }, {}).isConfigured
+    ).toBe(true);
+    expect(resolveProviderCredentials("omlx", { models: ["qwen3-coder"] }, {}).isConfigured).toBe(
+      true
+    );
+  });
+
   it("returns true for enabled custom OpenAI-compatible providers with only a base URL", () => {
     const providers: ProvidersConfig = {
       "local-vllm": {

@@ -92,6 +92,7 @@ test.describe("Settings", () => {
     await expect(page.getByRole("button", { name: /xAI/i })).toBeVisible();
     await expect(page.getByRole("button", { name: /Ollama/i })).toBeVisible();
     await expect(page.getByRole("button", { name: /LM Studio/i })).toBeVisible();
+    await expect(page.getByRole("button", { name: /oMLX/i })).toBeVisible();
     await expect(page.getByRole("button", { name: /OpenRouter/i })).toBeVisible();
   });
 

@@ -7,6 +7,7 @@ import XAIIcon from "@/browser/assets/icons/xai.svg?react";
 import OpenRouterIcon from "@/browser/assets/icons/openrouter.svg?react";
 import OllamaIcon from "@/browser/assets/icons/ollama.svg?react";
 import LMStudioIcon from "@/browser/assets/icons/lm-studio.svg?react";
+import OMLXIcon from "@/browser/assets/icons/omlx.svg?react";
 import DeepSeekIcon from "@/browser/assets/icons/deepseek.svg?react";
 import AWSIcon from "@/browser/assets/icons/aws.svg?react";
 import GitHubIcon from "@/browser/assets/icons/github.svg?react";
@@ -37,6 +38,7 @@ const PROVIDER_ICONS: Partial<Record<ProviderName, React.FC>> = {
   bedrock: AWSIcon,
   ollama: OllamaIcon,
   "lm-studio": LMStudioIcon,
+  omlx: OMLXIcon,
   "mux-gateway": GatewayIcon,
   "github-copilot": GitHubIcon,
   // OpenAI-compatible vendors. One icon per vendor; coding-plan / token-plan
