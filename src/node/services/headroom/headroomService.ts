@@ -20,7 +20,7 @@ import type {
   HeadroomAdvancedConfig,
   HeadroomWorkspaceOverride,
 } from "@/common/config/schemas/headroom";
-import { HEADROOM_ADVANCED_DEFAULTS } from "@/common/config/schemas/headroom";
+import { HEADROOM_ADVANCED_DEFAULTS, HeadroomConfigSchema } from "@/common/config/schemas/headroom";
 import { resolveHeadroomConfig } from "./headroomConfigResolver";
 import { log } from "@/node/services/log";
 import { shellQuote } from "@/common/utils/shell";
@@ -86,8 +86,9 @@ export class HeadroomService extends EventEmitter {
   /** Read the current headroom config (live, from disk). */
   getConfig(): HeadroomConfig {
     const onDisk = this.config.loadConfigOrDefault();
-    return (
-      onDisk.headroom ?? {
+    const raw = onDisk.headroom;
+    if (!raw) {
+      return {
         enabled: false,
         autoProvision: true,
         mode: "off",
@@ -98,8 +99,12 @@ export class HeadroomService extends EventEmitter {
         outputShaper: false,
         memory: { enabled: false },
         advanced: HEADROOM_ADVANCED_DEFAULTS,
-      }
-    );
+      };
+    }
+    // Apply schema defaults so a partial on-disk block (e.g. only {enabled, mode})
+    // is filled with HeadroomConfigSchema's documented defaults rather than
+    // surfacing undefined sub-objects to status/start.
+    return HeadroomConfigSchema.parse(raw);
   }
   /** Enumerate workspaces that have a Headroom override (sparse map, for the
    *  Settings overview). Title is best-effort from workspace metadata. */

@@ -1099,6 +1099,7 @@ export class Config {
           defaultRuntime,
           runtimeEnablement,
           onePasswordAccountName: parseOptionalNonEmptyString(parsed.onePasswordAccountName),
+          headroom: parsed.headroom,
         };
       }
     } catch (error) {
@@ -1375,6 +1376,13 @@ export class Config {
       const onePasswordAccountName = parseOptionalNonEmptyString(config.onePasswordAccountName);
       if (onePasswordAccountName) {
         data.onePasswordAccountName = onePasswordAccountName;
+      }
+
+      // Persist the headroom integration config so it survives config round-trips.
+      // Without this, saveConfig rewrites config.json from a hand-picked field set
+      // and silently drops the headroom block (see loadConfigOrDefault headroom pass-through).
+      if (config.headroom !== undefined) {
+        data.headroom = config.headroom;
       }
 
       await writeFileAtomic(this.configFile, JSON.stringify(data, null, 2), "utf-8");
