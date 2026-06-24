@@ -497,7 +497,9 @@ function sanitizeMoonshotSchema(node: unknown): unknown {
  *    recognized providerOptions keys (reasoningEffort -> body.reasoning_effort),
  *    so buildProviderOptions emits reasoningEffort as a "thinking is on" carrier
  *    that we translate into the field each vendor understands:
- *      - Z.AI/Zhipu (GLM): `thinking: { type: "enabled", clear_thinking: false }`
+ *      - Z.AI/Zhipu (GLM): `thinking: { type: "enabled", clear_thinking: false }`.
+ *        GLM-5.2 additionally keeps the top-level `reasoning_effort` (remapped to
+ *        Z.AI's "max" top tier) since its docs pair it with `thinking:{enabled}`.
  *      - DashScope (Alibaba): top-level `enable_thinking: true`
  *    When thinking is off the carrier is absent, so nothing is injected.
  *
@@ -511,8 +513,20 @@ export function makeOpenAICompatibleBodyTransform(providerName: ProviderName) {
     // 1. Reasoning-carrier translation (zai / alibaba families).
     if (body.reasoning_effort != null) {
       if (providerName === "zai" || providerName === "zai-coding-plan") {
+        const effort = body.reasoning_effort;
         delete body.reasoning_effort;
         body.thinking = { type: "enabled", clear_thinking: false };
+        // GLM-5.2 supports a top-level `reasoning_effort` (per the GLM-5.2 docs,
+        // which pair `thinking:{enabled}` with `reasoning_effort:"max"`). Preserve
+        // it so low/medium/high/xhigh/max actually take effect; the carrier arrives
+        // OpenAI-mapped (xhigh + max both -> "xhigh"), so remap the top tier to
+        // Z.AI's documented "max" value. Older GLM tiers keep strip-only behavior.
+        if (typeof body.model === "string" && typeof effort === "string") {
+          const isGlm52 = /^glm-5\.2(?!-[a-z])/.test(body.model.trim().toLowerCase());
+          if (isGlm52) {
+            body.reasoning_effort = effort === "xhigh" ? "max" : effort;
+          }
+        }
       } else if (providerName === "alibaba" || providerName === "alibaba-coding-plan") {
         delete body.reasoning_effort;
         body.enable_thinking = true;

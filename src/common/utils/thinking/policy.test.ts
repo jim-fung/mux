@@ -768,6 +768,7 @@ describe("OpenAI-compatible vendor reasoning recognition", () => {
   test.each([
     ["zai:glm-4.6"],
     ["zai:glm-5.1"],
+    ["zai:glm-5.2"],
     ["zai:glm-5v-turbo"],
     ["moonshot:kimi-k2-thinking"],
     ["moonshot:kimi-k2.5"],
@@ -783,6 +784,26 @@ describe("OpenAI-compatible vendor reasoning recognition", () => {
   ])("recognizes %s as reasoning (medium floor)", (model) => {
     expect(getDefaultMinimumThinkingLevel(model)).toBe("medium");
     expect(getThinkingPolicyForModel(model)).toContain("high");
+  });
+
+  // GLM-5.2 exposes a 5-level thinking surface capped at `max` (its docs document
+  // only "max" as the top reasoning_effort, so xhigh is omitted — it would be
+  // indistinguishable from max on the wire and in the dropdown). Older GLM tiers
+  // stay on the 4-level generic vendor policy.
+  test("glm-5.2 exposes the 5-level thinking surface capped at max, glm-5.1 does not", () => {
+    expect(getThinkingPolicyForModel("zai:glm-5.2")).toEqual([
+      "off",
+      "low",
+      "medium",
+      "high",
+      "max",
+    ]);
+    expect(getThinkingPolicyForModel("zai:glm-5.1")).toEqual([
+      "off",
+      "low",
+      "medium",
+      "high",
+    ]);
   });
 
   // Non-reasoning variants must NOT be recognized — otherwise DashScope would receive

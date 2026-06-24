@@ -140,6 +140,15 @@ function getExplicitThinkingPolicy(modelString: string): ThinkingPolicy | null {
     return ["low", "high"];
   }
 
+  // GLM-5.2 exposes a 5-level thinking surface capped at `max` (Z.AI's top
+  // reasoning_effort tier, per the GLM-5.2 docs). xhigh is omitted because Z.AI
+  // only documents "max" as the top tier — xhigh and max would be indistinguishable
+  // both on the wire and in the dropdown. Must run before the generic GLM branch
+  // below, which would otherwise shadow it.
+  if (/^glm-5\.2(?!-[a-z])/.test(withoutProviderNamespace)) {
+    return ["off", "low", "medium", "high", "max"];
+  }
+
   // OpenAI-compatible vendor reasoning models (Z.AI/Zhipu GLM, Moonshot Kimi,
   // MiniMax, Xiaomi MiMo, Alibaba Qwen/Qwq). All support a standard on/low/med/high
   // reasoning surface; vendor-specific body shaping happens in buildProviderOptions

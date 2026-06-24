@@ -533,6 +533,19 @@ export const modelsExtra: Record<string, ModelData> = {
     supports_function_calling: true,
     supports_reasoning: true,
   },
+  // GLM-5.2 - Z.AI flagship foundation model (text-only). 1M context, 128K max
+  // output, supports thinking mode. Per-token pricing not yet published on the
+  // GLM-5.2 doc page; mirrored from glm-5.1 as a placeholder.
+  "glm-5.2": {
+    max_input_tokens: 1000000,
+    max_output_tokens: 131072,
+    input_cost_per_token: 0.0000014,
+    output_cost_per_token: 0.0000044,
+    litellm_provider: "zai",
+    mode: "chat",
+    supports_function_calling: true,
+    supports_reasoning: true,
+  },
   "glm-4.5-air": {
     max_input_tokens: 131072,
     max_output_tokens: 98304,

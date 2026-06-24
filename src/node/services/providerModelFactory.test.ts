@@ -42,6 +42,38 @@ describe("makeOpenAICompatibleBodyTransform", () => {
     });
   });
 
+  // GLM-5.2 pairs `thinking:{enabled}` with a top-level `reasoning_effort` (per its
+  // docs). The carrier arrives OpenAI-mapped, so xhigh + max both remap to Z.AI's
+  // documented "max" value; low/medium/high pass through. Older GLM tiers strip it.
+  it("preserves reasoning_effort (remapped to max) for glm-5.2 on zai", () => {
+    const t = makeOpenAICompatibleBodyTransform("zai");
+    expect(t({ reasoning_effort: "xhigh", model: "glm-5.2" })).toEqual({
+      model: "glm-5.2",
+      thinking: { type: "enabled", clear_thinking: false },
+      reasoning_effort: "max",
+    });
+    // mid-tier effort passes through unchanged
+    expect(t({ reasoning_effort: "high", model: "glm-5.2" })).toEqual({
+      model: "glm-5.2",
+      thinking: { type: "enabled", clear_thinking: false },
+      reasoning_effort: "high",
+    });
+    // older GLM tier keeps strip-only behavior (no reasoning_effort on the wire)
+    expect(t({ reasoning_effort: "xhigh", model: "glm-5.1" })).toEqual({
+      model: "glm-5.1",
+      thinking: { type: "enabled", clear_thinking: false },
+    });
+  });
+
+  it("preserves reasoning_effort (remapped to max) for glm-5.2 on zai-coding-plan", () => {
+    const t = makeOpenAICompatibleBodyTransform("zai-coding-plan");
+    expect(t({ reasoning_effort: "xhigh", model: "glm-5.2" })).toEqual({
+      model: "glm-5.2",
+      thinking: { type: "enabled", clear_thinking: false },
+      reasoning_effort: "max",
+    });
+  });
+
   it("translates the carrier to enable_thinking for alibaba (DashScope)", () => {
     const t = makeOpenAICompatibleBodyTransform("alibaba");
     const out = t({ reasoning_effort: "high", model: "qwq-plus" });

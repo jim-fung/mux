@@ -180,14 +180,21 @@ const MODEL_DEFINITIONS = {
   },
   // ---------------------------------------------------------------------------
   // OpenAI-compatible vendor focal models. These give convenient short aliases
-  // (e.g. `glm` -> zai:glm-4.6). Token counting uses the default estimator; the
+  // (e.g. `glm` -> zai:glm-5.2). Token counting uses the default estimator; the
   // vendors have not published ai-tokenizer weights. Per-provider reasoning body
   // shaping is handled in buildProviderOptions + transformRequestBody.
   // ---------------------------------------------------------------------------
   GLM: {
     provider: "zai",
-    providerModelId: "glm-4.6",
+    providerModelId: "glm-5.2",
     aliases: ["glm"],
+  },
+  // GLM-5.1 is the prior Z.AI flagship (200K context, 128K output, text-only);
+  // kept selectable alongside glm-5.2. Bare `glm` stays pinned to the flagship.
+  GLM_5_1: {
+    provider: "zai",
+    providerModelId: "glm-5.1",
+    aliases: ["glm-5.1"],
   },
   KIMI: {
     provider: "moonshot",
