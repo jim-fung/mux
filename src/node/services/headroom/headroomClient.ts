@@ -47,6 +47,15 @@ export interface HeadroomStats {
   };
 }
 
+/** Result of compressing a single text string via /v1/compress. */
+export interface HeadroomContentCompressionResult {
+  compressedText: string;
+  tokensBefore?: number;
+  tokensAfter?: number;
+  tokensSaved?: number;
+  ccrHashes?: string[];
+}
+
 /** Default request timeout for compress calls (compression must not stall chat). */
 const COMPRESS_TIMEOUT_MS = 15_000;
 /** Short timeout for health checks during startup polling. */
@@ -98,6 +107,38 @@ export class HeadroomClient {
     }
     const data = (await res.json()) as { content?: string };
     return data.content ?? null;
+  }
+
+  /**
+   * Compress a raw text string via /v1/compress. Wraps the text as a single
+   * OpenAI-format user message, calls the compress endpoint, and extracts the
+   * compressed text. Returns null on any failure (fail-open — caller should
+   * deliver the original uncompressed content).
+   *
+   * SharedContext convenience: the proxy only accepts OpenAI-format messages,
+   * so raw text must be wrapped before sending.
+   */
+  async compressContent(
+    content: string,
+    model?: string
+  ): Promise<HeadroomContentCompressionResult | null> {
+    try {
+      const messages = [{ role: "user" as const, content }];
+      const res = await this.compress(messages, model);
+      if (!Array.isArray(res.messages) || res.messages.length === 0) return null;
+      const first = res.messages[0] as Record<string, unknown> | undefined;
+      const compressed = first?.content;
+      if (typeof compressed !== "string") return null;
+      return {
+        compressedText: compressed,
+        tokensBefore: res.tokens_before,
+        tokensAfter: res.tokens_after,
+        tokensSaved: res.tokens_saved,
+        ccrHashes: res.ccr_hashes,
+      };
+    } catch {
+      return null;
+    }
   }
 
   /** GET /health — liveness probe. */
