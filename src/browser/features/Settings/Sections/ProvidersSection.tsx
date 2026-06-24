@@ -30,7 +30,11 @@ import { CSS } from "@dnd-kit/utilities";
 
 import { createEditKeyHandler } from "@/browser/utils/ui/keybinds";
 import { getBrowserBackendBaseUrl } from "@/browser/utils/backendBaseUrl";
-import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
+import {
+  PROVIDER_DEFINITIONS,
+  type ProviderDefinition,
+  type ProviderName,
+} from "@/common/constants/providers";
 import { usePolicy } from "@/browser/contexts/PolicyContext";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { getAllowedProvidersForUi } from "@/browser/utils/policyUi";
@@ -172,6 +176,8 @@ function getProviderFields(provider: string, providerInfo?: ProviderConfigInfo):
     return [];
   }
 
+  const providerDefinition: ProviderDefinition = PROVIDER_DEFINITIONS[provider];
+
   if (provider === "bedrock") {
     return [
       { key: "region", label: "Region", placeholder: "us-east-1", type: "text" },
@@ -212,6 +218,18 @@ function getProviderFields(provider: string, providerInfo?: ProviderConfigInfo):
 
   if (provider === "github-copilot") {
     return []; // OAuth-based, no manual key entry
+  }
+
+  if (!providerDefinition.requiresApiKey) {
+    return [
+      {
+        key: "baseUrl",
+        label: "Base URL",
+        placeholder: providerDefinition.defaultBaseUrl ?? "http://localhost:11434/api",
+        type: "text",
+        optional: true,
+      },
+    ];
   }
 
   // Default for most providers

@@ -24,6 +24,7 @@ export type ProviderName =
   | "github-copilot"
   | "bedrock"
   | "ollama"
+  | "lm-studio"
   // OpenAI-compatible vendors (all use @ai-sdk/openai-compatible). Each carries a
   // defaultBaseUrl since createOpenAICompatible has no built-in default endpoint.
   | "zai"
@@ -37,7 +38,7 @@ export type ProviderName =
   | "alibaba"
   | "alibaba-coding-plan";
 
-interface ProviderDefinition {
+export interface ProviderDefinition {
   /** Display name for UI (proper casing) */
   displayName: string;
   /** Dynamic import function for lazy loading */
@@ -189,6 +190,14 @@ export const PROVIDER_DEFINITIONS = {
     factoryName: "createOllama",
     requiresApiKey: false, // Local service
     kind: "local",
+  },
+  "lm-studio": {
+    displayName: "LM Studio",
+    import: () => import("@ai-sdk/openai-compatible"),
+    factoryName: "createOpenAICompatible",
+    requiresApiKey: false, // Local service
+    kind: "local",
+    defaultBaseUrl: "http://localhost:1234/v1",
   },
   // ---------------------------------------------------------------------------
   // OpenAI-compatible vendors. These all use @ai-sdk/openai-compatible and carry

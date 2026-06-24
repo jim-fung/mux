@@ -233,10 +233,25 @@ describe("ProvidersSection", () => {
     const view = renderProvidersSection();
 
     const directHeading = await view.findByText("Direct Providers");
+    const localHeading = await view.findByText("Local");
     const customHeading = await view.findByText("Custom providers");
 
     expect(directHeading.parentElement?.textContent).toContain("OpenAI");
+    expect(localHeading.parentElement?.textContent).toContain("Ollama");
+    expect(localHeading.parentElement?.textContent).toContain("LM Studio");
     expect(customHeading.parentElement?.textContent).toContain("Acme OpenAI");
+  });
+
+  test("shows local-provider fields for LM Studio without API key inputs", async () => {
+    const view = renderProvidersSection();
+    const lmStudioButton = await view.findByRole("button", { name: /LM Studio/ });
+
+    fireEvent.click(lmStudioButton);
+
+    const lmStudioCard = getProviderCard(lmStudioButton);
+    expect(within(lmStudioCard).getByText("Base URL")).toBeTruthy();
+    expect(within(lmStudioCard).queryByText("API Key")).toBeNull();
+    expect(within(lmStudioCard).queryByText("API Key File")).toBeNull();
   });
 
   test("renders a custom provider display name with fallback icon support", async () => {

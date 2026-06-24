@@ -2267,6 +2267,9 @@ export class Config {
 //   },
 //   "ollama": {
 //     "baseUrl": "http://localhost:11434/api"  // Optional - only needed for remote/custom URL
+//   },
+//   "lm-studio": {
+//     "baseUrl": "http://localhost:1234/v1"  // Optional - only needed for remote/custom URL
 //   }
 // }
 ${jsonString}`;

@@ -10,6 +10,7 @@ import type { SendMessageError } from "@/common/types/errors";
 import {
   PROVIDER_REGISTRY,
   PROVIDER_DEFINITIONS,
+  type ProviderDefinition,
   type ProviderName,
 } from "@/common/constants/providers";
 import {
@@ -1154,8 +1155,14 @@ export class ProviderModelFactory {
       const providersConfig = this.config.loadProvidersConfig() ?? {};
       const providerConfigEntry = providersConfig[providerName];
       const providerIsBuiltIn = isBuiltInProvider(providerName);
+      const builtInProviderDefinition: ProviderDefinition | undefined = providerIsBuiltIn
+        ? PROVIDER_DEFINITIONS[providerName]
+        : undefined;
       const providerIsCustomOpenAICompatible =
         providerConfigEntry != null && isCustomOpenAICompatibleProviderConfig(providerConfigEntry);
+      const providerIsBuiltInOpenAICompatible =
+        builtInProviderDefinition?.factoryName === "createOpenAICompatible" &&
+        builtInProviderDefinition.kind !== "gateway";
 
       // Check if provider is supported. Explicit custom OpenAI-compatible config wins
       // even if a future release adds a built-in provider with the same id.
@@ -1270,6 +1277,7 @@ export class ProviderModelFactory {
             const supportsProxyMode =
               providerName === "anthropic" ||
               providerIsCustomOpenAICompatible ||
+              providerIsBuiltInOpenAICompatible ||
               (providerName === "openai" && openaiWireFormat === "chatCompletions");
             if (supportsProxyMode) {
               providerConfig = { ...providerConfig, baseURL: proxyBaseUrl };
@@ -2066,13 +2074,10 @@ export class ProviderModelFactory {
       // explicit SDK `name`, and a transformRequestBody that injects vendor-specific
       // reasoning body fields (see makeOpenAICompatibleBodyTransform).
       {
-        const oaiCompatDef = PROVIDER_DEFINITIONS[providerName as ProviderName];
-        if (
-          oaiCompatDef?.kind === "direct" &&
-          oaiCompatDef.factoryName === "createOpenAICompatible"
-        ) {
+        const oaiCompatDef = builtInProviderDefinition;
+        if (providerIsBuiltInOpenAICompatible && oaiCompatDef) {
           const creds = resolveProviderCredentials(providerName as ProviderName, providerConfig);
-          if (oaiCompatDef.requiresApiKey && !creds.isConfigured) {
+          if (!creds.isConfigured) {
             return Err({ type: "api_key_not_found", provider: providerName });
           }
           const resolvedApiKey = await this.resolveApiKey(creds.apiKey);

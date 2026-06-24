@@ -115,6 +115,13 @@ describe("hasAnyConfiguredProvider", () => {
     );
   });
 
+  it("keeps LM Studio unconfigured until the user opts in", () => {
+    expect(resolveProviderCredentials("lm-studio", {}, {}).isConfigured).toBe(false);
+    expect(
+      resolveProviderCredentials("lm-studio", { models: ["qwen3-coder"] }, {}).isConfigured
+    ).toBe(true);
+  });
+
   it("returns true for enabled custom OpenAI-compatible providers with only a base URL", () => {
     const providers: ProvidersConfig = {
       "local-vllm": {

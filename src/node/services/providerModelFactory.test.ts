@@ -640,6 +640,41 @@ describe("ProviderModelFactory.createModel", () => {
       }
     });
   });
+
+  it("creates built-in LM Studio models after an explicit local opt-in", async () => {
+    await withTempConfig(async (config, factory) => {
+      config.saveProvidersConfig({
+        "lm-studio": {
+          // The user asked for LM Studio to stay unconfigured by default, but once they
+          // opt in by saving a model, runtime should use the built-in localhost endpoint.
+          models: [LOCAL_VLLM_MODEL],
+        },
+      });
+
+      const result = await factory.createModel(`lm-studio:${LOCAL_VLLM_MODEL}`);
+      expect(result.success).toBe(true);
+      if (!result.success) {
+        return;
+      }
+
+      expect((result.data as { provider?: unknown }).provider).toBe("lm-studio.chat");
+      expect(result.data.constructor.name).toBe("OpenAICompatibleChatLanguageModel");
+    });
+  });
+
+  it("keeps built-in LM Studio unavailable until the user explicitly configures it", async () => {
+    await withTempConfig(async (_config, factory) => {
+      const result = await factory.createModel(`lm-studio:${LOCAL_VLLM_MODEL}`);
+
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error).toEqual({
+          type: "api_key_not_found",
+          provider: "lm-studio",
+        });
+      }
+    });
+  });
 });
 
 describe("ProviderModelFactory GitHub Copilot", () => {

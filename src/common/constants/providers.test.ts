@@ -3,7 +3,12 @@
  */
 
 import { describe, test, expect } from "bun:test";
-import { PROVIDER_REGISTRY, SUPPORTED_PROVIDERS, isValidProvider } from "./providers";
+import {
+  PROVIDER_DEFINITIONS,
+  PROVIDER_REGISTRY,
+  SUPPORTED_PROVIDERS,
+  isValidProvider,
+} from "./providers";
 
 describe("Provider Registry", () => {
   test("registry is not empty", () => {
@@ -23,6 +28,11 @@ describe("Provider Registry", () => {
   test("SUPPORTED_PROVIDERS array stays in sync with registry keys", () => {
     // If these don't match, derived array is out of sync
     expect(SUPPORTED_PROVIDERS.length).toBe(Object.keys(PROVIDER_REGISTRY).length);
+  });
+
+  test("LM Studio is registered as a built-in local provider", () => {
+    expect(SUPPORTED_PROVIDERS).toContain("lm-studio");
+    expect(PROVIDER_DEFINITIONS["lm-studio"].kind).toBe("local");
   });
 
   test("isValidProvider rejects invalid providers", () => {
