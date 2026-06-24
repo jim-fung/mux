@@ -6,20 +6,49 @@
   <img src="docs/img/black-mux.svg" alt="mux logo" width="18%" />
 </picture>
 
-# Mux - Coding Agent Multiplexer
+# Mux Fork - Coding Agent Multiplexer
 
-[![Download](https://img.shields.io/badge/Download-Releases-purple)](https://github.com/coder/mux/releases)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%203.0-blue.svg)](LICENSE)
-[![Discord](https://img.shields.io/discord/1446553342699507907?logo=discord&label=Discord)](https://cdr.co/mux-discord)
-[![X (formerly Twitter)](https://img.shields.io/badge/Follow-%40codermux-black?logo=x)](https://x.com/codermux)
 
 </div>
 
-Mux is a desktop & browser application for parallel agentic development. It enables developers to plan and execute tasks with multiple AI agents on local or remote compute.
+This repository is a fork of [Coder's official Mux](https://github.com/coder/mux), a desktop and browser app for parallel agentic development. It keeps the core Mux workflow and UX, while extending it with additional provider and model support plus deeper Headroom integration.
 
 <p><img src="./docs/img/mux-demo.gif" alt="mux product demo" width="100%" /></p>
 
-## Features
+## What Sets This Fork Apart
+
+Compared with the official Mux repo, this fork adds:
+
+- **Chinese direct providers built in**
+  - DeepSeek
+  - Z.AI
+  - Moonshot AI
+  - MiniMax
+  - Xiaomi
+  - Alibaba / DashScope
+- **Chinese built-in models**
+  - DeepSeek V4 Pro / Flash
+  - GLM
+  - Kimi
+  - MiniMax
+  - Mimo
+  - Qwen
+- **Headroom integration with an extensive configuration UI**
+  - Provisioning and runtime controls
+  - Middleware vs proxy modes
+  - Per-provider routing controls
+  - Advanced tuning and presets
+  - Workspace-level overrides
+- **Dedicated Headroom Stats section in Settings**
+  - Live compression totals
+  - Tokens saved
+  - Reduction percentage
+  - Persistent usage totals
+
+## Base Mux Features
+
+Mux is a desktop & browser application for parallel agentic development. It enables developers to plan and execute tasks with multiple AI agents on local or remote compute.
 
 - **Isolated workspaces** with central view on git divergence ([docs](https://mux.coder.com/runtime))
   - **[Local](https://mux.coder.com/runtime/local)**: run directly in your project directory
@@ -35,62 +64,27 @@ Mux is a desktop & browser application for parallel agentic development. It enab
 Mux has a custom agent loop but much of the core UX is inspired by Claude Code. You'll find familiar features like Plan/Exec mode, vim inputs, `/compact` and new ones
 like [opportunistic compaction](https://mux.coder.com/workspaces/compaction) and [mode prompts](https://mux.coder.com/agents/instruction-files#mode-prompts).
 
-**[Read the full documentation →](https://mux.coder.com)**
+## Why This Fork
+
+This fork is aimed at users who want the Mux experience but need:
+
+- Better support for Chinese AI providers without custom provider setup
+- Built-in access to popular Chinese model families from the model picker
+- Stronger Headroom-based context compression controls
+- Better visibility into Headroom behavior through a dedicated stats section
 
 ## Install
 
-Download pre-built binaries from [the releases page](https://github.com/coder/mux/releases) for
-macOS and Linux.
+Use this fork if you want the added provider, model, and Headroom capabilities described above.
 
-[More on installation →](https://mux.coder.com/install)
+If you are looking for upstream Mux releases and documentation, see:
 
-## Screenshots
-
-<!-- Screenshots below are generated from Storybook stories under Docs/README Screenshots -->
-<table>
-<tr>
-<td align="center" width="50%">
-<img src="./docs/img/code-review.webp" alt="Screenshot of code review" width="100%" /><br>
-<sub>Integrated code-review for faster iteration</sub>
-</td>
-<td align="center" width="50%">
-<img src="./docs/img/agent-status.webp" alt="Screenshot of agent status" width="100%" /><br>
-<sub>Agents report their status through the sidebar</sub>
-</td>
-</tr>
-<tr>
-<td align="center" width="50%">
-<img src="./docs/img/git-status.webp" alt="Screenshot of git status" width="100%" /><br>
-<sub>Git divergence UI keeps you looped in on changes and potential conflicts</sub>
-</td>
-<td align="center" width="50%">
-<img src="./docs/img/plan-mermaid.webp" alt="Screenshot of mermaid diagram" width="100%" /><br>
-<sub>Mermaid diagrams make it easier to review complex proposals from the Agent</sub>
-</td>
-</tr>
-<tr>
-<td align="center" colspan="2">
-<img src="./docs/img/costs-tab.webp" alt="Screenshot of costs table" width="50%" /><br>
-<sub>Stay looped in on costs and token consumption</sub>
-</td>
-</tr>
-<tr>
-<td align="center" colspan="2">
-<img src="./docs/img/context-management.webp" alt="Screenshot of context management dialog" width="50%" /><br>
-<sub>Context management dialog keeps compaction controls in one place</sub>
-</td>
-</tr>
-<tr>
-<td align="center" colspan="2">
-<img src="./docs/img/mobile-server-mode.webp" alt="Screenshot of mux mobile UI" width="40%" /><br>
-<sub>Mux server mode has a responsive UI for mobile users</sub>
-</td>
-</tr>
-</table>
+- Official repo: [coder/mux](https://github.com/coder/mux)
+- Official docs: [mux.coder.com](https://mux.coder.com)
 
 ## More reading
 
-See [the documentation](https://mux.coder.com) for more details.
+See [the official Mux documentation](https://mux.coder.com) for the upstream product and core concepts.
 
 ## Development
 
