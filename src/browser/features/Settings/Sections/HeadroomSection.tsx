@@ -1,8 +1,8 @@
 /**
  * Headroom Section — Settings UI for the Headroom context-compression integration.
  *
- * Shows provisioning status, proxy health, token-savings stats, and the global
- * routing mode toggle. Config changes trigger a proxy restart via the backend.
+ * Shows provisioning status, proxy health, and the global routing mode toggle.
+ * Config changes trigger a proxy restart via the backend.
  */
 
 import { useEffect, useState } from "react";
@@ -44,12 +44,6 @@ interface HeadroomStatus {
   memoryEnabled: boolean;
   perProvider: Record<string, string>;
   advanced: HeadroomAdvancedConfig;
-}
-
-interface HeadroomStats {
-  totalRequests: number | null;
-  tokensSaved: number | null;
-  savingsPercent: number | null;
 }
 
 const MODE_OPTIONS = [
@@ -99,7 +93,6 @@ async function doRestart(
 export function HeadroomSection() {
   const { api } = useAPI();
   const [status, setStatus] = useState<HeadroomStatus | null>(null);
-  const [stats, setStats] = useState<HeadroomStats | null>(null);
   const [loading, setLoading] = useState(true);
   const [provisioning, setProvisioning] = useState(false);
   const [perProvider, setPerProvider] = useState<Record<string, "off" | "middleware" | "proxy">>(
@@ -151,8 +144,6 @@ export function HeadroomSection() {
       }
       if (s.perProvider)
         setPerProvider(s.perProvider as Record<string, "off" | "middleware" | "proxy">);
-      const st = await api.headroom.getStats();
-      setStats(st);
       setWorkspaceOverrides(await api.headroom.listWorkspaceHeadroomOverrides());
     } catch {
       // Non-fatal — just show stale status
@@ -164,7 +155,7 @@ export function HeadroomSection() {
   useEffect(() => {
     if (!api) return;
     void refreshStatus();
-    // Poll stats every 10s while the proxy is running.
+    // Refresh status every 10s while the proxy is running.
     const interval = setInterval(() => {
       if (status?.proxyRunning) {
         void refreshStatus();
@@ -519,33 +510,6 @@ export function HeadroomSection() {
           </SelectContent>
         </Select>
       </div>
-
-      {/* Stats */}
-      {stats?.totalRequests != null && stats.totalRequests > 0 && (
-        <div className="bg-background-secondary border-border-medium space-y-2 rounded-lg border p-4">
-          <div className="text-foreground text-sm font-medium">Savings</div>
-          <div className="text-muted grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-xs">
-            <span>Requests:</span>
-            <span className="text-foreground counter-nums">{stats.totalRequests}</span>
-            {stats.tokensSaved != null && (
-              <>
-                <span>Tokens saved:</span>
-                <span className="text-foreground counter-nums">
-                  {stats.tokensSaved.toLocaleString()}
-                </span>
-              </>
-            )}
-            {stats.savingsPercent != null && (
-              <>
-                <span>Reduction:</span>
-                <span className="text-foreground counter-nums">
-                  {stats.savingsPercent.toFixed(1)}%
-                </span>
-              </>
-            )}
-          </div>
-        </div>
-      )}
 
       {/* Advanced settings */}
       <div>

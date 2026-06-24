@@ -1,6 +1,7 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import {
   ArrowLeft,
+  BarChart3,
   Brain,
   Menu,
   Settings,
@@ -39,6 +40,8 @@ import { ServerAccessSection } from "./Sections/ServerAccessSection";
 import { KeybindsSection } from "./Sections/KeybindsSection";
 import { SecuritySection } from "./Sections/SecuritySection";
 import { HeadroomSection } from "./Sections/HeadroomSection";
+import { HeadroomStatsSection } from "./Sections/HeadroomStatsSection";
+import { useAPI } from "@/browser/contexts/API";
 import type { SettingsSection } from "./types";
 
 const LEGACY_EXPERIMENT_SETTINGS_SECTION_IDS = new Set(["goals", "heartbeat"]);
@@ -131,9 +134,20 @@ interface SettingsSectionRedirect {
 
 export function getSettingsSections(
   governorEnabled: boolean,
-  memoryEnabled: boolean
+  memoryEnabled: boolean,
+  headroomStatsEnabled = false
 ): SettingsSection[] {
   const sections = [...BASE_SECTIONS];
+  // Headroom Stats sits adjacent to Headroom (last base entry) and only appears
+  // while Headroom is enabled. Gated by omission (no predicate on SettingsSection).
+  if (headroomStatsEnabled) {
+    sections.push({
+      id: "headroom-stats",
+      label: "Headroom Stats",
+      icon: <BarChart3 className="h-4 w-4" />,
+      component: HeadroomStatsSection,
+    });
+  }
   if (memoryEnabled) {
     sections.push({
       id: "memory",
@@ -156,7 +170,8 @@ export function getSettingsSections(
 export function getSettingsSectionRedirect(
   activeSection: string,
   governorEnabled: boolean,
-  memoryEnabled: boolean
+  memoryEnabled: boolean,
+  headroomStatsEnabled = false
 ): SettingsSectionRedirect | null {
   if (LEGACY_EXPERIMENT_SETTINGS_SECTION_IDS.has(activeSection)) {
     return { section: "experiments", replace: true };
@@ -167,6 +182,10 @@ export function getSettingsSectionRedirect(
   }
 
   if (!memoryEnabled && activeSection === "memory") {
+    return { section: BASE_SECTIONS[0]?.id ?? "general" };
+  }
+
+  if (!headroomStatsEnabled && activeSection === "headroom-stats") {
     return { section: BASE_SECTIONS[0]?.id ?? "general" };
   }
 
@@ -183,10 +202,36 @@ export function SettingsPage(props: SettingsPageProps) {
   const onboardingPause = useOnboardingPause();
   const governorEnabled = useExperimentValue(EXPERIMENT_IDS.MUX_GOVERNOR);
   const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
+  const { api } = useAPI();
+  const [headroomEnabled, setHeadroomEnabled] = useState(false);
+
+  // Headroom Stats is gated on Headroom being enabled. Unlike Governor/Memory
+  // (synchronous experiment flags), Headroom is a backend config flag, so fetch
+  // its status once on mount. getStatus is a cheap sync config + pool lookup.
+  useEffect(() => {
+    if (!api) return;
+    let cancelled = false;
+    api.headroom
+      .getStatus()
+      .then((s) => {
+        if (!cancelled) setHeadroomEnabled(s.enabled);
+      })
+      .catch(() => {
+        // Status unavailable (API still connecting) — keep the section hidden.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [api]);
 
   // Keep routing on a valid section when experiment-owned settings move or disappear.
   useEffect(() => {
-    const redirect = getSettingsSectionRedirect(activeSection, governorEnabled, memoryEnabled);
+    const redirect = getSettingsSectionRedirect(
+      activeSection,
+      governorEnabled,
+      memoryEnabled,
+      headroomEnabled
+    );
     if (!redirect) {
       return;
     }
@@ -197,7 +242,7 @@ export function SettingsPage(props: SettingsPageProps) {
     }
 
     setActiveSection(redirect.section);
-  }, [activeSection, setActiveSection, governorEnabled, memoryEnabled]);
+  }, [activeSection, setActiveSection, governorEnabled, memoryEnabled, headroomEnabled]);
 
   // Close settings on Escape. Uses bubble phase so inner surfaces (Select dropdowns,
   // Popover, Dialog) that call stopPropagation/preventDefault on Escape get first
@@ -216,7 +261,7 @@ export function SettingsPage(props: SettingsPageProps) {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [close]);
-  const sections = getSettingsSections(governorEnabled, memoryEnabled);
+  const sections = getSettingsSections(governorEnabled, memoryEnabled, headroomEnabled);
   const currentSection = sections.find((section) => section.id === activeSection) ?? sections[0];
   const SectionComponent = currentSection.component;
 
