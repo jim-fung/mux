@@ -39,6 +39,7 @@ import { BrowserControlService } from "@/node/services/browser/BrowserControlSer
 import { BrowserSessionStateHub } from "@/node/services/browser/BrowserSessionStateHub";
 import { DevToolsService } from "@/node/services/devToolsService";
 import { HeadroomService } from "@/node/services/headroom/headroomService";
+import { SharedContextStore } from "@/node/services/headroom/sharedContextStore";
 import { SessionTimingService } from "@/node/services/sessionTimingService";
 import { AnalyticsService } from "@/node/services/analytics/analyticsService";
 import { ExperimentsService } from "@/node/services/experimentsService";
@@ -134,6 +135,7 @@ export class ServiceContainer {
   public readonly sessionTimingService: SessionTimingService;
   public readonly devToolsService: DevToolsService;
   public readonly headroomService: HeadroomService;
+  public readonly sharedContextStore: SharedContextStore;
   public readonly browserSessionDiscoveryService: AgentBrowserSessionDiscoveryService;
   public readonly browserBridgeTokenManager: BrowserBridgeTokenManager;
   public readonly browserBridgeServer: BrowserBridgeServer;
@@ -170,6 +172,7 @@ export class ServiceContainer {
     this.analyticsService = new AnalyticsService(config);
     this.devToolsService = new DevToolsService(config);
     this.headroomService = new HeadroomService(config);
+    this.sharedContextStore = new SharedContextStore(this.headroomService);
     this.browserBridgeTokenManager = new BrowserBridgeTokenManager();
 
     // Desktop passes WorkspaceMcpOverridesService explicitly so AIService uses
@@ -235,6 +238,7 @@ export class ServiceContainer {
     });
     this.workspaceService = core.workspaceService;
     this.taskService = core.taskService;
+    this.taskService.setSharedContextStore(this.sharedContextStore);
     this.providerService = core.providerService;
     this.mcpConfigService = core.mcpConfigService;
     this.mcpServerManager = core.mcpServerManager;
