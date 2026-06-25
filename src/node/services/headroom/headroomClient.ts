@@ -38,12 +38,26 @@ export interface HeadroomHealth {
 }
 
 export interface HeadroomStats {
+  // Top-level convenience rollups (kept for any legacy callers). The proxy's
+  // /stats response is nested; the authoritative fields below are read from
+  // their real locations (proxy_inbound / summary.compression / router /
+  // persistent_savings) by the router handler.
   total_requests?: number;
   tokens_saved?: number;
   savings_percent?: number;
+  requests_compressed?: number;
+  proxy_inbound?: { total?: number; by_path?: Record<string, number> };
+  router?: { route_counts?: Record<string, number> };
+  summary?: {
+    compression?: {
+      requests_compressed?: number;
+      total_tokens_removed?: number;
+      avg_compression_pct?: number;
+    };
+  };
+  tokens?: { saved?: number; savings_percent?: number };
   persistent_savings?: {
-    total_tokens_saved?: number;
-    total_requests?: number;
+    lifetime?: { requests?: number; tokens_saved?: number };
   };
 }
 

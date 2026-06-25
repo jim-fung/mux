@@ -963,6 +963,10 @@ export const headroom = {
       totalRequests: z.number().nullable(),
       tokensSaved: z.number().nullable(),
       savingsPercent: z.number().nullable(),
+      /** Requests the proxy actually compressed — the key no-op signal. */
+      requestsCompressed: z.number().nullable(),
+      /** Per-route message counts (user_msg / system_msg / small / non_string …). */
+      routeCounts: z.record(z.string(), z.number()).nullable(),
       persistentTokensSaved: z.number().nullable(),
       persistentRequests: z.number().nullable(),
     }),

@@ -2766,12 +2766,17 @@ export const router = (authToken?: string) => {
         .output(schemas.headroom.getStats.output)
         .handler(async ({ context }) => {
           const stats = await context.headroomService.getStats();
+          // The proxy's /stats response is deeply nested; map the authoritative
+          // fields into a flat shape the UI consumes. `requestsCompressed` is the
+          // key no-op signal (traffic flowing but nothing compressed).
           return {
-            totalRequests: stats?.total_requests ?? null,
-            tokensSaved: stats?.tokens_saved ?? null,
-            savingsPercent: stats?.savings_percent ?? null,
-            persistentTokensSaved: stats?.persistent_savings?.total_tokens_saved ?? null,
-            persistentRequests: stats?.persistent_savings?.total_requests ?? null,
+            totalRequests: stats?.proxy_inbound?.total ?? null,
+            tokensSaved: stats?.summary?.compression?.total_tokens_removed ?? null,
+            savingsPercent: stats?.summary?.compression?.avg_compression_pct ?? null,
+            requestsCompressed: stats?.summary?.compression?.requests_compressed ?? null,
+            routeCounts: stats?.router?.route_counts ?? null,
+            persistentTokensSaved: stats?.persistent_savings?.lifetime?.tokens_saved ?? null,
+            persistentRequests: stats?.persistent_savings?.lifetime?.requests ?? null,
           };
         }),
       provision: t
