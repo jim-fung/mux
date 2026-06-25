@@ -530,12 +530,7 @@ export function buildProviderOptions(
   // makeOpenAICompatibleReasoningTransform (providerModelFactory) then translates into
   // the field each vendor understands. Other vendors (moonshot/minimax/xiaomi) reason
   // natively and need no carrier. Thinking off => no carrier => nothing injected.
-  if (
-    formatProvider === "zai" ||
-    formatProvider === "zai-coding-plan" ||
-    formatProvider === "alibaba" ||
-    formatProvider === "alibaba-coding-plan"
-  ) {
+  if (formatProvider === "zai" || formatProvider === "alibaba") {
     const reasoningEffort = OPENAI_REASONING_EFFORT[effectiveThinking];
     if (!reasoningEffort) {
       log.debug("buildProviderOptions: OAI-compat vendor thinking off", { formatProvider });

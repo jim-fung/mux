@@ -29,15 +29,10 @@ export type ProviderName =
   // OpenAI-compatible vendors (all use @ai-sdk/openai-compatible). Each carries a
   // defaultBaseUrl since createOpenAICompatible has no built-in default endpoint.
   | "zai"
-  | "zai-coding-plan"
   | "moonshot"
   | "minimax"
-  | "minimax-coding-plan"
   | "xiaomi"
-  | "xiaomi-token-plan-sgp"
-  | "xiaomi-token-plan-ams"
-  | "alibaba"
-  | "alibaba-coding-plan";
+  | "alibaba";
 
 export interface ProviderDefinition {
   /** Display name for UI (proper casing) */
@@ -220,14 +215,8 @@ export const PROVIDER_DEFINITIONS = {
     factoryName: "createOpenAICompatible",
     requiresApiKey: true,
     kind: "direct",
-    defaultBaseUrl: "https://api.z.ai/api/paas/v4",
-  },
-  "zai-coding-plan": {
-    displayName: "Z.AI Coding Plan",
-    import: () => import("@ai-sdk/openai-compatible"),
-    factoryName: "createOpenAICompatible",
-    requiresApiKey: true,
-    kind: "direct",
+    // Prefill the coding-plan endpoint: GLM models are served here for coding-plan
+    // subscribers, and this is the default the UI surfaces for the base URL.
     defaultBaseUrl: "https://api.z.ai/api/coding/paas/v4",
   },
   moonshot: {
@@ -246,14 +235,6 @@ export const PROVIDER_DEFINITIONS = {
     kind: "direct",
     defaultBaseUrl: "https://api.minimax.chat/v1",
   },
-  "minimax-coding-plan": {
-    displayName: "MiniMax Coding Plan",
-    import: () => import("@ai-sdk/openai-compatible"),
-    factoryName: "createOpenAICompatible",
-    requiresApiKey: true,
-    kind: "direct",
-    defaultBaseUrl: "https://api.minimax.chat/v1",
-  },
   xiaomi: {
     displayName: "Xiaomi",
     import: () => import("@ai-sdk/openai-compatible"),
@@ -262,36 +243,14 @@ export const PROVIDER_DEFINITIONS = {
     kind: "direct",
     defaultBaseUrl: "https://api.xiaomimimo.com/v1",
   },
-  "xiaomi-token-plan-sgp": {
-    displayName: "Xiaomi (Singapore)",
-    import: () => import("@ai-sdk/openai-compatible"),
-    factoryName: "createOpenAICompatible",
-    requiresApiKey: true,
-    kind: "direct",
-    defaultBaseUrl: "https://token-plan-sgp.xiaomimimo.com/v1",
-  },
-  "xiaomi-token-plan-ams": {
-    displayName: "Xiaomi (Europe)",
-    import: () => import("@ai-sdk/openai-compatible"),
-    factoryName: "createOpenAICompatible",
-    requiresApiKey: true,
-    kind: "direct",
-    defaultBaseUrl: "https://token-plan-ams.xiaomimimo.com/v1",
-  },
   alibaba: {
     displayName: "Alibaba",
     import: () => import("@ai-sdk/openai-compatible"),
     factoryName: "createOpenAICompatible",
     requiresApiKey: true,
     kind: "direct",
-    defaultBaseUrl: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
-  },
-  "alibaba-coding-plan": {
-    displayName: "Alibaba Coding Plan",
-    import: () => import("@ai-sdk/openai-compatible"),
-    factoryName: "createOpenAICompatible",
-    requiresApiKey: true,
-    kind: "direct",
+    // Prefill the coding-plan endpoint (DashScope coding-intl), surfaced as the
+    // base URL default in the UI.
     defaultBaseUrl: "https://coding-intl.dashscope.aliyuncs.com/v1",
   },
 } as const satisfies Record<ProviderName, ProviderDefinition>;

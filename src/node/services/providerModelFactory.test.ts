@@ -65,28 +65,12 @@ describe("makeOpenAICompatibleBodyTransform", () => {
     });
   });
 
-  it("preserves reasoning_effort (remapped to max) for glm-5.2 on zai-coding-plan", () => {
-    const t = makeOpenAICompatibleBodyTransform("zai-coding-plan");
-    expect(t({ reasoning_effort: "xhigh", model: "glm-5.2" })).toEqual({
-      model: "glm-5.2",
-      thinking: { type: "enabled", clear_thinking: false },
-      reasoning_effort: "max",
-    });
-  });
-
   it("translates the carrier to enable_thinking for alibaba (DashScope)", () => {
     const t = makeOpenAICompatibleBodyTransform("alibaba");
     const out = t({ reasoning_effort: "high", model: "qwq-plus" });
     expect(out).toEqual({ model: "qwq-plus", enable_thinking: true });
     // reasoning_effort is stripped (DashScope rejects unknown params).
     expect("reasoning_effort" in out).toBe(false);
-  });
-
-  it("also covers the coding-plan variants", () => {
-    const t = makeOpenAICompatibleBodyTransform("zai-coding-plan");
-    expect(t({ reasoning_effort: "medium" })).toEqual({
-      thinking: { type: "enabled", clear_thinking: false },
-    });
   });
 
   it("is a no-op when thinking is off (no carrier present)", () => {

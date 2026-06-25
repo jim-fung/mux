@@ -245,7 +245,7 @@ function getProviderFields(provider: string, providerInfo?: ProviderConfigInfo):
     {
       key: "baseUrl",
       label: "Base URL",
-      placeholder: "https://api.example.com",
+      placeholder: providerDefinition.defaultBaseUrl ?? "https://api.example.com",
       type: "text",
       optional: true,
     },

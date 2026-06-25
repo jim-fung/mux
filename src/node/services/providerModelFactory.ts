@@ -513,7 +513,7 @@ export function makeOpenAICompatibleBodyTransform(providerName: ProviderName) {
   return (body: Record<string, unknown>): Record<string, unknown> => {
     // 1. Reasoning-carrier translation (zai / alibaba families).
     if (body.reasoning_effort != null) {
-      if (providerName === "zai" || providerName === "zai-coding-plan") {
+      if (providerName === "zai") {
         const effort = body.reasoning_effort;
         delete body.reasoning_effort;
         body.thinking = { type: "enabled", clear_thinking: false };
@@ -528,7 +528,7 @@ export function makeOpenAICompatibleBodyTransform(providerName: ProviderName) {
             body.reasoning_effort = effort === "xhigh" ? "max" : effort;
           }
         }
-      } else if (providerName === "alibaba" || providerName === "alibaba-coding-plan") {
+      } else if (providerName === "alibaba") {
         delete body.reasoning_effort;
         body.enable_thinking = true;
       }

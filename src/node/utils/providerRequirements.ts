@@ -76,10 +76,6 @@ export const PROVIDER_ENV_VARS: Partial<
     apiKey: ["ZHIPU_API_KEY"],
     baseUrl: ["ZAI_BASE_URL"],
   },
-  "zai-coding-plan": {
-    apiKey: ["ZHIPU_API_KEY"],
-    baseUrl: ["ZAI_BASE_URL"],
-  },
   moonshot: {
     apiKey: ["MOONSHOT_API_KEY"],
     baseUrl: ["MOONSHOT_BASE_URL"],
@@ -88,29 +84,13 @@ export const PROVIDER_ENV_VARS: Partial<
     apiKey: ["MINIMAX_API_KEY"],
     baseUrl: ["MINIMAX_BASE_URL"],
   },
-  "minimax-coding-plan": {
-    apiKey: ["MINIMAX_API_KEY"],
-    baseUrl: ["MINIMAX_BASE_URL"],
-  },
   xiaomi: {
-    apiKey: ["XIAOMI_API_KEY"],
-    baseUrl: ["XIAOMI_BASE_URL"],
-  },
-  "xiaomi-token-plan-sgp": {
-    apiKey: ["XIAOMI_API_KEY"],
-    baseUrl: ["XIAOMI_BASE_URL"],
-  },
-  "xiaomi-token-plan-ams": {
     apiKey: ["XIAOMI_API_KEY"],
     baseUrl: ["XIAOMI_BASE_URL"],
   },
   alibaba: {
     apiKey: ["DASHSCOPE_API_KEY"],
     baseUrl: ["ALIBABA_BASE_URL", "DASHSCOPE_BASE_URL"],
-  },
-  "alibaba-coding-plan": {
-    apiKey: ["ALIBABA_CODING_PLAN_API_KEY"],
-    baseUrl: ["ALIBABA_CODING_PLAN_BASE_URL"],
   },
 };
 

@@ -1073,9 +1073,6 @@ describe("buildProviderOptions - OpenAI-compatible vendor reasoning carrier", ()
     expect(buildProviderOptions("zai:glm-4.6", "medium")).toEqual({
       zai: { reasoningEffort: "medium" },
     });
-    expect(buildProviderOptions("zai-coding-plan:glm-5.1", "high")).toEqual({
-      "zai-coding-plan": { reasoningEffort: "high" },
-    });
   });
 
   test("alibaba emits a reasoningEffort carrier when thinking is on", () => {

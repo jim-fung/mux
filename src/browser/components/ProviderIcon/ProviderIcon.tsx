@@ -41,18 +41,12 @@ const PROVIDER_ICONS: Partial<Record<ProviderName, React.FC>> = {
   omlx: OMLXIcon,
   "mux-gateway": GatewayIcon,
   "github-copilot": GitHubIcon,
-  // OpenAI-compatible vendors. One icon per vendor; coding-plan / token-plan
-  // regional variants reuse the vendor icon.
+  // OpenAI-compatible vendors. One icon per vendor.
   zai: ZaiIcon,
-  "zai-coding-plan": ZaiIcon,
   moonshot: MoonshotIcon,
   minimax: MinimaxIcon,
-  "minimax-coding-plan": MinimaxIcon,
   xiaomi: XiaomiIcon,
-  "xiaomi-token-plan-sgp": XiaomiIcon,
-  "xiaomi-token-plan-ams": XiaomiIcon,
   alibaba: AlibabaIcon,
-  "alibaba-coding-plan": AlibabaIcon,
 };
 
 /**

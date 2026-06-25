@@ -445,7 +445,6 @@ describe("OpenAI-compatible vendor credential resolution", () => {
     ["minimax", "MINIMAX_API_KEY"],
     ["xiaomi", "XIAOMI_API_KEY"],
     ["alibaba", "DASHSCOPE_API_KEY"],
-    ["alibaba-coding-plan", "ALIBABA_CODING_PLAN_API_KEY"],
   ] as const)("resolves %s apiKey from its env var", (provider, envVar) => {
     const result = resolveProviderCredentials(provider, {}, { [envVar]: "sk-test" });
     expect(result.isConfigured).toBe(true);
