@@ -9,7 +9,7 @@ import { HEADROOM_ADVANCED_DEFAULTS } from "@/common/config/schemas/headroom";
 const globalConfig: HeadroomConfig = {
   enabled: true,
   autoProvision: true,
-  mode: "middleware",
+  mode: "off",
   perProvider: { openai: "proxy" },
   includeMl: false,
   proxyBaseUrl: null,
@@ -47,7 +47,7 @@ describe("resolveHeadroomConfig", () => {
     const resolved = resolveHeadroomConfig(globalConfig, overrideOf({ enabled: false }));
     expect(resolved.enabled).toBe(false);
     // Untouched routing fields still come from global.
-    expect(resolved.mode).toBe("middleware");
+    expect(resolved.mode).toBe("off");
     expect(resolved.perProvider).toEqual({ openai: "proxy" });
   });
 

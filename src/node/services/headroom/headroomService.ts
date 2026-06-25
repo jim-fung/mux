@@ -4,7 +4,8 @@
  * Owns the lifecycle of the headroom proxy: provisioning (venv + pip install),
  * process supervision (spawn + health-check + teardown), and exposes status/stats
  * to the UI via oRPC. The ProviderModelFactory reads `getProxyBaseUrl()` to know
- * where the proxy is (or null if not running) so it can attach the compress middleware.
+ * where the proxy is (or null if not running) so it can point proxy-mode providers
+ * at it. SharedContext also uses the client to compress subagent reports.
  *
  * Lifecycle hooks: constructed in ServiceContainer (like DevToolsService), started in
  * ServiceContainer.initialize(), stopped in ServiceContainer.dispose(). All operations

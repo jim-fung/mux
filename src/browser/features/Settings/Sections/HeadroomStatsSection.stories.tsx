@@ -33,7 +33,7 @@ function mockHeadroomStatsApi(
     port: 8787,
     runtimeMethod: "uv",
     lastError: null,
-    mode: "middleware",
+    mode: "off",
     autoProvision: true,
     includeMl: false,
     outputShaper: false,

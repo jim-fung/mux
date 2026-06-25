@@ -8,8 +8,9 @@
  *   GET  /health          — liveness + session stats
  *   GET  /stats           — detailed statistics
  *
- * All methods are fail-safe: network/parse errors throw, but callers (notably the
- * compression middleware) catch and degrade gracefully so chat is never blocked.
+ * All methods are fail-safe: network/parse errors throw, but callers (notably
+ * SharedContext, which compresses subagent reports) catch and degrade gracefully
+ * so chat is never blocked.
  */
 
 export interface HeadroomCompressRequest {

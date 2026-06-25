@@ -27,7 +27,7 @@ function createMockHeadroomService(
   const config: HeadroomConfig = {
     enabled: true,
     autoProvision: true,
-    mode: "middleware",
+    mode: "off",
     perProvider: {},
     includeMl: false,
     proxyBaseUrl: null,

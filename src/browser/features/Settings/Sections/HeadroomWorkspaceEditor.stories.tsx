@@ -43,7 +43,7 @@ function mockApi(
 export const AllInherited: Story = {
   render: () => (
     <SettingsSectionStory
-      setup={() => mockApi(null, { enabled: true, mode: "middleware", perProvider: {} })}
+      setup={() => mockApi(null, { enabled: true, mode: "proxy", perProvider: {} })}
     >
       <HeadroomWorkspaceEditor workspaceId="ws1" />
     </SettingsSectionStory>

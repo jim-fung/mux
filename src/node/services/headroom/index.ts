@@ -1,7 +1,5 @@
 export { HeadroomService } from "./headroomService";
 export type { HeadroomStatus, HeadroomStats, HeadroomProvisioningState } from "./headroomService";
-export { createHeadroomCompressMiddleware } from "./headroomCompressMiddleware";
-export type { HeadroomMiddlewareOptions } from "./headroomCompressMiddleware";
 export { HeadroomClient } from "./headroomClient";
 export type { HeadroomContentCompressionResult } from "./headroomClient";
 export { SharedContextStore } from "./sharedContextStore";

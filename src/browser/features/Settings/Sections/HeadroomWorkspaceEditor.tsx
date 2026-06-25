@@ -41,14 +41,13 @@ const ALL_NULL: HeadroomWorkspaceOverride = {
 
 const MODE_OPTIONS = [
   { value: "off", label: "Off" },
-  { value: "middleware", label: "Middleware (all providers)" },
   { value: "proxy", label: "Proxy (Anthropic + OpenAI chat)" },
 ];
 
 interface EffectiveRouting {
   enabled: boolean;
-  mode: "off" | "middleware" | "proxy";
-  perProvider: Record<string, "off" | "middleware" | "proxy">;
+  mode: "off" | "proxy";
+  perProvider: Record<string, "off" | "proxy">;
 }
 
 function Badge({ children }: { children: React.ReactNode }) {
@@ -102,7 +101,7 @@ export function HeadroomWorkspaceEditor(props: HeadroomWorkspaceEditorProps) {
     await api.headroom.setWorkspaceHeadroom({ workspaceId: props.workspaceId, override: next });
   }
 
-  async function setProviderMode(provider: string, mode: "off" | "middleware" | "proxy") {
+  async function setProviderMode(provider: string, mode: "off" | "proxy") {
     const current = override?.perProvider ?? {};
     const updated = { ...current };
     if (mode === "off") delete updated[provider];
@@ -133,11 +132,13 @@ export function HeadroomWorkspaceEditor(props: HeadroomWorkspaceEditorProps) {
             Compression mode
             {!modeOverridden && <Badge>Inherited</Badge>}
           </div>
-          <div className="text-muted text-xs">Middleware works everywhere; proxy is limited.</div>
+          <div className="text-muted text-xs">
+            Proxy compresses Anthropic + OpenAI chat traffic.
+          </div>
         </div>
         <Select
           value={effective.mode}
-          onValueChange={(value) => void patch({ mode: value as "off" | "middleware" | "proxy" })}
+          onValueChange={(value) => void patch({ mode: value as "off" | "proxy" })}
         >
           <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-auto cursor-pointer rounded-md border px-3 text-sm transition-colors">
             <SelectValue />
@@ -165,9 +166,7 @@ export function HeadroomWorkspaceEditor(props: HeadroomWorkspaceEditorProps) {
               </div>
               <Select
                 value={override?.perProvider?.[provider] ?? "off"}
-                onValueChange={(value) =>
-                  void setProviderMode(provider, value as "off" | "middleware" | "proxy")
-                }
+                onValueChange={(value) => void setProviderMode(provider, value as "off" | "proxy")}
               >
                 <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-8 w-[160px] cursor-pointer rounded-md border px-3 text-xs transition-colors">
                   <SelectValue />

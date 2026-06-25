@@ -6,7 +6,14 @@
  */
 
 import { useEffect, useState } from "react";
-import { AlertCircle, CheckCircle2, ChevronDown, ExternalLink, Loader2, RotateCcw } from "lucide-react";
+import {
+  AlertCircle,
+  CheckCircle2,
+  ChevronDown,
+  ExternalLink,
+  Loader2,
+  RotateCcw,
+} from "lucide-react";
 import type {
   HeadroomAdvancedConfig,
   HeadroomWorkspaceOverride,
@@ -25,6 +32,7 @@ import {
   SelectValue,
 } from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import { useAPI } from "@/browser/contexts/API";
+import type { APIClient } from "@/browser/contexts/API";
 import { SUPPORTED_PROVIDERS, PROVIDER_DISPLAY_NAMES } from "@/common/constants/providers";
 
 interface HeadroomStatus {
@@ -48,7 +56,6 @@ interface HeadroomStatus {
 
 const MODE_OPTIONS = [
   { value: "off", label: "Off" },
-  { value: "middleware", label: "Middleware (all providers)" },
   { value: "proxy", label: "Proxy (Anthropic + OpenAI chat)" },
 ];
 
@@ -93,11 +100,12 @@ async function doRestart(
 export function HeadroomSection() {
   const { api } = useAPI();
   const [status, setStatus] = useState<HeadroomStatus | null>(null);
+  const [stats, setStats] = useState<Awaited<ReturnType<APIClient["headroom"]["getStats"]>> | null>(
+    null
+  );
   const [loading, setLoading] = useState(true);
   const [provisioning, setProvisioning] = useState(false);
-  const [perProvider, setPerProvider] = useState<Record<string, "off" | "middleware" | "proxy">>(
-    {}
-  );
+  const [perProvider, setPerProvider] = useState<Record<string, "off" | "proxy">>({});
   const [learnOutput, setLearnOutput] = useState<string | null>(null);
   const [learnLoading, setLearnLoading] = useState(false);
   const [mcpLoading, setMcpLoading] = useState(false);
@@ -132,6 +140,7 @@ export function HeadroomSection() {
     try {
       const s = await api.headroom.getStatus();
       setStatus(s);
+      setStats(await api.headroom.getStats());
       // Sync the tuning draft from live config (only when not actively editing).
       if (s.advanced) {
         setTuningDraft(s.advanced);
@@ -142,8 +151,7 @@ export function HeadroomSection() {
         );
         setExtraArgsText(s.advanced.extraArgs.join(" "));
       }
-      if (s.perProvider)
-        setPerProvider(s.perProvider as Record<string, "off" | "middleware" | "proxy">);
+      if (s.perProvider) setPerProvider(s.perProvider as Record<string, "off" | "proxy">);
       setWorkspaceOverrides(await api.headroom.listWorkspaceHeadroomOverrides());
     } catch {
       // Non-fatal — just show stale status
@@ -168,14 +176,15 @@ export function HeadroomSection() {
   async function toggleEnabled(checked: boolean) {
     if (!api) return;
     setStatus((prev) => (prev ? { ...prev, enabled: checked } : prev));
+    // Enable only flips the master switch; the routing mode is left as-is
+    // (default "off"). Proxy mode is opt-in since it only works for Anthropic
+    // and OpenAI chat-completions providers, so silently picking it could give
+    // a non-compatible provider a no-op path.
     await api.headroom.setConfig({ enabled: checked });
-    if (checked) {
-      await api.headroom.setConfig({ mode: "middleware" });
-    }
     await refreshStatus();
   }
 
-  async function changeMode(mode: "off" | "middleware" | "proxy") {
+  async function changeMode(mode: "off" | "proxy") {
     if (!api) return;
     await api.headroom.setConfig({ mode });
     await refreshStatus();
@@ -335,7 +344,7 @@ export function HeadroomSection() {
     updateTuning("llmlingua", enabled);
   }
 
-  async function setProviderMode(provider: string, mode: "off" | "middleware" | "proxy") {
+  async function setProviderMode(provider: string, mode: "off" | "proxy") {
     if (!api) return;
     const updated = { ...perProvider, [provider]: mode };
     // Remove "off" entries to keep the map sparse (they fall back to global mode)
@@ -354,6 +363,19 @@ export function HeadroomSection() {
   const lastError = status?.lastError ?? null;
   const runtimeMethod = status?.runtimeMethod ?? "none";
   const currentMode = status?.mode ?? "off";
+
+  // No-op hint for the status card: proxy running + real traffic but nothing
+  // compressed. Mirrors the amber warning in HeadroomStatsSection so users see
+  // the signal without leaving the config panel.
+  const requestsCompressed = stats?.requestsCompressed ?? null;
+  const tokensSaved = stats?.tokensSaved ?? null;
+  const isCompressing =
+    requestsCompressed != null ? requestsCompressed > 0 : tokensSaved != null && tokensSaved > 0;
+  const routeCounts = stats?.routeCounts ?? null;
+  const messagesSeen = routeCounts
+    ? Object.values(routeCounts).reduce((sum, n) => sum + (n ?? 0), 0)
+    : 0;
+  const isNoOp = proxyRunning && messagesSeen > 0 && !isCompressing;
 
   // Effective advanced config for the live command preview + validation. Merges
   // the customEnv/extraArgs textareas so the preview reflects un-applied edits.
@@ -428,6 +450,15 @@ export function HeadroomSection() {
           )}
         </div>
         {lastError && <div className="mt-2 text-xs text-red-500">{lastError}</div>}
+        {isNoOp && (
+          <div className="border-warning/60 bg-warning/10 text-warning mt-2 flex items-center gap-2 rounded border px-2 py-1.5 text-xs">
+            <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+            <span>
+              Attached but compressing nothing ({messagesSeen.toLocaleString()} messages seen). Set
+              a Savings profile below to engage compression.
+            </span>
+          </div>
+        )}
         <div className="mt-3 flex gap-2">
           <Button
             onClick={() => void handleProvision()}
@@ -490,13 +521,14 @@ export function HeadroomSection() {
         <div className="flex-1">
           <div className="text-foreground text-sm">Compression mode</div>
           <div className="text-muted text-xs">
-            Middleware works with all providers. Proxy mode only supports Anthropic and OpenAI chat
-            completions.
+            Proxy mode points the provider at the Headroom proxy, which compresses and forwards.
+            Only Anthropic (/v1/messages) and OpenAI chat completions are supported; other wire
+            formats must stay Off.
           </div>
         </div>
         <Select
           value={currentMode}
-          onValueChange={(value) => void changeMode(value as "off" | "middleware" | "proxy")}
+          onValueChange={(value) => void changeMode(value as "off" | "proxy")}
         >
           <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-auto cursor-pointer rounded-md border px-3 text-sm transition-colors">
             <SelectValue />
@@ -580,8 +612,7 @@ export function HeadroomSection() {
               <span className="text-muted text-xs">Presets:</span>
               {HEADROOM_PRESETS.map((preset) => {
                 const isApplying = presetApplyingId === preset.id;
-                const result =
-                  presetResult?.id === preset.id ? presetResult : null;
+                const result = presetResult?.id === preset.id ? presetResult : null;
                 return (
                   <Button
                     key={preset.id}
@@ -972,9 +1003,7 @@ export function HeadroomSection() {
               </div>
               <Select
                 value={perProvider[provider] ?? "off"}
-                onValueChange={(value) =>
-                  void setProviderMode(provider, value as "off" | "middleware" | "proxy")
-                }
+                onValueChange={(value) => void setProviderMode(provider, value as "off" | "proxy")}
               >
                 <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-8 w-[180px] cursor-pointer rounded-md border px-3 text-xs transition-colors">
                   <SelectValue />

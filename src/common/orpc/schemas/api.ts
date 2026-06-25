@@ -1050,8 +1050,8 @@ export const headroom = {
     input: z.object({
       enabled: z.boolean().nullish(),
       autoProvision: z.boolean().nullish(),
-      mode: z.enum(["off", "middleware", "proxy"]).nullish(),
-      perProvider: z.record(z.string(), z.enum(["off", "middleware", "proxy"])).nullish(),
+      mode: z.enum(["off", "proxy"]).nullish(),
+      perProvider: z.record(z.string(), z.enum(["off", "proxy"])).nullish(),
       includeMl: z.boolean().nullish(),
       proxyBaseUrl: z.string().nullable().nullish(),
       telemetry: z.boolean().nullish(),

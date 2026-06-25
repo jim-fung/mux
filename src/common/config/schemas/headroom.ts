@@ -8,19 +8,28 @@ import { z } from "zod";
  * (`headroom proxy`) that compresses tool outputs, logs, files, and conversation
  * history before they reach the model — 60-95% fewer tokens with the same answers.
  *
- * Two integration levers, selectable per provider:
- *  - "middleware": a Vercel AI SDK LanguageModelV3Middleware calls the proxy's
- *    `/v1/compress` endpoint and rewrites the prompt in-process. Works with ALL
- *    providers and wire formats (provider-agnostic).
+ * Routing modes, selectable per provider:
  *  - "proxy": the provider's baseURL is pointed at the Headroom proxy, which
  *    compresses + forwards. Only valid for Anthropic (/v1/messages) and
  *    OpenAI chat-completions; breaks Responses/WebSocket/Google/Bedrock.
+ *  - "off": no in-path compression. Headroom may still be enabled for
+ *    SharedContext (subagent-report compression at delivery) and the proxy
+ *    process may still run to serve /v1/compress.
+ *
+ * The former "middleware" lever (a Vercel AI SDK middleware that called
+ * /v1/compress per request) has been removed: it sat AFTER Mux's own
+ * tool-output caps, compaction-boundary slicing, and per-string sanitization,
+ * so the content it saw was already compressed more aggressively than headroom
+ * itself applies, and it reduced ~0 tokens in practice. `.catch("off")` below
+ * self-heals persisted "middleware" values so old configs keep loading without
+ * a manual migration.
  *
  * Mux auto-provisions an isolated Python venv (`~/.mux/headroom/`) and installs
- * `headroom-ai[proxy]` there, then launches and supervises the proxy. This is the
- * first "integration" of its kind in Mux — there is no generic plugin system yet.
+ * `headroom-ai[proxy]` there, then launches and supervises the proxy.
  */
-export const HeadroomModeSchema = z.enum(["off", "middleware", "proxy"]);
+// Self-healing: a persisted "middleware" value (removed lever) normalizes to
+// "off" on load rather than failing config parse.
+export const HeadroomModeSchema = z.enum(["off", "proxy"]).catch("off");
 
 export type HeadroomMode = z.infer<typeof HeadroomModeSchema>;
 
