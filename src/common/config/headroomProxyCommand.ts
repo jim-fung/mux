@@ -49,6 +49,12 @@ export function buildProxyCommand(
   }
   if (spec.outputShaper) env.HEADROOM_OUTPUT_SHAPER = "1";
   if (spec.memoryEnabled) env.HEADROOM_MEMORY_ENABLED = "1";
+  // Mux invariant: never let the proxy inject its `headroom_retrieve` tool.
+  // Mux has its own tool system and cannot resolve that tool, so in proxy mode
+  // the model would call it and error. /v1/compress (SharedContext) is
+  // compression-only and injects nothing upstream, so this is harmless there.
+  argv.push("--no-ccr-inject-tool");
+  env.HEADROOM_NO_CCR_INJECT_TOOL = "1";
 
   applyAdvanced(argv, env, spec.advanced);
   return { argv, env };
