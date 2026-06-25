@@ -39,7 +39,7 @@ Compared with the official Mux repo, this fork adds:
   - oMLX (`http://localhost:8000/v1`)
 - **Headroom integration with an extensive configuration UI**
   - Provisioning and runtime controls
-  - Middleware vs proxy modes
+  - Proxy mode (Anthropic + OpenAI chat-completions providers)
   - Per-provider routing controls
   - Advanced tuning and presets
   - Workspace-level overrides
