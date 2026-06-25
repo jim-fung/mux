@@ -63,6 +63,14 @@ const FULL_STATS = {
   totalRequests: 1284,
   tokensSaved: 982_311,
   savingsPercent: 71.4,
+  requestsCompressed: 1284,
+  routeCounts: {
+    user_msg: 200,
+    system_msg: 50,
+    small: 400,
+    non_string: 300,
+    cache_hit: 334,
+  },
   persistentTokensSaved: 5_120_998,
   persistentRequests: 6731,
 };
@@ -91,13 +99,16 @@ export const Empty: Story = {
   render: () => (
     <SettingsSectionStory
       setup={() =>
-        setupHeadroomStatsStory({}, {
-          totalRequests: null,
-          tokensSaved: null,
-          savingsPercent: null,
-          persistentTokensSaved: null,
-          persistentRequests: null,
-        })
+        setupHeadroomStatsStory(
+          {},
+          {
+            totalRequests: null,
+            tokensSaved: null,
+            savingsPercent: null,
+            persistentTokensSaved: null,
+            persistentRequests: null,
+          }
+        )
       }
     >
       <HeadroomStatsSection />
@@ -106,6 +117,43 @@ export const Empty: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await canvas.findByText("No compression stats yet");
+  },
+};
+
+/** Proxy running with real traffic but compressing nothing — the "isn't doing
+ *  anything" failure mode. Asserts the amber no-op warning renders. */
+export const NoOp: Story = {
+  render: () => (
+    <SettingsSectionStory
+      setup={() =>
+        setupHeadroomStatsStory(
+          {},
+          {
+            totalRequests: 1284,
+            tokensSaved: 0,
+            savingsPercent: 0,
+            requestsCompressed: 0,
+            routeCounts: {
+              user_msg: 600,
+              system_msg: 200,
+              small: 300,
+              non_string: 184,
+              cache_hit: 0,
+            },
+            persistentTokensSaved: 0,
+            persistentRequests: 0,
+          }
+        )
+      }
+    >
+      <HeadroomStatsSection />
+    </SettingsSectionStory>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByText("Headroom is attached but hasn't compressed anything");
+    // The breakdown of why messages were skipped must render.
+    await canvas.findByText(/protected/);
   },
 };
 
