@@ -193,6 +193,8 @@ export interface SlashCommandContext extends Omit<CommandHandlerContext, "worksp
   attachedReviewIds?: string[];
 }
 
+export const WORKFLOW_FREEFORM_ARGS_ERROR_MESSAGE =
+  "Freeform workflow arguments are unsupported. Use JSON args or ask the agent to run the workflow.";
 const WORKFLOW_COMMAND_SUPERSEDED_MESSAGE = "Workflow command was superseded.";
 const WORKFLOW_TERMINAL_STATUSES = new Set(["completed", "failed", "interrupted"]);
 const WORKFLOW_POLL_INTERVAL_MS = 2_000;
@@ -243,11 +245,11 @@ function parseWorkflowSlashArgs(argsText: string | undefined): unknown {
     return {};
   }
 
-  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+  try {
     return JSON.parse(trimmed) as unknown;
+  } catch {
+    throw new Error(WORKFLOW_FREEFORM_ARGS_ERROR_MESSAGE);
   }
-
-  return { input: trimmed };
 }
 
 // ============================================================================
