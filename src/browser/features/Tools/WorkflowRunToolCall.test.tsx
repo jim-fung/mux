@@ -1652,6 +1652,75 @@ describe("WorkflowRunToolCall", () => {
     expect(workflowHeader.textContent).not.toContain("pending");
   });
 
+  test("fetches full inline run details when a completed tool output was source-redacted", async () => {
+    const inlineSource =
+      'export default function workflow({ args }) { return { reportMarkdown: "Inline workflow received " + args.value }; }\n';
+    const fullRun: WorkflowRunRecord = {
+      id: "wfr_inline_redacted_source",
+      workspaceId: TEST_WORKSPACE_ID,
+      workflow: {
+        name: "inline-c5ab4a2c0aba",
+        description: "Inline workflow",
+        scope: "project",
+        sourcePath: "inline://workflow-c5ab4a2c0aba.js",
+        requestedScriptPath: "inline://workflow-c5ab4a2c0aba.js",
+        canonicalScriptPath: "inline://workflow-c5ab4a2c0aba.js",
+        sourceKind: "inline",
+        sourceHash: "c5ab4a2c0aba",
+        executable: true,
+      },
+      source: inlineSource,
+      sourceHash: "c5ab4a2c0aba",
+      args: { value: "ok" },
+      status: "completed",
+      createdAt: "2026-06-28T00:00:00.000Z",
+      updatedAt: "2026-06-28T00:00:01.000Z",
+      events: [
+        { sequence: 1, type: "phase", at: "2026-06-28T00:00:00.000Z", name: "inline-smoke" },
+        {
+          sequence: 2,
+          type: "result",
+          at: "2026-06-28T00:00:01.000Z",
+          result: { reportMarkdown: "Inline workflow received ok" },
+        },
+        { sequence: 3, type: "status", at: "2026-06-28T00:00:01.000Z", status: "completed" },
+      ],
+      steps: [],
+    };
+    const getRun = mock(async () => fullRun);
+
+    const view = render(
+      <APIHarness client={{ workflows: { getRun } }}>
+        <ThemeProvider forcedTheme="dark">
+          <TooltipProvider>
+            <WorkflowRunToolCall
+              args={{
+                script_source: inlineSource,
+                args: { value: "ok" },
+                run_in_background: false,
+              }}
+              status="completed"
+              result={{
+                status: "completed",
+                runId: fullRun.id,
+                result: { reportMarkdown: "Inline workflow received ok" },
+              }}
+              workspaceId={TEST_WORKSPACE_ID}
+            />
+          </TooltipProvider>
+        </ThemeProvider>
+      </APIHarness>
+    );
+
+    fireEvent.click(getWorkflowHeader(view));
+
+    await waitFor(() =>
+      expect(getRun).toHaveBeenCalledWith({ workspaceId: TEST_WORKSPACE_ID, runId: fullRun.id })
+    );
+    await waitFor(() => expect(view.getByText("Script source")).toBeTruthy());
+    expect(view.getByText(/Inline workflow received ok/)).toBeTruthy();
+  });
+
   test("renders attached foreground workflow runs without heuristic discovery", async () => {
     const attachedRun = {
       id: "wfr_attached",
@@ -1869,6 +1938,86 @@ describe("WorkflowRunToolCall", () => {
 
     await waitFor(() => expect(interrupt).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(getWorkflowHeader(view).textContent).toContain("interrupted"));
+  });
+
+  test("discovers foreground inline workflow runs by source equality", async () => {
+    const inlineSource =
+      "export default function workflow() { return { reportMarkdown: 'inline' }; }\n";
+    const inlineRun = {
+      id: "wfr_inline_foreground",
+      workspaceId: "workspace-1",
+      workflow: {
+        name: "inline-123456789abc",
+        description: "Inline workflow",
+        scope: "project" as const,
+        sourcePath: "inline://workflow-123456789abc.js",
+        requestedScriptPath: "inline://workflow-123456789abc.js",
+        canonicalScriptPath: "inline://workflow-123456789abc.js",
+        sourceKind: "inline" as const,
+        sourceHash: "123456789abc",
+        executable: true,
+      },
+      source: inlineSource,
+      sourceHash: "sha256:inline",
+      args: { value: "ok" },
+      status: "running" as const,
+      createdAt: "2026-05-29T00:00:00.490Z",
+      updatedAt: "2026-05-29T00:00:02.000Z",
+      events: [
+        {
+          sequence: 1,
+          type: "phase" as const,
+          at: "2026-05-29T00:00:02.000Z",
+          name: "inline-smoke",
+        },
+      ],
+      steps: [],
+    };
+    const pathRun = {
+      ...inlineRun,
+      id: "wfr_path_foreground",
+      workflow: {
+        ...inlineRun.workflow,
+        sourceKind: "workspace-file" as const,
+        sourcePath: "./workflows/inline.js",
+        requestedScriptPath: "./workflows/inline.js",
+        canonicalScriptPath: "./workflows/inline.js",
+      },
+    };
+    const listRuns = mock(async () => [pathRun, inlineRun]);
+    const getRun = mock(async () => inlineRun);
+    const api = {
+      workflows: {
+        listRuns,
+        getRun,
+      },
+    };
+
+    const view = render(
+      <APIHarness client={api}>
+        <ThemeProvider forcedTheme="dark">
+          <TooltipProvider>
+            <WorkflowRunToolCall
+              args={{
+                script_source: inlineSource,
+                args: { value: "ok" },
+                run_in_background: false,
+              }}
+              status="executing"
+              workspaceId="workspace-1"
+              startedAt={Date.parse("2026-05-29T00:00:00.500Z")}
+            />
+          </TooltipProvider>
+        </ThemeProvider>
+      </APIHarness>
+    );
+
+    expect(getWorkflowHeader(view).textContent).toContain("inline workflow");
+    await waitFor(() => expect(view.getByText("wfr_inline_foreground")).toBeTruthy());
+    expect(view.queryByText("wfr_path_foreground")).toBeNull();
+    expect(view.getByText("inline-smoke")).toBeTruthy();
+    expect(getWorkflowHeader(view).textContent).toContain("inline-123456789abc");
+    expect(listRuns).toHaveBeenCalledWith({ workspaceId: "workspace-1" });
   });
 
   test("does not attach ambiguous foreground workflow run matches", async () => {

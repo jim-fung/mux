@@ -1046,8 +1046,37 @@ function getNewestWorkflowRunSnapshot(
   return compareWorkflowRunSnapshots(current, next) > 0 ? current : next;
 }
 
+function getWorkflowRunSource(run: WorkflowRunRecord | null | undefined): string | null {
+  const source = (run as { source?: unknown } | null | undefined)?.source;
+  return typeof source === "string" && source.length > 0 ? source : null;
+}
+
 function getWorkflowRunScriptPath(args: WorkflowRunToolDisplayArgs): string {
   return args.script_path ?? ("name" in args ? args.name : "");
+}
+
+function getWorkflowRunDisplayName(args: WorkflowRunToolDisplayArgs): string {
+  const scriptPath = getWorkflowRunScriptPath(args);
+  if (scriptPath.length > 0) {
+    return scriptPath;
+  }
+  return args.script_source != null ? "inline workflow" : "";
+}
+
+function workflowRunMatchesLaunchArgs(
+  run: WorkflowRunRecord,
+  args: WorkflowRunToolDisplayArgs
+): boolean {
+  const invocationArgs = args.args ?? {};
+  if (!workflowArgsEqual(run.args ?? {}, invocationArgs)) {
+    return false;
+  }
+  if (args.script_source != null) {
+    return run.workflow.sourceKind === "inline" && getWorkflowRunSource(run) === args.script_source;
+  }
+  const scriptPath = getWorkflowRunScriptPath(args);
+  assert(scriptPath.length > 0, "workflowRunMatchesLaunchArgs requires a script path");
+  return workflowScriptMatchesPath(run.workflow, scriptPath);
 }
 
 function findForegroundWorkflowRun(input: {
@@ -1055,14 +1084,10 @@ function findForegroundWorkflowRun(input: {
   args: WorkflowRunToolDisplayArgs;
   startedAt?: number;
 }): WorkflowRunRecord | null {
-  const scriptPath = getWorkflowRunScriptPath(input.args);
-  assert(scriptPath.length > 0, "findForegroundWorkflowRun requires a script path");
-  const invocationArgs = input.args.args ?? {};
   const candidates = input.runs.filter(
     (run) =>
-      workflowScriptMatchesPath(run.workflow, scriptPath) &&
+      workflowRunMatchesLaunchArgs(run, input.args) &&
       DISCOVERABLE_FOREGROUND_WORKFLOW_STATUSES.has(run.status) &&
-      workflowArgsEqual(run.args ?? {}, invocationArgs) &&
       isFreshEnoughForToolCall(run, input.startedAt)
   );
   if (candidates.length !== 1) {
@@ -1205,9 +1230,11 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
   const resumeOrRetryPendingForRun =
     runId != null && (resumingRunId === runId || workflowControlInFlightRunId === runId);
   const displayWorkflow = run?.workflow;
+  const runSource = getWorkflowRunSource(run);
+  const workflowWorkspaceId = run?.workspaceId ?? workspaceId;
   // workflow_resume cards only know the run ID until a snapshot loads; prefer the real
   // workflow name once available.
-  const displayName = displayWorkflow?.name ?? getWorkflowRunScriptPath(args);
+  const displayName = displayWorkflow?.name ?? getWorkflowRunDisplayName(args);
   // A uniquely discovered foreground run is actionable before the blocking tool call returns.
   const discoveredForegroundRunConfirmed =
     status === "executing" &&
@@ -1424,6 +1451,40 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
     };
   }, [apiState?.api, exactDiscoveryRunId, run, status, workspaceId]);
 
+  // Tool output redaction can strip `run.source` from completed cards; fetch the full durable
+  // run lazily when the user expands the card so the Script source disclosure remains useful.
+  useEffect(() => {
+    if (
+      !expanded ||
+      apiState?.api == null ||
+      runId == null ||
+      workflowWorkspaceId == null ||
+      runSource != null
+    ) {
+      return;
+    }
+
+    let ignore = false;
+    const refresh = async () => {
+      try {
+        const nextRun = await apiState.api.workflows.getRun({
+          workspaceId: workflowWorkspaceId,
+          runId,
+        });
+        if (!ignore && nextRun != null) {
+          setRefreshedRun((current) => getNewestWorkflowRunSnapshot(current, nextRun));
+        }
+      } catch (error) {
+        console.error("Failed to load workflow run source:", error);
+      }
+    };
+
+    void refresh();
+    return () => {
+      ignore = true;
+    };
+  }, [apiState?.api, expanded, runId, runSource, workflowWorkspaceId]);
+
   useEffect(() => {
     if (
       apiState?.api == null ||
@@ -1497,14 +1558,10 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
             <WorkflowJsonBlock value={invocationArgs} className="max-h-[180px]" />
           </WorkflowDisclosureSection>
 
-          {run?.source && (
+          {runSource && (
             <WorkflowDisclosureSection title="Script source">
               <div className="border-border bg-code-bg max-h-[260px] overflow-auto rounded border p-2">
-                <HighlightedCode
-                  language="javascript"
-                  code={run.source.trimEnd()}
-                  showLineNumbers
-                />
+                <HighlightedCode language="javascript" code={runSource.trimEnd()} showLineNumbers />
               </div>
             </WorkflowDisclosureSection>
           )}
