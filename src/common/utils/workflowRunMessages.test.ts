@@ -6,14 +6,14 @@ import { buildWorkflowRunToolPart, stripWorkflowRunRecordForModel } from "./work
 const run: WorkflowRunRecord = {
   id: "wfr_test",
   workspaceId: "workspace-1",
-  definition: {
+  workflow: {
     name: "nested-parent-simple",
     description: "Nested parent",
-    scope: "scratch",
+    scope: "project",
     executable: true,
   },
-  definitionSource: "export default function workflow() { return { reportMarkdown: 'done' }; }",
-  definitionHash: "sha256:test",
+  source: "export default function workflow() { return { reportMarkdown: 'done' }; }",
+  sourceHash: "sha256:test",
   args: {},
   status: "completed",
   createdAt: "2026-05-29T00:00:00.000Z",
@@ -36,6 +36,29 @@ describe("workflowRunMessages", () => {
       runId: run.id,
       result: { reportMarkdown: "done" },
     });
+  });
+
+  test("strips durable inline run source while preserving original tool input source", () => {
+    const inlineSource = "export default function inlineSecretWorkflow() { return null; }";
+    const part = buildWorkflowRunToolPart(
+      { scriptSource: inlineSource, args: { value: "ok" } },
+      {
+        runId: run.id,
+        status: "completed",
+        result: { reportMarkdown: "done" },
+        run: { ...run, source: inlineSource },
+      },
+      1_000
+    );
+
+    expect(part.state).toBe("output-available");
+    if (part.state !== "output-available") {
+      throw new Error("Expected workflow run tool part to include output");
+    }
+    const stripped = stripWorkflowRunRecordForModel(part.toolName, part.output);
+
+    expect(part.input).toMatchObject({ script_source: inlineSource });
+    expect(JSON.stringify(stripped)).not.toContain("inlineSecretWorkflow");
   });
 
   test("preserves run snapshots in UI workflow card tool parts", () => {

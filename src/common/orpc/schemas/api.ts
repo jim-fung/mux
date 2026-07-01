@@ -6,6 +6,10 @@ import { WORKTREE_ARCHIVE_BEHAVIORS } from "@/common/config/worktreeArchiveBehav
 import { HEARTBEAT_MAX_INTERVAL_MS, HEARTBEAT_MIN_INTERVAL_MS } from "@/constants/heartbeat";
 import { DEFAULT_GOAL_DEFAULTS } from "@/constants/goals";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import {
+  MAX_STAGED_ATTACHMENT_BASE64_CHARS,
+  MAX_STAGED_ATTACHMENT_SIZE_BYTES,
+} from "@/common/constants/stagedAttachments";
 import { ChatStatsSchema, SessionUsageFileSchema } from "./chatStats";
 import { AdditionalSystemContextSchema, WorkspaceInstructionsSchema } from "./instructions";
 import {
@@ -34,7 +38,7 @@ import {
   GoalSetErrorSchema,
   GoalSetInputSchema,
 } from "./goal";
-import { ProjectConfigSchema, ProjectWorkflowScheduleSchema } from "./project";
+import { ProjectConfigSchema } from "./project";
 import {
   MemoryChangeEventSchema,
   MemoryConsolidationRecordSchema,
@@ -75,7 +79,6 @@ import {
   WorkspaceActivitySnapshotSchema,
   WorkspaceGoalDefaultsOverrideSchema,
   WorkspaceHeartbeatSettingsSchema,
-  WorkspaceWorkflowScheduleSchema,
 } from "./workspace";
 import { WorkspaceAISettingsSchema } from "./workspaceAiSettings";
 import {
@@ -85,11 +88,11 @@ import {
   SkillNameSchema,
 } from "./agentSkill";
 import {
-  WorkflowDefinitionDescriptorSchema,
-  WorkflowNameSchema,
+  AvailableWorkflowSchema,
   WorkflowRunIdSchema,
   WorkflowRunRecordSchema,
   WorkflowRunStatusSchema,
+  WorkflowRunStreamEventSchema,
 } from "./workflow";
 import {
   AgentDefinitionDescriptorSchema,
@@ -172,6 +175,17 @@ export const ProjectGitStatusResultSchema = z.object({
 
 export type ProjectGitStatusResult = z.infer<typeof ProjectGitStatusResultSchema>;
 
+export const BackgroundProcessMonitorInfoSchema = z.object({
+  filter: z.string(),
+  filter_exclude: z.boolean(),
+  cooldown_ms: z.number(),
+  max_events: z.number().optional(),
+  totalMatches: z.number(),
+  droppedLines: z.number(),
+  lastLines: z.array(z.string()),
+  stopped: z.boolean(),
+});
+
 // Background process info (for UI display)
 export const BackgroundProcessInfoSchema = z.object({
   id: z.string(),
@@ -180,6 +194,7 @@ export const BackgroundProcessInfoSchema = z.object({
   displayName: z.string().optional(),
   startTime: z.number(),
   status: BackgroundProcessStatusSchema,
+  monitor: BackgroundProcessMonitorInfoSchema.optional(),
   exitCode: z.number().optional(),
 });
 
@@ -616,13 +631,6 @@ export const mcpOauth = {
   },
 };
 
-const ProjectWorkflowScheduleInputSchema = ProjectWorkflowScheduleSchema.omit({
-  id: true,
-  lastRunStartedAt: true,
-}).extend({
-  id: z.string().min(1).optional(),
-});
-
 // Projects
 export const projects = {
   create: {
@@ -728,28 +736,6 @@ export const projects = {
       })
       .passthrough(),
     output: z.void(),
-  },
-  workflowSchedules: {
-    set: {
-      input: z
-        .object({
-          projectPath: z.string().min(1),
-          schedule: ProjectWorkflowScheduleInputSchema,
-        })
-        .strict(),
-      output: ResultSchema(ProjectWorkflowScheduleSchema, z.string()),
-    },
-    run: {
-      input: z.object({ projectPath: z.string().min(1), scheduleId: z.string().min(1) }).strict(),
-      output: ResultSchema(
-        z.object({ runId: WorkflowRunIdSchema, status: WorkflowRunStatusSchema }),
-        z.string()
-      ),
-    },
-    remove: {
-      input: z.object({ projectPath: z.string().min(1), scheduleId: z.string().min(1) }).strict(),
-      output: ResultSchema(z.void(), z.string()),
-    },
   },
   mcp: {
     list: {
@@ -1321,18 +1307,6 @@ export const workspace = {
     }),
     output: ResultSchema(z.object({ tags: z.record(z.string(), z.string()) }), z.string()),
   },
-  setWorkflowSchedule: {
-    /**
-     * Set (or clear, with null) the workspace's scheduled workflow run.
-     * lastRunStartedAt is scheduler-owned state and not settable by callers;
-     * (re)setting a schedule makes it immediately due.
-     */
-    input: z.object({
-      workspaceId: z.string(),
-      schedule: WorkspaceWorkflowScheduleSchema.omit({ lastRunStartedAt: true }).nullable(),
-    }),
-    output: ResultSchema(z.void(), z.string()),
-  },
   regenerateTitle: {
     input: z.object({ workspaceId: z.string() }),
     output: ResultSchema(z.object({ title: z.string() }), z.string()),
@@ -1448,6 +1422,39 @@ export const workspace = {
       }),
       z.object({ success: z.literal(false), error: z.string() }),
     ]),
+  },
+  stageAttachment: {
+    input: z.object({
+      workspaceId: z.string(),
+      filename: z.string(),
+      mediaType: z.string().nullish(),
+      sizeBytes: z.number().int().nonnegative().max(MAX_STAGED_ATTACHMENT_SIZE_BYTES),
+      dataBase64: z.string().max(MAX_STAGED_ATTACHMENT_BASE64_CHARS),
+    }),
+    output: ResultSchema(
+      z.object({
+        filename: z.string(),
+        mediaType: z.string(),
+        sizeBytes: z.number().int().nonnegative(),
+        stagedPath: z.string(),
+      }),
+      z.string()
+    ),
+  },
+  downloadStagedAttachment: {
+    input: z.object({
+      workspaceId: z.string(),
+      stagedPath: z.string(),
+    }),
+    output: ResultSchema(
+      z.object({
+        filename: z.string(),
+        mediaType: z.string(),
+        sizeBytes: z.number().int().nonnegative().max(MAX_STAGED_ATTACHMENT_SIZE_BYTES),
+        dataBase64: z.string().max(MAX_STAGED_ATTACHMENT_BASE64_CHARS),
+      }),
+      z.string()
+    ),
   },
   sendMessage: {
     input: z.object({
@@ -2016,31 +2023,8 @@ export const agentSkills = {
   },
 };
 
-const WorkflowDefinitionDiscoveryInputSchema = z.union([
-  z
-    .object({
-      projectPath: z.string().min(1),
-      workspaceId: z.never().optional(),
-    })
-    .strict(),
-  z
-    .object({
-      workspaceId: z.string().min(1),
-      projectPath: z.string().min(1).optional(),
-    })
-    .strict(),
-]);
-
 // Workflows
 export const workflows = {
-  listDefinitions: {
-    input: WorkflowDefinitionDiscoveryInputSchema,
-    output: z.array(WorkflowDefinitionDescriptorSchema),
-  },
-  readDefinition: {
-    input: z.object({ workspaceId: z.string().min(1), name: WorkflowNameSchema }).strict(),
-    output: z.object({ descriptor: WorkflowDefinitionDescriptorSchema, source: z.string().min(1) }),
-  },
   listRuns: {
     input: z.object({ workspaceId: z.string().min(1) }).strict(),
     output: z.array(WorkflowRunRecordSchema),
@@ -2069,36 +2053,11 @@ export const workflows = {
       result: z.unknown(),
     }),
   },
-  promoteScratchDefinition: {
-    input: z
-      .object({
-        workspaceId: z.string().min(1),
-        name: WorkflowNameSchema,
-        description: z.string().min(1).max(1024),
-        location: z.enum(["project", "global"]),
-        overwrite: z.boolean().optional(),
-      })
-      .strict(),
-    output: WorkflowDefinitionDescriptorSchema,
-  },
-  promoteScratch: {
-    input: z
-      .object({
-        workspaceId: z.string().min(1),
-        runId: WorkflowRunIdSchema,
-        name: WorkflowNameSchema,
-        description: z.string().min(1).max(1024),
-        location: z.enum(["project", "global"]),
-        overwrite: z.boolean().optional(),
-      })
-      .strict(),
-    output: WorkflowDefinitionDescriptorSchema,
-  },
   start: {
     input: z
       .object({
         workspaceId: z.string().min(1),
-        name: WorkflowNameSchema,
+        scriptPath: z.string().min(1),
         runInBackground: z.boolean().optional(),
         args: z.unknown().optional(),
         rawCommand: z.string().min(1).optional(),
@@ -2111,6 +2070,14 @@ export const workflows = {
       result: z.unknown(),
       invocationMessagePersisted: z.boolean().optional(),
     }),
+  },
+  subscribe: {
+    input: z.object({ workspaceId: z.string().min(1) }).strict(),
+    output: eventIterator(WorkflowRunStreamEventSchema),
+  },
+  listScripts: {
+    input: z.object({ workspaceId: z.string().min(1) }).strict(),
+    output: z.array(AvailableWorkflowSchema),
   },
 };
 

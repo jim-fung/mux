@@ -385,6 +385,36 @@ describe("getThinkingPolicyForModel", () => {
     ]);
   });
 
+  test("returns all 6 levels for Sonnet 5 (native xhigh)", () => {
+    // Sonnet 5 introduced the native xhigh effort level for the Sonnet tier, so it exposes
+    // all 6 levels (unlike Sonnet 4.6, which maps xhigh -> "max" and stops at 5).
+    expect(getThinkingPolicyForModel("anthropic:claude-sonnet-5")).toEqual([
+      "off",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+    expect(getThinkingPolicyForModel("anthropic:claude-sonnet-5-20260630")).toEqual([
+      "off",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+    // Behind gateway
+    expect(getThinkingPolicyForModel("mux-gateway:anthropic/claude-sonnet-5")).toEqual([
+      "off",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+  });
+
   test("returns 5 levels including xhigh for Sonnet 4.6", () => {
     expect(getThinkingPolicyForModel("anthropic:claude-sonnet-4-6")).toEqual([
       "off",
@@ -798,12 +828,7 @@ describe("OpenAI-compatible vendor reasoning recognition", () => {
       "high",
       "max",
     ]);
-    expect(getThinkingPolicyForModel("zai:glm-5.1")).toEqual([
-      "off",
-      "low",
-      "medium",
-      "high",
-    ]);
+    expect(getThinkingPolicyForModel("zai:glm-5.1")).toEqual(["off", "low", "medium", "high"]);
   });
 
   // Non-reasoning variants must NOT be recognized — otherwise DashScope would receive

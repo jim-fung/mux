@@ -18,6 +18,7 @@ import { MarkdownRenderer } from "@/browser/features/Messages/MarkdownRenderer";
 import { useTranscriptContextMenu } from "@/browser/features/Messages/useTranscriptContextMenu";
 import type { UserMessageNavigation } from "@/browser/features/Messages/UserMessage";
 import { InterruptedBarrier } from "@/browser/features/Messages/ChatBarrier/InterruptedBarrier";
+import { useResumeStream } from "@/browser/hooks/useResumeStream";
 import { EditCutoffBarrier } from "@/browser/features/Messages/ChatBarrier/EditCutoffBarrier";
 import { StreamingBarrier } from "@/browser/features/Messages/ChatBarrier/StreamingBarrier";
 import { RetryBarrier } from "@/browser/features/Messages/ChatBarrier/RetryBarrier";
@@ -47,6 +48,7 @@ import {
   getInterruptionContext,
   getLastMainRetryCandidateMessage,
   getLastNonDecorativeMessage,
+  isPreTokenInterruptedUserTurn,
 } from "@/common/utils/messages/retryEligibility";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
@@ -858,6 +860,13 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     }
 
     sendQueuedImmediatelyInFlightRef.current = queuedMessage.id;
+    // Release the duplicate-send guard only if it still points at this attempt; a
+    // newer queued message (or a clear) may have already reset it in the meantime.
+    const clearInFlightGuardIfCurrent = () => {
+      if (sendQueuedImmediatelyInFlightRef.current === queuedMessage.id) {
+        sendQueuedImmediatelyInFlightRef.current = null;
+      }
+    };
     try {
       // Set "interrupting" state immediately so UI shows "interrupting..." without flash.
       storeRaw.setInterrupting(workspaceId);
@@ -865,16 +874,11 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
         workspaceId,
         options: { sendQueuedImmediately: true },
       });
-      if (
-        !interruptResult.success &&
-        sendQueuedImmediatelyInFlightRef.current === queuedMessage.id
-      ) {
-        sendQueuedImmediatelyInFlightRef.current = null;
+      if (!interruptResult.success) {
+        clearInFlightGuardIfCurrent();
       }
     } catch (error) {
-      if (sendQueuedImmediatelyInFlightRef.current === queuedMessage.id) {
-        sendQueuedImmediatelyInFlightRef.current = null;
-      }
+      clearInFlightGuardIfCurrent();
       throw error;
     }
   }, [api, workspaceId, workspaceState?.queuedMessage, workspaceState?.canInterrupt, storeRaw]);
@@ -1054,6 +1058,34 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       interruptedBarrierMessageIds.add(message.id);
     }
   }
+  // A turn interrupted before its first token leaves the user message as the tail
+  // with no assistant row, so the loop above never marks it. Mark it here (subject
+  // to the same hydration/auto-retry/streaming suppression) so the divider still
+  // offers to continue. interruptedTailResumable/render both key off this set.
+  if (
+    !isHydratingTranscript &&
+    !isAutoRetryActive &&
+    !shouldShowStreamingBarrier &&
+    lastRetryCandidateMessage != null &&
+    isPreTokenInterruptedUserTurn(lastRetryCandidateMessage, workspaceState.lastAbortReason)
+  ) {
+    interruptedBarrierMessageIds.add(lastRetryCandidateMessage.id);
+  }
+
+  // Owned here so the click and keybind paths share one resume/error. resetKey is
+  // the resume target, so error/spinner reset when the interrupted turn changes.
+  const { resume: resumeInterruptedStreamAsync, error: resumeInterruptedError } = useResumeStream(
+    workspaceId,
+    lastRetryCandidateMessage?.id
+  );
+  const resumeInterruptedStream = () => void resumeInterruptedStreamAsync();
+  // Resumable only on the writable tail and only when RetryBarrier is suppressed
+  // (user-aborted case). When RetryBarrier is visible, its button owns resume.
+  const interruptedTailResumable =
+    !transcriptOnly &&
+    !showRetryBarrierUI &&
+    lastRetryCandidateMessage != null &&
+    interruptedBarrierMessageIds.has(lastRetryCandidateMessage.id);
   const transcriptTailItems: TranscriptTailStackItem[] = [];
   if (shouldMountRetryBarrier) {
     transcriptTailItems.push(
@@ -1124,6 +1156,8 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     aggregator,
     setEditingMessage,
     vimEnabled,
+    canResumeInterruptedStream: interruptedTailResumable,
+    resumeInterruptedStream,
   });
 
   // Clear editing state if the message being edited no longer exists
@@ -1257,7 +1291,13 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
           />
         )}
         {isAtCutoff && <EditCutoffBarrier />}
-        {interruptedBarrierMessageIds.has(message.id) && <InterruptedBarrier />}
+        {interruptedBarrierMessageIds.has(message.id) && (
+          <InterruptedBarrier
+            resumable={interruptedTailResumable && message.id === lastRetryCandidateMessage?.id}
+            onResume={resumeInterruptedStream}
+            error={resumeInterruptedError}
+          />
+        )}
       </React.Fragment>
     );
   };

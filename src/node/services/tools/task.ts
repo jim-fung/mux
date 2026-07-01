@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import { tool } from "ai";
+import { tool, type Tool } from "ai";
 import type { z } from "zod";
 
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
@@ -35,6 +35,33 @@ import {
 } from "@/common/types/thinking";
 import { normalizeModelInput } from "@/common/utils/ai/normalizeModelInput";
 import { coerceNonEmptyString } from "@/node/services/taskUtils";
+
+// Plan agent is read-only: only `explore` sub-agent tasks may be spawned. Shared by both the
+// workspace-turn guard and the per-launch agent-id guard so the message can't drift between them.
+const PLAN_AGENT_EXPLORE_ONLY_ERROR =
+  'In the plan agent you may only spawn agentId: "explore" tasks.';
+
+const BUILT_IN_TASK_TOOL_MARKER = Symbol("muxBuiltInTaskTool");
+
+export function markBuiltInTaskTool<TParameters, TResult>(
+  taskTool: Tool<TParameters, TResult>
+): Tool<TParameters, TResult> {
+  Object.defineProperty(taskTool, BUILT_IN_TASK_TOOL_MARKER, {
+    value: true,
+    // enumerable so object spread (wrapWithInitWait) and descriptor clones (withHooks,
+    // cloneToolPreservingDescriptors, cache control) carry the marker forward to every wrapper —
+    // that is what lets sibling explore task calls share the parallel reader lock downstream.
+    enumerable: true,
+    configurable: true,
+  });
+  return taskTool;
+}
+
+export function isBuiltInTaskTool(tool: Tool | undefined): boolean {
+  return Boolean(
+    (tool as (Tool & Record<symbol, unknown>) | undefined)?.[BUILT_IN_TASK_TOOL_MARKER] === true
+  );
+}
 
 /** Resolve the parent workspace's runtime mode from the injected MUX_RUNTIME env. */
 function resolveRuntimeMode(config: ToolConfiguration): RuntimeMode | undefined {
@@ -331,7 +358,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
   const inputSchema = buildTaskToolAgentArgsSchema({
     includeIsolation: runtimeModeSupportsSharedTaskWorkspace(runtimeMode),
   });
-  return tool({
+  const taskTool = tool({
     description: buildTaskDescription(config),
     inputSchema,
     execute: async (args, { abortSignal, toolCallId }): Promise<unknown> => {
@@ -380,7 +407,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
       const parentRuntimeAiSettings = buildParentRuntimeAiSettings(config);
 
       if (config.planFileOnly && kind === "workspace") {
-        throw new Error('In the plan agent you may only spawn agentId: "explore" tasks.');
+        throw new Error(PLAN_AGENT_EXPLORE_ONLY_ERROR);
       }
 
       if (kind === "workspace") {
@@ -394,11 +421,16 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
             ? { thinkingLevel: aiOverrides.thinkingLevel }
             : {}),
           ...(parentRuntimeAiSettings != null ? { parentRuntimeAiSettings } : {}),
+          // Background launches are non-blocking with terminal wake-up; foreground/default block.
+          attentionPolicy: run_in_background ? "notify_on_terminal" : "blocking_until_terminal",
           workspace: {
             mode: workspace?.mode ?? "new",
             ...(workspace?.workspaceId != null ? { workspaceId: workspace.workspaceId } : {}),
             ...(workspace?.branchName != null ? { branchName: workspace.branchName } : {}),
             ...(workspace?.trunkBranch != null ? { trunkBranch: workspace.trunkBranch } : {}),
+            ...(workspace?.queueDispatchMode != null
+              ? { queueDispatchMode: workspace.queueDispatchMode }
+              : {}),
             ...(workspace?.disposable != null ? { disposable: workspace.disposable } : {}),
           },
         });
@@ -453,6 +485,13 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
           }
           const errorMessage = getErrorMessage(error);
           if (errorMessage === "Timed out waiting for workspace turn") {
+            // The foreground wait exceeded its budget but the workspace turn keeps running. Make it
+            // non-blocking so the owner's stream-end does not re-force a task_await; Mux wakes the
+            // owner with the terminal output instead.
+            await taskService.markBackgroundWorkNotifyOnTerminal?.(
+              created.data.taskId,
+              workspaceId
+            );
             return parseToolResult(
               TaskToolResultSchema,
               {
@@ -482,7 +521,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
 
       // Plan agent is explicitly non-executing. Allow only read-only exploration tasks.
       if (config.planFileOnly && requestedAgentId !== "explore") {
-        throw new Error('In the plan agent you may only spawn agentId: "explore" tasks.');
+        throw new Error(PLAN_AGENT_EXPLORE_ONLY_ERROR);
       }
 
       // Parent runtime model and thinking are forwarded as a low-priority fallback so
@@ -509,6 +548,8 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
             : {}),
           ...(isolation != null ? { isolation } : {}),
           ...(parentRuntimeAiSettings != null ? { parentRuntimeAiSettings } : {}),
+          // Background launches are non-blocking with terminal wake-up; foreground/default block.
+          attentionPolicy: run_in_background ? "notify_on_terminal" : "blocking_until_terminal",
           bestOf:
             taskGroupId != null
               ? {
@@ -638,6 +679,17 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
       const hadInterruptedTask = waitOutcomes.some(
         (outcome) => outcome.kind === "task_interrupted"
       );
+
+      // Foreground waits that exceeded their budget but whose tasks keep running become
+      // non-blocking: persist notify_on_terminal so the owner is not re-forced to await them.
+      await Promise.all(
+        waitOutcomes.flatMap((outcome, index) => {
+          const task = createdTasks[index];
+          return outcome.kind === "timed_out" && task != null
+            ? [taskService.markBackgroundWorkNotifyOnTerminal?.(task.taskId, workspaceId)]
+            : [];
+        })
+      );
       if (wasBackgrounded || didTimeOut || hadInterruptedTask) {
         return parseToolResult(
           TaskToolResultSchema,
@@ -663,4 +715,5 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
       throw new Error("Task foreground wait ended without a terminal result");
     },
   });
+  return markBuiltInTaskTool(taskTool);
 };

@@ -7,19 +7,13 @@ import {
   WorkflowTaskMetadataSchema,
   WorkspaceGoalDefaultsOverrideSchema,
   WorkspaceHeartbeatSettingsSchema,
-  WorkspaceWorkflowScheduleSchema,
-  WorkflowScheduleContextModeSchema,
-  WorkflowScheduleTargetBranchNameSchema,
 } from "@/common/orpc/schemas/workspace";
 import {
   WorkspaceAISettingsByAgentSchema,
   WorkspaceAISettingsSchema,
 } from "@/common/orpc/schemas/workspaceAiSettings";
 import { ThinkingLevelSchema } from "@/common/types/thinking";
-import {
-  WORKFLOW_SCHEDULE_MAX_INTERVAL_MS,
-  WORKFLOW_SCHEDULE_MIN_INTERVAL_MS,
-} from "@/constants/workflowSchedule";
+import { BackgroundWorkAttentionPolicySchema } from "@/common/types/backgroundWorkAttention";
 import { z } from "zod";
 
 import { RuntimeEnablementIdSchema } from "./ids";
@@ -104,9 +98,6 @@ export const WorkspaceConfigSchema = z.object({
   heartbeat: WorkspaceHeartbeatSettingsSchema.optional().meta({
     description: "Persisted heartbeat settings for this workspace.",
   }),
-  workflowSchedule: WorkspaceWorkflowScheduleSchema.optional().meta({
-    description: "Persisted scheduled workflow run for this workspace.",
-  }),
   goalDefaults: WorkspaceGoalDefaultsOverrideSchema.optional().meta({
     description:
       "Per-workspace overrides for goal creation defaults. Sparse; each null field follows the global `goalDefaults`.",
@@ -150,6 +141,10 @@ export const WorkspaceConfigSchema = z.object({
     }),
   taskLaunchError: z.string().optional().meta({
     description: "Startup failure recorded before an agent task could begin streaming.",
+  }),
+  taskTimeoutFinalizationTokens: z.array(z.string().min(1)).optional().meta({
+    description:
+      "Idempotency tokens for workflow timeout finalization prompts already sent to this task.",
   }),
   taskRecoveryAttempts: z.number().int().nonnegative().optional().meta({
     description:
@@ -205,6 +200,12 @@ export const WorkspaceConfigSchema = z.object({
         "checkout (no fork): its `path` points at the parent's checkout, init is skipped, and removal " +
         'must not delete that shared directory. Absent/"fork" is the isolated default.',
     }),
+  taskAttentionPolicy: BackgroundWorkAttentionPolicySchema.optional().meta({
+    description:
+      "How the owner workspace's stream-end treats this child task while it is active. " +
+      '"notify_on_terminal" (background launches) does not force the owner to await; ' +
+      '"blocking_until_terminal" (foreground/default, and missing/legacy records) does.',
+  }),
   mcp: WorkspaceMCPOverridesSchema.optional().meta({
     description:
       "LEGACY: Per-workspace MCP overrides (migrated to <workspace>/.mux/mcp.local.jsonc)",
@@ -228,71 +229,6 @@ export const WorkspaceConfigSchema = z.object({
   }),
 });
 
-export const ProjectWorkflowScheduleTargetSchema = z.discriminatedUnion("type", [
-  z.object({
-    type: z.literal("existing-workspace").meta({
-      description: "Run the project automation in a specific existing workspace.",
-    }),
-    workspaceId: z.string().min(1).meta({
-      description: "Workspace used as the execution target for this automation.",
-    }),
-  }),
-  z.object({
-    type: z.literal("new-workspace").meta({
-      description: "Create a fresh workspace for each due project automation run.",
-    }),
-    branchName: WorkflowScheduleTargetBranchNameSchema.optional().meta({
-      description:
-        "Optional branch/workspace-name base for the fresh workspace. Runtime collision handling may suffix it.",
-    }),
-    trunkBranch: z.string().min(1).meta({
-      description: "Base branch checked out when creating the fresh automation workspace.",
-    }),
-    title: z.string().min(1).optional().meta({
-      description: "Optional human-readable title for each fresh automation workspace.",
-    }),
-  }),
-]);
-
-/**
- * Project-level scheduled workflow automation. The project owns the automation;
- * workspaces are only runtime targets resolved at dispatch time.
- */
-export const ProjectWorkflowScheduleSchema = z.object({
-  id: z.string().min(1).meta({
-    description: "Stable project-local automation identifier.",
-  }),
-  title: z.string().min(1).optional().meta({
-    description: "Optional user-facing automation title.",
-  }),
-  enabled: z.boolean().meta({
-    description: "Whether this project automation is active.",
-  }),
-  workflowName: z.string().min(1).meta({
-    description: "Named workflow definition to run (resolved like workflows.start).",
-  }),
-  args: z.record(z.string(), z.unknown()).optional().meta({
-    description: "JSON args passed to the workflow run.",
-  }),
-  contextMode: WorkflowScheduleContextModeSchema.optional().meta({
-    description:
-      'Context preparation before existing-workspace scheduled runs. Missing values default to "normal" at read time for backward compatibility.',
-  }),
-  target: ProjectWorkflowScheduleTargetSchema.meta({
-    description: "Workspace target policy for this project automation.",
-  }),
-  intervalMs: z
-    .number()
-    .int()
-    .min(WORKFLOW_SCHEDULE_MIN_INTERVAL_MS)
-    .max(WORKFLOW_SCHEDULE_MAX_INTERVAL_MS)
-    .meta({ description: "Wall-clock interval between dispatched runs." }),
-  lastRunStartedAt: z.string().optional().meta({
-    description:
-      "ISO timestamp of the last dispatched run (persisted before dispatch so restarts retry at most once per interval).",
-  }),
-});
-
 export const ProjectConfigSchema = z.object({
   displayName: z.string().nullish().meta({
     description: "Custom display name for the project",
@@ -309,9 +245,6 @@ export const ProjectConfigSchema = z.object({
     description: "Absolute path to the top-level parent project for one-level sub-projects",
   }),
   workspaces: z.array(WorkspaceConfigSchema),
-  workflowSchedules: z.array(ProjectWorkflowScheduleSchema).optional().meta({
-    description: "Project-level scheduled workflow automations.",
-  }),
   idleCompactionHours: z.number().min(1).nullable().optional().meta({
     description:
       "Hours of inactivity before auto-compacting workspaces. null/undefined = disabled.",

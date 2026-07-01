@@ -29,6 +29,7 @@ import {
   isWorkspaceTurnTaskId,
   type WorkspaceTurnTaskStatus,
 } from "@/node/services/taskHandleStore";
+import { buildWorkflowProgressSummary, formatWorkflowProgressNote } from "./workflowProgress";
 import {
   ForegroundWaitBackgroundedError,
   type AgentTaskStatus,
@@ -38,6 +39,9 @@ import {
 
 const DEFAULT_TASK_AWAIT_TIMEOUT_MS = 600_000;
 const WORKFLOW_AWAIT_POLL_INTERVAL_MS = 250;
+// Shared fallback used when a workspace-turn record errored without a specific message,
+// so every error-status await result path reports identical text.
+const WORKSPACE_TURN_DEFAULT_ERROR = "Workspace turn failed";
 
 // Status values for which task_await still treats an agent task as live and
 // should surface the live status (plus an `elapsed_ms` field) instead of
@@ -124,13 +128,13 @@ function getWorkflowRunReport(run: WorkflowRunRecord): {
   if (result != null) {
     return result;
   }
-  return { reportMarkdown: `Workflow ${run.definition.name} completed without a final report.` };
+  return { reportMarkdown: `Workflow ${run.workflow.name} completed without a final report.` };
 }
 
 function getWorkflowRunError(run: WorkflowRunRecord): string {
   const message =
     run.events.findLast((event) => event.type === "error")?.message ??
-    `Workflow ${run.definition.name} failed.`;
+    `Workflow ${run.workflow.name} failed.`;
   // Surface the recovery affordance exactly where the agent sees the failure.
   if (canRetryWorkflowFromCheckpoint(run)) {
     return `${message} The run can be retried from its last durable checkpoint with workflow_resume (mode 'retry_from_checkpoint').`;
@@ -144,7 +148,7 @@ function getWorkflowRunError(run: WorkflowRunRecord): string {
 // task_await without re-running anything.
 function buildWorkflowFailureState(run: WorkflowRunRecord) {
   return {
-    name: run.definition.name,
+    name: run.workflow.name,
     steps: run.steps.map((step) => ({
       stepId: step.stepId,
       status: step.status,
@@ -155,13 +159,15 @@ function buildWorkflowFailureState(run: WorkflowRunRecord) {
 }
 
 function buildWorkflowAwaitResult(run: WorkflowRunRecord) {
-  // Deliberately omit the full run record (definition source, event log, step snapshots):
+  // Deliberately omit the full run record (script source, event log, step snapshots):
   // it is huge and model-facing only. In-progress events may never materialize in the final
   // result, so the model only needs the status plus the final report/error.
   const base = {
     taskId: run.id,
     ...withElapsedMs(getWorkflowRunElapsedMs(run)),
   };
+  const workflowProgress = buildWorkflowProgressSummary(run);
+  const workflowProgressField = workflowProgress == null ? {} : { workflowProgress };
 
   switch (run.status) {
     case "completed": {
@@ -173,7 +179,7 @@ function buildWorkflowAwaitResult(run: WorkflowRunRecord) {
         ...(result.structuredOutput !== undefined
           ? { structuredOutput: result.structuredOutput }
           : {}),
-        title: run.definition.name,
+        title: run.workflow.name,
         note: COMPLETED_REPORT_REFETCH_NOTE,
       };
     }
@@ -188,25 +194,31 @@ function buildWorkflowAwaitResult(run: WorkflowRunRecord) {
       return {
         status: "interrupted" as const,
         ...base,
-        note: `Workflow ${run.definition.name} was interrupted. Durable state is preserved; resume it with workflow_resume.`,
+        note: `Workflow ${run.workflow.name} was interrupted. Durable state is preserved; resume it with workflow_resume.`,
       };
     case "pending":
       return {
         status: "queued" as const,
         ...base,
-        note: `Workflow ${run.definition.name} is queued.`,
+        ...workflowProgressField,
+        note: formatWorkflowProgressNote(`Workflow ${run.workflow.name} is queued.`, run),
       };
     case "backgrounded":
       return {
         status: "backgrounded" as const,
         ...base,
-        note: `Workflow ${run.definition.name} is backgrounded. Use task_await to monitor progress.`,
+        ...workflowProgressField,
+        note: formatWorkflowProgressNote(
+          `Workflow ${run.workflow.name} is backgrounded. Use task_await to monitor progress.`,
+          run
+        ),
       };
     case "running":
       return {
         status: "running" as const,
         ...base,
-        note: `Workflow ${run.definition.name} is still running.`,
+        ...workflowProgressField,
+        note: formatWorkflowProgressNote(`Workflow ${run.workflow.name} is still running.`, run),
       };
   }
 }
@@ -393,12 +405,26 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
         return parseWorkflowRun(run);
       };
 
+      const markWorkflowTerminalAttentionConsumed = async (
+        run: WorkflowRunRecord
+      ): Promise<void> => {
+        if (!isTerminalWorkflowRunStatus(run.status)) {
+          return;
+        }
+        await taskService.markWorkflowRunTerminalAttentionConsumed?.({
+          ownerWorkspaceId: workspaceId,
+          status: run.status,
+          runId: run.id,
+        });
+      };
+
       const awaitWorkflowRun = async (runId: string, taskSignal: AbortSignal) => {
         let run = await getWorkflowRun(runId);
         if (run == null) {
           return { status: "not_found" as const, taskId: runId };
         }
         if (timeoutMs === 0 || isTerminalWorkflowRunStatus(run.status)) {
+          await markWorkflowTerminalAttentionConsumed(run);
           return buildWorkflowAwaitResult(run);
         }
 
@@ -427,6 +453,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
           run = nextRun;
         }
 
+        await markWorkflowTerminalAttentionConsumed(run);
         return buildWorkflowAwaitResult(run);
       };
 
@@ -549,7 +576,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
               return {
                 status: "error" as const,
                 taskId,
-                error: snapshot.error ?? "Workspace turn failed",
+                error: snapshot.error ?? WORKSPACE_TURN_DEFAULT_ERROR,
               };
             }
           }
@@ -620,7 +647,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
                 return {
                   status: "error" as const,
                   taskId,
-                  error: latest.error ?? "Workspace turn failed",
+                  error: latest.error ?? WORKSPACE_TURN_DEFAULT_ERROR,
                 };
               }
               return {
@@ -654,7 +681,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
                 return {
                   status: "error" as const,
                   taskId,
-                  error: latest.error ?? "Workspace turn failed",
+                  error: latest.error ?? WORKSPACE_TURN_DEFAULT_ERROR,
                 };
               }
               if (latest.status === "interrupted") {

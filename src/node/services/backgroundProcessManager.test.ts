@@ -1,8 +1,10 @@
+import { Buffer } from "node:buffer";
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import {
   BackgroundProcessManager,
   computeTailStartOffset,
   type BackgroundProcessMeta,
+  type MonitorMatchPayload,
 } from "./backgroundProcessManager";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import type { Runtime } from "@/node/runtime/Runtime";
@@ -13,6 +15,26 @@ import { createBashTool } from "@/node/services/tools/bash";
 import { createBashOutputTool } from "@/node/services/tools/bash_output";
 import { TestTempDir, createTestToolConfig } from "@/node/services/tools/testHelpers";
 import type { BashToolResult, BashOutputToolResult } from "@/common/types/tools";
+
+function waitForMonitorMatch(
+  manager: BackgroundProcessManager,
+  timeoutMs = 2_000
+): Promise<{ workspaceId: string; payload: MonitorMatchPayload }> {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      manager.off("monitor:match", handler);
+      reject(new Error("Timed out waiting for monitor match"));
+    }, timeoutMs);
+
+    const handler = (workspaceId: string, payload: MonitorMatchPayload) => {
+      clearTimeout(timeout);
+      manager.off("monitor:match", handler);
+      resolve({ workspaceId, payload });
+    };
+
+    manager.on("monitor:match", handler);
+  });
+}
 
 describe("BackgroundProcessManager", () => {
   let manager: BackgroundProcessManager;
@@ -126,6 +148,482 @@ describe("BackgroundProcessManager", () => {
         expect(meta.status).toBe("running");
         expect(meta.startTime).toBeGreaterThan(0);
       }
+    });
+  });
+
+  describe("monitor", () => {
+    it("emits a match for a final unterminated line", async () => {
+      const eventPromise = waitForMonitorMatch(manager);
+      const result = await manager.spawn(runtime, testWorkspaceId, "printf 'READY'", {
+        cwd: process.cwd(),
+        displayName: "monitor-unterminated-line",
+        monitor: {
+          filter: "READY",
+          pattern: /READY/,
+          exclude: false,
+          cooldownMs: 0,
+        },
+      });
+
+      expect(result.success).toBe(true);
+      const event = await eventPromise;
+      expect(event.workspaceId).toBe(testWorkspaceId);
+      expect(event.payload.lines).toEqual(["READY"]);
+      expect(event.payload.totalMatches).toBe(1);
+      expect(event.payload.filter).toBe("READY");
+      expect(event.payload.filterExclude).toBe(false);
+    });
+
+    it("coalesces burst matches within the cooldown window", async () => {
+      const eventPromise = waitForMonitorMatch(manager);
+      const result = await manager.spawn(
+        runtime,
+        testWorkspaceId,
+        "printf 'ERR one\\nERR two\\n'",
+        {
+          cwd: process.cwd(),
+          displayName: "monitor-coalesce",
+          monitor: {
+            filter: "ERR",
+            pattern: /ERR/,
+            exclude: false,
+            cooldownMs: 50,
+          },
+        }
+      );
+
+      expect(result.success).toBe(true);
+      const event = await eventPromise;
+      expect(event.payload.lines).toEqual(["ERR one", "ERR two"]);
+      expect(event.payload.totalMatches).toBe(2);
+    });
+
+    it("supports inverted filtering", async () => {
+      const eventPromise = waitForMonitorMatch(manager);
+      const result = await manager.spawn(runtime, testWorkspaceId, "printf 'progress\\ndone\\n'", {
+        cwd: process.cwd(),
+        displayName: "monitor-inverted",
+        monitor: {
+          filter: "progress",
+          pattern: /progress/,
+          exclude: true,
+          cooldownMs: 0,
+        },
+      });
+
+      expect(result.success).toBe(true);
+      const event = await eventPromise;
+      expect(event.payload.lines).toEqual(["done"]);
+    });
+
+    it("stops monitoring after maxEvents without killing the process", async () => {
+      const eventPromise = waitForMonitorMatch(manager);
+      const result = await manager.spawn(
+        runtime,
+        testWorkspaceId,
+        "for i in 1 2 3; do echo ERR$i; sleep 0.05; done; sleep 2",
+        {
+          cwd: process.cwd(),
+          displayName: "monitor-max-events",
+          monitor: {
+            filter: "ERR",
+            pattern: /ERR/,
+            exclude: false,
+            maxEvents: 1,
+            cooldownMs: 0,
+          },
+        }
+      );
+
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      const event = await eventPromise;
+      expect(event.payload.lines).toEqual(["ERR1"]);
+      expect(event.payload.totalMatches).toBe(1);
+
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      const proc = await manager.getProcess(result.processId);
+      expect(proc?.status).toBe("running");
+      expect(proc ? manager.getMonitorSnapshot(proc)?.totalMatches : undefined).toBe(1);
+      expect(proc ? manager.getMonitorSnapshot(proc)?.stopped : undefined).toBe(true);
+    });
+
+    it("clears pending monitor timers when terminating an already-exited process", async () => {
+      const result = await manager.spawn(runtime, testWorkspaceId, "echo ERR", {
+        cwd: process.cwd(),
+        displayName: "monitor-exited-terminate",
+        monitor: {
+          filter: "ERR",
+          pattern: /ERR/,
+          exclude: false,
+          cooldownMs: 10_000,
+        },
+      });
+
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      let proc = await manager.getProcess(result.processId);
+      for (let attempt = 0; attempt < 20; attempt++) {
+        proc = await manager.getProcess(result.processId);
+        if (proc?.monitor?.flushTimer != null && proc.status === "exited") break;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+
+      expect(proc?.status).toBe("exited");
+      expect(proc?.monitor?.flushTimer).toBeDefined();
+      const terminateResult = await manager.terminate(result.processId);
+
+      expect(terminateResult.success).toBe(true);
+      expect(proc?.monitor?.stopped).toBe(true);
+      expect(proc?.monitor?.flushTimer).toBeUndefined();
+    });
+
+    it("does not consume the task_await output cursor", async () => {
+      const eventPromise = waitForMonitorMatch(manager);
+      const result = await manager.spawn(
+        runtime,
+        testWorkspaceId,
+        "printf 'ERR one\\nkeep me\\n'",
+        {
+          cwd: process.cwd(),
+          displayName: "monitor-cursor",
+          monitor: {
+            filter: "ERR",
+            pattern: /ERR/,
+            exclude: false,
+            cooldownMs: 0,
+          },
+        }
+      );
+
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      await eventPromise;
+
+      const output = await manager.getOutput(result.processId, undefined, false, 1);
+      expect(output.success).toBe(true);
+      if (output.success) {
+        expect(output.output).toContain("ERR one");
+        expect(output.output).toContain("keep me");
+      }
+    });
+
+    it("drops a deferred monitor wake once the agent reads past the matched output", async () => {
+      // Regression: a monitor must not wake the agent about output the agent has already read
+      // inline (e.g. via a concurrent task_await / bash_output on the same bash task). Without
+      // the cursor guard in emitMonitorMatch the deferred flush double-reports the matched line.
+      let matchCount = 0;
+      const handler = () => {
+        matchCount++;
+      };
+      manager.on("monitor:match", handler);
+
+      // Print a matching line, then stay alive so the only flush we trigger is the explicit
+      // terminate() below -- never the cooldown timer (kept large) nor process exit.
+      const result = await manager.spawn(
+        runtime,
+        testWorkspaceId,
+        "printf 'ERR boom\\n'; sleep 5",
+        {
+          cwd: process.cwd(),
+          displayName: "monitor-already-read",
+          monitor: {
+            filter: "ERR",
+            pattern: /ERR/,
+            exclude: false,
+            cooldownMs: 10_000,
+          },
+        }
+      );
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      // Wait until the monitor has scanned and queued the match (flush deferred by the cooldown).
+      let proc = await manager.getProcess(result.processId);
+      for (let attempt = 0; attempt < 60; attempt++) {
+        proc = await manager.getProcess(result.processId);
+        if ((proc?.monitor?.pendingLines.length ?? 0) > 0) break;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      expect(proc?.monitor?.pendingLines.length ?? 0).toBeGreaterThan(0);
+
+      // Agent reads the output inline, advancing its cursor to the monitor's scan position.
+      const output = await manager.getOutput(result.processId, undefined, false, 1);
+      expect(output.success).toBe(true);
+      if (output.success) expect(output.output).toContain("ERR boom");
+
+      // Precondition for the drop: the read cursor has caught up to the monitor's scan offset.
+      proc = await manager.getProcess(result.processId);
+      expect(proc?.outputBytesRead ?? 0).toBeGreaterThanOrEqual(proc?.monitor?.lastReadOffset ?? 0);
+
+      // Force the deferred flush. The cursor has caught up, so it must drop instead of waking.
+      await manager.terminate(result.processId);
+      expect(matchCount).toBe(0);
+
+      manager.off("monitor:match", handler);
+    });
+
+    it("still wakes when the matched line was only buffered (unterminated), not shown", async () => {
+      // getOutput advances outputBytesRead past an unterminated trailing line but keeps it in
+      // incompleteLineBuffer (not returned). The monitor only matches that line on exit, when the
+      // agent still hasn't seen it -- so the wake must NOT be suppressed by the read cursor.
+      const eventPromise = waitForMonitorMatch(manager, 6_000);
+      const result = await manager.spawn(runtime, testWorkspaceId, "printf 'ERR boom'; sleep 3", {
+        cwd: process.cwd(),
+        displayName: "monitor-buffered-unterminated",
+        monitor: {
+          filter: "ERR",
+          pattern: /ERR/,
+          exclude: false,
+          cooldownMs: 0,
+        },
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      // Read while running: "ERR boom" has no trailing newline, so it is buffered (cursor advances)
+      // rather than returned to the agent.
+      const reading = await manager.getOutput(result.processId, undefined, false, 1);
+      expect(reading.success).toBe(true);
+      const proc = await manager.getProcess(result.processId);
+      expect(proc?.incompleteLineBuffer).toContain("ERR boom");
+
+      // On exit the monitor finalizes the buffered line; the agent never saw it, so it still wakes.
+      const event = await eventPromise;
+      expect(event.payload.lines).toEqual(["ERR boom"]);
+    });
+
+    it("drops the wake for a matched line even when a trailing fragment follows it", async () => {
+      // A complete matched line followed by an unterminated fragment: getOutput returns the line
+      // and buffers only the fragment, so the agent HAS seen the match. The monitor's raw scan
+      // cursor (lastReadOffset) includes the fragment, so comparing against it would wrongly wake;
+      // matchedThroughOffset (end of the matched line) must drive the suppression instead.
+      let matchCount = 0;
+      const handler = () => {
+        matchCount++;
+      };
+      manager.on("monitor:match", handler);
+
+      const result = await manager.spawn(
+        runtime,
+        testWorkspaceId,
+        "printf 'ERR foo\\npartial'; sleep 5",
+        {
+          cwd: process.cwd(),
+          displayName: "monitor-line-plus-fragment",
+          monitor: {
+            filter: "ERR",
+            pattern: /ERR/,
+            exclude: false,
+            cooldownMs: 10_000,
+          },
+        }
+      );
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      // Wait until the monitor has recorded the match and parked the trailing fragment.
+      let proc = await manager.getProcess(result.processId);
+      for (let attempt = 0; attempt < 60; attempt++) {
+        proc = await manager.getProcess(result.processId);
+        if ((proc?.monitor?.pendingLines.length ?? 0) > 0 && proc?.monitor?.incompleteLineBuffer)
+          break;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      expect(proc?.monitor?.pendingLines ?? []).toEqual(["ERR foo"]);
+      expect(proc?.monitor?.incompleteLineBuffer).toContain("partial");
+      // matchedThroughOffset ends at the matched line; the raw scan cursor sits past it.
+      expect(proc?.monitor?.matchedThroughOffset ?? 0).toBeLessThan(
+        proc?.monitor?.lastReadOffset ?? 0
+      );
+
+      // Agent reads inline: gets "ERR foo", buffers "partial".
+      const output = await manager.getOutput(result.processId, undefined, false, 1);
+      expect(output.success).toBe(true);
+      if (output.success) expect(output.output).toContain("ERR foo");
+
+      // The agent has been shown through the matched line, so the deferred flush must drop.
+      await manager.terminate(result.processId);
+      expect(matchCount).toBe(0);
+
+      manager.off("monitor:match", handler);
+    });
+
+    it("anchors matchedThroughOffset to the matched line, not later output in the same chunk", async () => {
+      // A matched line followed by a non-matching complete line in one poll: matchedThroughOffset
+      // must point at the end of the matched line (byte 8 of "ERR foo\n"), not the end of the whole
+      // complete region (byte 16 of "...nomatch\n"). Otherwise an agent that read only the matched
+      // line stays below the inflated offset and gets a redundant wake.
+      const result = await manager.spawn(
+        runtime,
+        testWorkspaceId,
+        "printf 'ERR foo\\nnomatch\\n'; sleep 5",
+        {
+          cwd: process.cwd(),
+          displayName: "monitor-matched-line-anchor",
+          monitor: {
+            filter: "ERR",
+            pattern: /ERR/,
+            exclude: false,
+            cooldownMs: 10_000,
+          },
+        }
+      );
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      // Wait until both lines have been scanned (cursor at 16, no fragment buffered).
+      let proc = await manager.getProcess(result.processId);
+      for (let attempt = 0; attempt < 60; attempt++) {
+        proc = await manager.getProcess(result.processId);
+        if (
+          (proc?.monitor?.lastReadOffset ?? 0) >= 16 &&
+          (proc?.monitor?.pendingLines.length ?? 0) > 0
+        )
+          break;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      expect(proc?.monitor?.pendingLines ?? []).toEqual(["ERR foo"]);
+      expect(proc?.monitor?.matchedThroughOffset).toBe(8);
+      expect(proc?.monitor?.lastReadOffset).toBe(16);
+    });
+
+    it("still wakes when a filtered read advanced past but did not show the matched line", async () => {
+      // A filtered task_await / bash_output read advances outputBytesRead past every complete line
+      // but returns only lines matching its own filter. A pending monitor match for "ERR" must still
+      // wake after the agent reads with filter="DONE": the error line was never shown to the agent.
+      let matchCount = 0;
+      const handler = () => {
+        matchCount++;
+      };
+      manager.on("monitor:match", handler);
+
+      const result = await manager.spawn(
+        runtime,
+        testWorkspaceId,
+        "printf 'ERR boom\\nDONE\\n'; sleep 5",
+        {
+          cwd: process.cwd(),
+          displayName: "monitor-filtered-read",
+          monitor: {
+            filter: "ERR",
+            pattern: /ERR/,
+            exclude: false,
+            cooldownMs: 10_000, // defer the flush so the filtered read happens first
+          },
+        }
+      );
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      // Wait until the monitor has matched "ERR boom" (flush deferred by the cooldown).
+      let proc = await manager.getProcess(result.processId);
+      for (let attempt = 0; attempt < 60; attempt++) {
+        proc = await manager.getProcess(result.processId);
+        if ((proc?.monitor?.pendingLines.length ?? 0) > 0) break;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      expect(proc?.monitor?.pendingLines ?? []).toEqual(["ERR boom"]);
+
+      // Agent reads with a filter that excludes the error line: it sees only "DONE".
+      const filtered = await manager.getOutput(result.processId, "DONE", false, 1);
+      expect(filtered.success).toBe(true);
+      if (filtered.success) {
+        expect(filtered.output).toContain("DONE");
+        expect(filtered.output).not.toContain("ERR boom");
+      }
+      // The filtered read must not have advanced the shown mark.
+      proc = await manager.getProcess(result.processId);
+      expect(proc?.shownThroughOffset ?? -1).toBe(0);
+
+      // Force the deferred flush. The error was never shown, so it must still wake.
+      await manager.terminate(result.processId);
+      expect(matchCount).toBe(1);
+
+      manager.off("monitor:match", handler);
+    });
+
+    it("strips ANSI before matching and emitting matched lines", async () => {
+      const eventPromise = waitForMonitorMatch(manager);
+      const result = await manager.spawn(
+        runtime,
+        testWorkspaceId,
+        "printf '\\033[31mFAILED\\033[0m\\n'",
+        {
+          cwd: process.cwd(),
+          displayName: "monitor-ansi",
+          monitor: {
+            filter: "^FAILED$",
+            pattern: /^FAILED$/,
+            exclude: false,
+            cooldownMs: 0,
+          },
+        }
+      );
+
+      expect(result.success).toBe(true);
+      const event = await eventPromise;
+      expect(event.payload.lines).toEqual(["FAILED"]);
+    });
+
+    it("matches long complete lines when the token appears after the prompt cap", async () => {
+      const eventPromise = waitForMonitorMatch(manager);
+      const result = await manager.spawn(
+        runtime,
+        testWorkspaceId,
+        `bun -e "process.stdout.write('A'.repeat(16384) + ' FAILED tail\\n')"`,
+        {
+          cwd: process.cwd(),
+          displayName: "monitor-long-line-suffix",
+          monitor: {
+            filter: "FAILED tail",
+            pattern: /FAILED tail/,
+            exclude: false,
+            cooldownMs: 0,
+          },
+        }
+      );
+
+      expect(result.success).toBe(true);
+      const event = await eventPromise;
+      expect(event.payload.lines).toHaveLength(1);
+      expect(event.payload.lines[0]).toContain("FAILED tail");
+      expect(event.payload.lines[0]).toContain("truncated");
+    });
+
+    it("bounds incomplete monitor lines while a process keeps running", async () => {
+      const longByteCount = 1_100_000;
+      const result = await manager.spawn(
+        runtime,
+        testWorkspaceId,
+        `bun -e "process.stdout.write('A'.repeat(${longByteCount})); setTimeout(() => {}, 2000)"`,
+        {
+          cwd: process.cwd(),
+          displayName: "monitor-incomplete-bound",
+          monitor: {
+            filter: "NEVER_MATCHES",
+            pattern: /NEVER_MATCHES/,
+            exclude: false,
+            cooldownMs: 0,
+          },
+        }
+      );
+
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      let incompleteLineBytes = 0;
+      for (let attempt = 0; attempt < 20; attempt++) {
+        const proc = await manager.getProcess(result.processId);
+        incompleteLineBytes = Buffer.byteLength(proc?.monitor?.incompleteLineBuffer ?? "", "utf8");
+        if (incompleteLineBytes > 0) break;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+
+      expect(incompleteLineBytes).toBeGreaterThan(0);
+      expect(incompleteLineBytes).toBeLessThanOrEqual(1_000_000);
     });
   });
 

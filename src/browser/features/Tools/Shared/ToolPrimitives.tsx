@@ -6,6 +6,7 @@ import {
 } from "@/browser/features/Messages/TranscriptQuoteBoundary";
 import type { LucideIcon } from "lucide-react";
 import {
+  Activity,
   ArrowDownUp,
   Bell,
   BookOpen,
@@ -18,6 +19,8 @@ import {
   GraduationCap,
   Hand,
   Keyboard,
+  Layers,
+  LayoutGrid,
   Lightbulb,
   MessageCircleQuestion,
   Monitor,
@@ -238,13 +241,14 @@ export const TOOL_NAME_TO_ICON: Partial<Record<string, LucideIcon>> = {
   bash_output: Wrench,
   bash_background_terminate: Square,
   bash_background_list: List,
-  workflow_list: List,
-  workflow_read: BookOpen,
   workflow_run: Sparkles,
   workflow_resume: RotateCcw,
   agent_report: FileText,
   agent_skill_read: GraduationCap,
   agent_skill_read_file: GraduationCap,
+  // LayoutGrid (a 2×2 catalog of tiles) reads as "the index of skills you can pick
+  // from" — distinct from the GraduationCap used when reading a single skill.
+  agent_skill_list: LayoutGrid,
   advisor: Lightbulb,
   ask_user_question: MessageCircleQuestion,
   file_read: BookOpen,
@@ -270,9 +274,15 @@ export const TOOL_NAME_TO_ICON: Partial<Record<string, LucideIcon>> = {
   review_pane_get: ScanEye,
   analytics_query: Database,
   task_apply_git_patch: GitCommit,
+  // Layers (stacked planes) reads as "manage the stack of child workspaces" — matches the
+  // WorkspaceLifecycleToolCall card's glyph.
+  task_workspace_lifecycle: Layers,
   set_goal: Target,
   get_goal: Target,
   complete_goal: CircleCheck,
+  // Activity (ECG line) rather than HeartPulse: it matches the scanning pulse-trace
+  // motif inside the HeartbeatToolCall card. The config menu uses HeartPulse.
+  heartbeat: Activity,
 };
 
 export const ToolIcon: React.FC<ToolIconProps> = ({ toolName, emoji, emojiSpin, className }) => {

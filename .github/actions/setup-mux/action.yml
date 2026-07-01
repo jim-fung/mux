@@ -8,6 +8,18 @@ inputs:
 runs:
   using: "composite"
   steps:
+    # Pin Node 22 (LTS) before anything installs deps. The GitHub runners now default
+    # to Node 24, whose extract-zip regression (nodejs/node#63487) hangs/corrupts zip
+    # extraction in dependency postinstalls — it breaks Electron's `node install.js`
+    # ("Electron failed to install correctly") and Playwright's browser install (stalls
+    # at 100%), which intermittently fails Test / E2E (macos) on a browser-cache miss.
+    # Node 22 is unaffected (microsoft/playwright#41092 workaround). Runs first so its
+    # `node` is on PATH for every subsequent `bun install` / `bun x` step.
+    - name: Setup Node
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      with:
+        node-version: "22"
+
     - name: Setup Bun
       uses: oven-sh/setup-bun@b7a1c7ccf290d58743029c4f6903da283811b979 # v2.1.0
       with:
@@ -18,14 +30,24 @@ runs:
       shell: bash
       run: echo "version=$(bun --version)" >> $GITHUB_OUTPUT
 
+    # Capture the Node version to key the node_modules cache below. Without it, changing
+    # the pinned Node (e.g. from the runner default to the version pinned above) would hit
+    # a cache built under the old Node and skip `bun install`, keeping modules whose
+    # postinstalls (Electron) ran — and whose native ABI was built — under the wrong Node,
+    # which defeats this pin. (Codex review, PR #3656.)
+    - name: Get Node version
+      id: node-version
+      shell: bash
+      run: echo "version=$(node --version)" >> $GITHUB_OUTPUT
+
     - name: Cache node_modules
       id: cache-node-modules
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: node_modules
-        key: ${{ runner.os }}-${{ runner.arch }}-bun-${{ steps.bun-version.outputs.version }}-node-modules-${{ hashFiles('**/bun.lock') }}
+        key: ${{ runner.os }}-${{ runner.arch }}-bun-${{ steps.bun-version.outputs.version }}-node-${{ steps.node-version.outputs.version }}-node-modules-${{ hashFiles('**/bun.lock') }}
         restore-keys: |
-          ${{ runner.os }}-${{ runner.arch }}-bun-${{ steps.bun-version.outputs.version }}-node-modules-
+          ${{ runner.os }}-${{ runner.arch }}-bun-${{ steps.bun-version.outputs.version }}-node-${{ steps.node-version.outputs.version }}-node-modules-
 
     - name: Check if node_modules exists
       id: check-node-modules

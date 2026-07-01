@@ -1,4 +1,3 @@
-import * as path from "node:path";
 import * as fs from "fs/promises";
 import { EventEmitter } from "events";
 
@@ -139,23 +138,23 @@ import { applyToolPolicyAndExperiments, captureMcpToolTelemetry } from "./toolAs
 import { getErrorMessage } from "@/common/utils/errors";
 import { validateJsonSchemaSubsetSchema } from "@/common/utils/jsonSchemaSubset";
 import { filterSideQuestionMessages } from "@/common/utils/messages/sideQuestion";
+import { isTerminalWorkflowRunStatus } from "@/common/types/workflow";
 import {
   WORKFLOW_RESULT_METADATA_TYPE,
   buildWorkflowResultContextMessage,
   filterWorkflowDisplayOnlyMessages,
 } from "@/common/utils/workflowRunMessages";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
-import {
-  shouldUseRuntimeWorkflowProjectIO,
-  WorkflowDefinitionStore,
-} from "@/node/services/workflows/WorkflowDefinitionStore";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import {
   WorkflowService,
   type WorkflowRunStatusChangedEvent,
 } from "@/node/services/workflows/WorkflowService";
-import { WorkflowTaskServiceAdapter } from "@/node/services/workflows/WorkflowTaskServiceAdapter";
-import { resolveWorkflowScratchRoots } from "@/node/services/workflows/workflowScratchRoots";
+import {
+  DEFAULT_WORKFLOW_AGENT_ID,
+  WorkflowTaskServiceAdapter,
+} from "@/node/services/workflows/WorkflowTaskServiceAdapter";
+import { resolveWorkflowScript } from "@/node/services/workflows/workflowScriptResolver";
 import { isProjectTrusted } from "@/node/utils/projectTrust";
 
 const STREAM_STARTUP_DIAGNOSTIC_THRESHOLD_MS = 1_000;
@@ -251,7 +250,7 @@ export interface StreamMessageOptions {
   allowAgentSetGoal?: boolean;
   workspaceGoalService?: WorkspaceGoalService;
   disableWorkspaceAgents?: boolean;
-  hasQueuedMessage?: () => boolean;
+  hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
   muxMetadata?: MuxMessageMetadata;
   openaiTruncationModeOverride?: "auto" | "disabled";
 }
@@ -780,7 +779,10 @@ export class AIService extends EventEmitter {
     if (workflowTask?.outputSchema === undefined) {
       return false;
     }
-    if (validateJsonSchemaSubsetSchema(workflowTask.outputSchema).success) {
+    if (
+      validateJsonSchemaSubsetSchema(workflowTask.outputSchema, { requireObjectSchema: true })
+        .success
+    ) {
       return false;
     }
     if (metadata.parentWorkspaceId == null) {
@@ -1007,7 +1009,7 @@ export class AIService extends EventEmitter {
       allowAgentSetGoal,
       workspaceGoalService,
       disableWorkspaceAgents,
-      hasQueuedMessage,
+      hasQueuedMessages,
       openaiTruncationModeOverride,
       muxMetadata,
     } = opts;
@@ -1764,34 +1766,29 @@ export class AIService extends EventEmitter {
         cfg.advisorThinkingLevel ?? THINKING_LEVEL_OFF
       );
       const runtimeType = getRuntimeType(metadata.runtimeConfig);
-      const useRuntimeProjectWorkflowIO = shouldUseRuntimeWorkflowProjectIO(runtimeType);
-      const workflowScratchRoots = resolveWorkflowScratchRoots(this.config, workspaceId, {
-        workspaceRootPath: workspacePath,
-        normalizePath: runtime.normalizePath.bind(runtime),
-      });
       const muxEnv = getMuxEnv(metadata.projectPath, runtimeType, metadata.name, {
         workspaceId,
         modelString,
         thinkingLevel: thinkingLevel ?? "off",
         costsUsd: sessionCostsUsd,
       });
+      const getWorkflowProjectTrusted = () => isProjectTrusted(this.config, metadata.projectPath);
 
       const workflowService =
         dynamicWorkflowsExperimentEnabled && this.taskService != null
           ? new WorkflowService({
-              definitionStore: new WorkflowDefinitionStore({
-                projectRoot: runtime.normalizePath(".mux/workflows", workspacePath),
-                globalRoot: path.join(this.config.rootDir, "workflows"),
-                scratchRoot: workflowScratchRoots.scratchRoot,
-                projectRuntime: useRuntimeProjectWorkflowIO ? runtime : undefined,
-                projectCwd: useRuntimeProjectWorkflowIO ? workspacePath : undefined,
-              }),
               runStore: new WorkflowRunStore({
                 sessionDir: this.config.getSessionDir(workspaceId),
               }),
-              ...(this.onWorkflowRunStatusChanged != null
-                ? { onRunStatusChanged: this.onWorkflowRunStatusChanged }
-                : {}),
+              onRunStatusChanged: async (event) => {
+                if (!isTerminalWorkflowRunStatus(event.status)) {
+                  await this.taskService?.resetWorkflowRunTerminalAttention({
+                    ownerWorkspaceId: event.workspaceId,
+                    runId: event.runId,
+                  });
+                }
+                await this.onWorkflowRunStatusChanged?.(event);
+              },
               runtimeFactory: new QuickJSRuntimeFactory(),
               taskAdapterFactory: (runId, workflowName) =>
                 new WorkflowTaskServiceAdapter({
@@ -1799,26 +1796,45 @@ export class AIService extends EventEmitter {
                   parentWorkspaceId: workspaceId,
                   workflowRunId: runId,
                   workflowName,
-                  defaultAgentId: "explore",
+                  defaultAgentId: DEFAULT_WORKFLOW_AGENT_ID,
                   patchToolConfig: {
                     workspaceId,
                     cwd: workspacePath,
                     runtime,
                     runtimeTempDir,
                     workspaceSessionDir: this.config.getSessionDir(workspaceId),
-                    trusted: isProjectTrusted(this.config, metadata.projectPath),
+                    trusted: getWorkflowProjectTrusted(),
                   },
-                  getProjectTrusted: () => isProjectTrusted(this.config, metadata.projectPath),
+                  getProjectTrusted: getWorkflowProjectTrusted,
                   experiments: {
                     ...experiments,
                     dynamicWorkflows: dynamicWorkflowsExperimentEnabled,
                     workspaceHeartbeats: workspaceHeartbeatsExperimentEnabled,
                   },
                 }),
+              resolveWorkflowScript: (scriptPath) =>
+                resolveWorkflowScript({
+                  scriptPath,
+                  runtime,
+                  workspacePath,
+                  projectTrusted: getWorkflowProjectTrusted(),
+                }),
               // Background workflow tools outlive the model turn that started them. Feed the
               // terminal result back as a hidden user turn so the parent agent continues
               // instead of leaving the user staring at the workflow report payload.
               onBackgroundRunTerminal: async ({ runId, status, result, run }) => {
+                if (run.parentWorkflow != null) {
+                  return;
+                }
+                if (this.taskService != null) {
+                  await this.taskService.enqueueWorkflowRunTerminalAttention({
+                    ownerWorkspaceId: workspaceId,
+                    runId,
+                    status,
+                  });
+                  return;
+                }
+
                 const continuationSender = this.workflowResultContinuationSender;
                 if (continuationSender == null) {
                   log.warn("Workflow completed but no continuation sender is configured", {
@@ -1828,10 +1844,11 @@ export class AIService extends EventEmitter {
                   return;
                 }
 
-                const rawCommand = `workflow_run ${run.definition.name}`;
+                const scriptPath = run.workflow.sourcePath ?? run.workflow.name;
+                const rawCommand = `workflow_run ${scriptPath}`;
                 const workflowResultMessage = buildWorkflowResultContextMessage({
                   rawCommand,
-                  name: run.definition.name,
+                  name: scriptPath,
                   runId,
                   status,
                   result,
@@ -2698,7 +2715,7 @@ export class AIService extends EventEmitter {
         maxOutputTokens,
         effectiveToolPolicy,
         streamToken, // Pass the pre-generated stream token
-        hasQueuedMessage,
+        hasQueuedMessages,
         metadata.name,
         effectiveThinkingLevel,
         requestHeaders,

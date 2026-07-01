@@ -1,7 +1,10 @@
 import { describe, it, expect, mock } from "bun:test";
 import type { TaskCreatedEvent } from "@/common/types/stream";
 
-import { createTaskTool } from "./task";
+import { tool } from "ai";
+import { z } from "zod";
+
+import { createTaskTool, markBuiltInTaskTool, isBuiltInTaskTool } from "./task";
 import { createTestToolConfig, mockToolCallOptions, TestTempDir } from "./testHelpers";
 import { Ok, Err } from "@/common/types/result";
 import { ForegroundWaitBackgroundedError, type TaskService } from "@/node/services/taskService";
@@ -163,6 +166,56 @@ describe("task tool", () => {
     });
     expect(result).toMatchObject({
       status: "running",
+      taskId: "wst_child-turn",
+      workspaceId: "child-workspace",
+      handleKind: "workspace_turn",
+    });
+  });
+
+  it("forwards workspace turn queue dispatch mode", async () => {
+    using tempDir = new TestTempDir("test-task-tool-workspace-turn-queue-mode");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+
+    const createWorkspaceTurn = mock(() =>
+      Ok({
+        taskId: "wst_child-turn",
+        kind: "workspace_turn" as const,
+        status: "queued" as const,
+        workspaceId: "child-workspace",
+      })
+    );
+    const taskService = { createWorkspaceTurn } as unknown as TaskService;
+    const tool = createTaskTool({ ...baseConfig, taskService });
+
+    const result: unknown = await Promise.resolve(
+      tool.execute!(
+        {
+          kind: "workspace",
+          prompt: "follow up",
+          title: "Follow-up",
+          run_in_background: true,
+          workspace: {
+            mode: "existing",
+            workspaceId: "child-workspace",
+            queueDispatchMode: "turn-end",
+          },
+        },
+        mockToolCallOptions
+      )
+    );
+
+    expect(createWorkspaceTurn).toHaveBeenCalledTimes(1);
+    const createWorkspaceTurnCall = createWorkspaceTurn.mock.calls[0] as unknown[];
+    expect(createWorkspaceTurnCall[0]).toMatchObject({
+      ownerWorkspaceId: "parent-workspace",
+      workspace: {
+        mode: "existing",
+        workspaceId: "child-workspace",
+        queueDispatchMode: "turn-end",
+      },
+    });
+    expect(result).toMatchObject({
+      status: "queued",
       taskId: "wst_child-turn",
       workspaceId: "child-workspace",
       handleKind: "workspace_turn",
@@ -332,7 +385,7 @@ describe("task tool", () => {
 
     expect(create).toHaveBeenCalledTimes(1);
     const createArgs = create.mock.calls[0]?.[0];
-    expect(createArgs?.modelString).toBe("anthropic:claude-sonnet-4-6");
+    expect(createArgs?.modelString).toBe("anthropic:claude-sonnet-5");
     expect(createArgs?.thinkingLevel).toBe("high");
     // Parent runtime hint is still forwarded so unspecified fields keep inheriting.
     expect(createArgs?.parentRuntimeAiSettings).toEqual({
@@ -1115,5 +1168,22 @@ describe("task tool", () => {
     }
     expect(create).not.toHaveBeenCalled();
     expect(waitForAgentReport).not.toHaveBeenCalled();
+  });
+});
+
+describe("built-in task marker", () => {
+  function makeTool() {
+    return tool({
+      description: "task",
+      inputSchema: z.object({ prompt: z.string() }),
+      execute: () => Promise.resolve("ok"),
+    });
+  }
+
+  it("marks and recognizes the built-in task tool", () => {
+    const t = makeTool();
+    expect(isBuiltInTaskTool(t)).toBe(false);
+    markBuiltInTaskTool(t);
+    expect(isBuiltInTaskTool(t)).toBe(true);
   });
 });

@@ -1,5 +1,6 @@
 import { type LanguageModel, type Tool } from "ai";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
+import type { BackgroundWorkAttentionPolicy } from "@/common/types/backgroundWorkAttention";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
 import { createFileReadTool } from "@/node/services/tools/file_read";
 import { createAttachFileTool } from "@/node/services/tools/attach_file";
@@ -30,6 +31,7 @@ import { createTaskTool } from "@/node/services/tools/task";
 import { createTaskApplyGitPatchTool } from "@/node/services/tools/task_apply_git_patch";
 import { createTaskAwaitTool } from "@/node/services/tools/task_await";
 import { createTaskTerminateTool } from "@/node/services/tools/task_terminate";
+import { createTaskWorkspaceLifecycleTool } from "@/node/services/tools/task_workspace_lifecycle";
 import { createTaskListTool } from "@/node/services/tools/task_list";
 import { createAgentSkillReadTool } from "@/node/services/tools/agent_skill_read";
 import { createAgentSkillReadFileTool } from "@/node/services/tools/agent_skill_read_file";
@@ -42,10 +44,6 @@ import { createMuxAgentsReadTool } from "@/node/services/tools/mux_agents_read";
 import { createMuxAgentsWriteTool } from "@/node/services/tools/mux_agents_write";
 import { createMuxConfigReadTool } from "@/node/services/tools/mux_config_read";
 import { createMuxConfigWriteTool } from "@/node/services/tools/mux_config_write";
-import {
-  createWorkflowListTool,
-  createWorkflowReadTool,
-} from "@/node/services/tools/workflow_definitions";
 import { createWorkflowRunTool } from "@/node/services/tools/workflow_run";
 import { createWorkflowResumeTool } from "@/node/services/tools/workflow_resume";
 import { createAgentReportTool } from "@/node/services/tools/agent_report";
@@ -78,6 +76,13 @@ import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
 import type { ModelMessage } from "@/common/types/message";
 import type { GoalDefaults } from "@/constants/goals";
 import type { ProjectRef, WorkspaceMetadata } from "@/common/types/workspace";
+
+export interface ToolAgentSkillsRoots {
+  projectRoot: string;
+  projectUniversalRoot?: string;
+  globalRoot: string;
+  universalRoot?: string;
+}
 
 export interface ToolModelUsageEvent {
   source: "tool";
@@ -118,6 +123,14 @@ export interface WorkspaceHeartbeatToolService {
 /**
  * Configuration for tools that need runtime context
  */
+export interface WorkflowServiceScriptInput {
+  requestedScriptPath: string;
+  canonicalScriptPath: string;
+  source: string;
+  sourceHash: string;
+  sourceKind: "skill" | "workspace-file" | "inline";
+}
+
 export interface ToolConfiguration {
   /** Working directory for command execution - actual path in runtime's context (local or remote) */
   cwd: string;
@@ -158,6 +171,8 @@ export interface ToolConfiguration {
   workspaceId?: string;
   /** Pre-resolved mux-managed resource scope (global ~/.mux vs project root). */
   muxScope?: MuxToolScope;
+  /** Optional skill roots override for tests and isolated workflow resolution. */
+  agentSkillsRoots?: ToolAgentSkillsRoots;
   /** Memory service for the memory tool (present only when the memory experiment is enabled). */
   memoryService?: MemoryService;
   /** Per-scope memory write policy for the current agent (defaults to read-only). */
@@ -172,22 +187,14 @@ export interface ToolConfiguration {
   taskService?: TaskService;
   /** Durable workflow lifecycle service for dynamic workflow tools. */
   workflowService?: {
-    listDefinitions(options: { projectTrusted: boolean }): Promise<unknown[]>;
-    listDefinitionsWithMetadata?(options: { projectTrusted: boolean }): Promise<unknown[]>;
-    readDefinition(input: { name: string; projectTrusted: boolean }): Promise<{
-      descriptor: unknown;
-      source: string;
-      metadata?: unknown;
-      args?: unknown[];
-      sourceStats?: { chars: number; lines: number };
-    }>;
     getRun?(input: { workspaceId: string; runId: string }): Promise<unknown>;
     listRuns?(input: { workspaceId: string }): Promise<unknown[]>;
-    startNamedWorkflowInBackground?(input: {
-      name: string;
+    startWorkflowInBackground?(input: {
+      script: WorkflowServiceScriptInput;
       workspaceId: string;
       projectTrusted: boolean;
       args: unknown;
+      attentionPolicy?: BackgroundWorkAttentionPolicy;
       onRunCreated?: (event: {
         runId: string;
         status: "pending";
@@ -195,8 +202,8 @@ export interface ToolConfiguration {
         run: unknown;
       }) => Promise<void> | void;
     }): Promise<{ runId: string; status: string; result: unknown }>;
-    startNamedWorkflow(input: {
-      name: string;
+    startWorkflow?(input: {
+      script: WorkflowServiceScriptInput;
       workspaceId: string;
       projectTrusted: boolean;
       args: unknown;
@@ -482,19 +489,25 @@ async function getDesktopTools(config: ToolConfiguration): Promise<Record<string
 /**
  * Returns true when an Anthropic model supports webFetch_20250910 (Claude 4.6+).
  *
- * Generation-based IDs: claude-{variant}-{major}-{minor} (e.g. claude-sonnet-4-6)
- * Pinned generation IDs: claude-{variant}-{major}-{minor}-{date} (e.g. claude-opus-4-6-20260201)
- * Date-based pre-4.6 IDs: claude-{variant}-{major}-{date} (e.g. claude-sonnet-4-20250514)
+ * Two-segment IDs:    claude-{variant}-{major}-{minor} (e.g. claude-sonnet-4-6, claude-opus-4-8)
+ * Pinned two-segment: claude-{variant}-{major}-{minor}-{date} (e.g. claude-opus-4-6-20260201)
+ * Date-based pre-4.6: claude-{variant}-{major}-{date} (e.g. claude-sonnet-4-20250514)
+ * Major-only IDs:     claude-{variant}-{major} (e.g. claude-sonnet-5, claude-fable-5,
+ *                     claude-mythos-5) — the dateless naming adopted for the 5 generation.
  *
- * The \d{1,2} constraint on the minor segment accepts 1-2 digit version numbers (1–99) while
- * rejecting 8-digit date suffixes. The (?:-|$) lookahead allows an optional pinned date to follow.
+ * The minor segment is optional so major-only IDs (Sonnet 5, Fable 5, Mythos 5, future Opus 5+)
+ * are recognized; those are all > 4 and qualify. The variant segment must be alphabetic so older
+ * third-generation IDs like claude-3-5-sonnet-20241022 do not get misread as major=5. The \d{1,2}
+ * constraint accepts 1-2 digit version numbers (1–99) while rejecting 8-digit date suffixes, so
+ * date-based pre-4.6 IDs like claude-sonnet-4-20250514 parse as major=4 / no minor and correctly
+ * stay unsupported. The (?:-|$) lookahead allows an optional pinned date to follow.
  */
-function supportsAnthropicNativeWebFetch(modelId: string): boolean {
-  const match = /^claude-\w+-(\d+)-(\d{1,2})(?:-|$)/.exec(modelId);
+export function supportsAnthropicNativeWebFetch(modelId: string): boolean {
+  const match = /^claude-[a-z]+-(\d+)(?:-(\d{1,2}))?(?:-|$)/.exec(modelId);
   if (!match) return false;
   const major = parseInt(match[1], 10);
-  const minor = parseInt(match[2], 10);
-  return major > 4 || (major === 4 && minor >= 6);
+  const minor = match[2] != null ? parseInt(match[2], 10) : undefined;
+  return major > 4 || (major === 4 && minor !== undefined && minor >= 6);
 }
 
 export async function getToolsForModel(
@@ -534,6 +547,7 @@ export async function getToolsForModel(
     task_await: wrap(createTaskAwaitTool(config)),
     task_apply_git_patch: wrap(createTaskApplyGitPatchTool(config)),
     task_terminate: wrap(createTaskTerminateTool(config)),
+    task_workspace_lifecycle: wrap(createTaskWorkspaceLifecycleTool(config)),
     task_list: wrap(createTaskListTool(config)),
 
     // Bash execution (foreground/background). Manage background output via task_await/task_list/task_terminate.
@@ -582,8 +596,6 @@ export async function getToolsForModel(
     // "call me immediately" descriptions.
     ...(config.workflowService && config.experiments?.dynamicWorkflows
       ? {
-          workflow_list: createWorkflowListTool(config),
-          workflow_read: createWorkflowReadTool(config),
           workflow_run: createWorkflowRunTool(config),
           workflow_resume: createWorkflowResumeTool(config),
         }

@@ -26,11 +26,16 @@ interface UseAIViewKeybindsParams {
   aggregator: StreamingMessageAggregator | undefined; // For compaction detection
   setEditingMessage: (editing: EditingMessageState | undefined) => void;
   vimEnabled: boolean; // For vim-aware interrupt keybind
+  // RESUME_STREAM keybind: continue an interrupted stream. Optional so the hook
+  // stays drop-in for callers/tests that don't surface a resume affordance.
+  canResumeInterruptedStream?: boolean; // Whether a resumable interrupted turn is shown
+  resumeInterruptedStream?: () => void; // Continue the interrupted stream
 }
 
 /**
  * Manages keyboard shortcuts for AIView:
  * - Esc (non-vim) or Ctrl+C (vim): Interrupt stream (Escape skips text inputs by default)
+ * - Shift+R: Resume an interrupted stream (when a resumable turn is shown)
  * - Ctrl+I: Focus chat input
  * - Shift+H: Load older transcript messages (when available)
  * - Shift+G: Jump to bottom
@@ -52,6 +57,8 @@ export function useAIViewKeybinds({
   aggregator,
   setEditingMessage,
   vimEnabled,
+  canResumeInterruptedStream = false,
+  resumeInterruptedStream,
 }: UseAIViewKeybindsParams): void {
   const { api } = useAPI();
 
@@ -145,6 +152,19 @@ export function useAIViewKeybinds({
         return;
       }
 
+      // Resume an interrupted stream. Like Shift+G/Shift+H, this is a
+      // transcript-scoped key: gated below the editable guard so Shift+R types
+      // normally while composing. Only acts when a resumable turn is shown.
+      if (
+        matchesKeybind(e, KEYBINDS.RESUME_STREAM) &&
+        canResumeInterruptedStream &&
+        resumeInterruptedStream
+      ) {
+        e.preventDefault();
+        resumeInterruptedStream();
+        return;
+      }
+
       if (matchesKeybind(e, KEYBINDS.LOAD_OLDER_MESSAGES) && loadOlderHistory) {
         e.preventDefault();
         loadOlderHistory();
@@ -180,6 +200,8 @@ export function useAIViewKeybinds({
     aggregator,
     setEditingMessage,
     vimEnabled,
+    canResumeInterruptedStream,
+    resumeInterruptedStream,
     api,
   ]);
 }

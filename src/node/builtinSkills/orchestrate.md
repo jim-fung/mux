@@ -19,18 +19,18 @@ Coordinate implementation by delegating investigation + coding to sub-agents, th
 - **Trust `explore` sub-agent reports as authoritative for repo facts** (paths/symbols/callsites). Do not redo the same investigation yourself; only re-check if a report is ambiguous or contradicts other evidence. For correctness claims, an `explore` report counts as having read the referenced files.
 - **`bash` is for orchestration only:** `git` / `gh` repo coordination, targeted post-apply verification, and waiting on PR review/CI. Do not use `bash` for file reads/writes, manual code editing, or broad repo exploration. If a direct verification check fails due to a code issue, delegate the fix to `exec` instead of patching it yourself.
 - **Never read or scan session storage** (`~/.mux/sessions/**`, `~/.mux/sessions/subagent-patches/**`). Treat session storage as internal. Access patches only through `task_apply_git_patch`.
-- **Do not call `propose_plan`** from this workflow. If a complex subtask needs more shape before implementation, decompose it with one or more `explore` tasks and write a richer brief for `exec`, rather than spawning a `plan` sub-agent (plan is not runnable as a sub-agent).
+- **Do not call `propose_plan`** from this workflow conductor. If a complex subtask needs more shape before implementation, either decompose it with one or more `explore` tasks and write a richer brief for `exec`, or model an explicit workflow-owned `agentId: "plan"` step followed by a separate `exec` step.
 
 ## Long-horizon work: prefer a durable workflow
 
-If the `workflow_run` / `workflow_list` tools are unavailable in this session, skip this section and use the interactive task loop below.
+If the `workflow_run` tool is unavailable in this session, skip this section and use the interactive task loop below.
 
 For long-horizon orchestration — many phases, a dependency DAG known up front, or repeated implement → gate → fixup → re-gate loops — encode the orchestration as a durable workflow instead of driving it turn-by-turn from the transcript:
 
-- Reuse existing workflows before authoring one: run `workflow_list` and invoke a fitting workflow with `workflow_run`. For example, when a subtask needs deep multi-source investigation before implementation briefs can be written, run the built-in `deep-research` workflow instead of hand-rolling parallel `explore` fan-out.
+- Reuse packaged workflows before authoring one: read relevant workflow skills with `agent_skill_read`, inspect workflow scripts with `agent_skill_read_file` when needed, and invoke a fitting workflow with `workflow_run({ script_path: "skill://<skill>/workflow.js", args: {} })`.
 - Read the built-in `workflow-authoring` skill first (`agent_skill_read({ name: "workflow-authoring" })`).
-- Author a scratch workflow at `.mux/workflows/.scratch/<name>.js` that encodes the DAG in code: `agent(...)` for sub-agent steps, `applyPatch(...)` for patch integration (the host dry-runs automatically and returns structured conflict results), `phase`/`log` for progress, and plain control flow for gate/fixup loops.
-- Run it with `workflow_run`; resume interrupted runs with `workflow_resume`. Durable runs survive restarts and context compaction — completed steps are never re-executed.
+- Author a local workflow at an explicit workspace path such as `./workflows/<name>.js` that encodes the DAG in code: `agent(...)` for sub-agent steps, `phase`/`log` for progress, and plain control flow for gate/fixup loops.
+- Run it with `workflow_run({ script_path: "./workflows/<name>.js", args: {} })`; resume interrupted runs with `workflow_resume`. Durable runs survive restarts and context compaction — completed steps are never re-executed.
 
 Stay with the interactive task loop below when the work is exploratory, the user wants to steer between batches, or the batch is small (a handful of tasks) — there, workflow authoring overhead outweighs the durability benefit.
 
@@ -100,7 +100,7 @@ Example dependency chain (schema download → generation):
 
 1. Identify a batch of independent subtasks.
 2. Spawn one `exec` sub-agent task per subtask with `run_in_background: true`.
-3. Await the batch via `task_await`.
+3. If you can do useful setup work while they run, do it; when you are ready to integrate, call `task_await` for the pending task IDs. If no parent-side work remains, end the turn after recording task IDs; Mux will wake this workspace as each background task reaches a terminal state.
 4. For each successful implementation task, integrate patches **one at a time**:
    - Treat every successful child task with a `taskId` as pending patch integration, whether the completion arrived inline from `task` or later from `task_await`.
    - Complete each dry-run + real-apply pair before starting the next patch. Applying one patch changes `HEAD`, which can invalidate later dry-run results.
@@ -119,6 +119,10 @@ Example dependency chain (schema download → generation):
    - PASS: summary-only (no long logs).
    - FAIL: include the failing command + key error lines; then delegate a fix to `exec` and re-verify.
 
+## Background readiness monitors
+
+For PR/CI readiness that can continue after your turn ends, prefer bounded monitor tasks over parent-side polling. Read `background-monitors`, then launch independent monitors with `task({ run_in_background: true })` for CI/checks, mergeability, review arrival, or deployment health. Each monitor should poll internally with a deadline and call `agent_report` only on convergence, failure, state transition, or timeout. Use `bash({ run_in_background: true, monitor: ... })` only for line-oriented shell output watchers (dev-server logs, watch tests, compiler errors), not for GitHub/API polling.
+
 ## Gate loop (verification)
 
 The same loop applies whether you orchestrate interactively or from a workflow:
@@ -129,7 +133,7 @@ The same loop applies whether you orchestrate interactively or from a workflow:
 
 Implementation sub-agents may _suggest_ additional gates in their reports (they know what they touched), but the orchestrator owns the gate list and suggestions are only ever additive — an implementer must not narrow its own acceptance criteria. A self-reported "tests pass" from an implementer is evidence, not a gate result.
 
-In a workflow, the verifier becomes `agent({ outputSchema, onRefusal: "fail" })` returning a structured verdict the conductor branches on, and the fix/gate loop is a bounded `while` in code.
+In a workflow, the verifier becomes `agent(prompt, { id, schema, onRefusal: "fail" })` returning a structured verdict the conductor branches on, and the fix/gate loop is a bounded `while` in code.
 
 ## Sequential protocol (only for dependency chains)
 

@@ -16,16 +16,18 @@ import {
 } from "@/common/orpc/schemas";
 import {
   type StructuredTaskOutput,
-  type WorkflowDefinitionDescriptor,
+  type WorkflowScriptDescriptor,
   type WorkflowRunEvent,
   type WorkflowRunParent,
   type WorkflowRunRecord,
   type WorkflowRunStatus,
   type WorkflowStepRecord,
 } from "@/common/types/workflow";
+import type { BackgroundWorkAttentionPolicy } from "@/common/types/backgroundWorkAttention";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
+import { workflowRunStreamHub } from "@/node/services/workflows/workflowRunStreamHub";
 
 const WorkflowRunStatusSnapshotSchema = WorkflowRunRecordSchema.pick({
   id: true,
@@ -46,11 +48,15 @@ export interface WorkflowRunStoreOptions {
 export interface CreateWorkflowRunInput {
   id: string;
   workspaceId: string;
-  definition: WorkflowDefinitionDescriptor;
-  definitionSource: string;
+  workflow: WorkflowScriptDescriptor;
+  source: string;
   args: unknown;
   agentOutputSchemaRequired?: boolean;
+  /** Existing persisted source snapshots may still contain agentType; new runs default to false. */
+  agentTypeAliasAllowed?: boolean;
   parentWorkflow?: WorkflowRunParent;
+  /** Background runs persist "notify_on_terminal"; foreground/default omit (defaults to blocking). */
+  attentionPolicy?: BackgroundWorkAttentionPolicy;
   now: string;
 }
 
@@ -71,6 +77,9 @@ type WorkflowRunEventDraft = WorkflowRunEvent extends infer Event
     ? Omit<Event, "sequence">
     : never
   : never;
+
+const WORKFLOW_SOURCE_FILENAME = "source.js";
+const LEGACY_WORKFLOW_SOURCE_FILENAME = "definition.js";
 
 interface LeaseRecord {
   ownerId: string;
@@ -95,26 +104,25 @@ export class WorkflowRunStore {
   async createRun(input: CreateWorkflowRunInput): Promise<WorkflowRunRecord> {
     assert(input.id.length > 0, "WorkflowRunStore.createRun: id is required");
     assert(input.workspaceId.length > 0, "WorkflowRunStore.createRun: workspaceId is required");
-    assert(
-      input.definitionSource.length > 0,
-      "WorkflowRunStore.createRun: definitionSource is required"
-    );
+    assert(input.source.length > 0, "WorkflowRunStore.createRun: source is required");
 
     const runDir = this.runDir(input.id);
     await fs.mkdir(runDir, { recursive: true });
-    await fs.writeFile(path.join(runDir, "definition.js"), input.definitionSource, "utf-8");
+    await fs.writeFile(path.join(runDir, WORKFLOW_SOURCE_FILENAME), input.source, "utf-8");
     await fs.writeFile(path.join(runDir, "events.jsonl"), "", { flag: "a" });
     await fs.writeFile(path.join(runDir, "steps.jsonl"), "", { flag: "a" });
 
     const run = WorkflowRunRecordSchema.parse({
       id: input.id,
       workspaceId: input.workspaceId,
-      definition: input.definition,
-      definitionSource: input.definitionSource,
-      definitionHash: hashSource(input.definitionSource),
+      workflow: input.workflow,
+      source: input.source,
+      sourceHash: hashSource(input.source),
       args: input.args,
       agentOutputSchemaRequired: input.agentOutputSchemaRequired ?? true,
+      agentTypeAliasAllowed: input.agentTypeAliasAllowed ?? false,
       ...(input.parentWorkflow != null ? { parentWorkflow: input.parentWorkflow } : {}),
+      ...(input.attentionPolicy != null ? { attentionPolicy: input.attentionPolicy } : {}),
       status: "pending",
       createdAt: input.now,
       updatedAt: input.now,
@@ -132,10 +140,7 @@ export class WorkflowRunStore {
       input.workspaceId.length > 0,
       "WorkflowRunStore.createRunIfAbsent: workspaceId is required"
     );
-    assert(
-      input.definitionSource.length > 0,
-      "WorkflowRunStore.createRunIfAbsent: definitionSource is required"
-    );
+    assert(input.source.length > 0, "WorkflowRunStore.createRunIfAbsent: source is required");
 
     const runDir = this.runDir(input.id);
     await fs.mkdir(this.workflowsDir(), { recursive: true });
@@ -157,18 +162,19 @@ export class WorkflowRunStore {
       await fs.rm(runDir, { recursive: true, force: true });
       await fs.mkdir(runDir, { recursive: false });
       try {
-        await fs.writeFile(path.join(runDir, "definition.js"), input.definitionSource, "utf-8");
+        await fs.writeFile(path.join(runDir, WORKFLOW_SOURCE_FILENAME), input.source, "utf-8");
         await fs.writeFile(path.join(runDir, "events.jsonl"), "", { flag: "a" });
         await fs.writeFile(path.join(runDir, "steps.jsonl"), "", { flag: "a" });
 
         const run = WorkflowRunRecordSchema.parse({
           id: input.id,
           workspaceId: input.workspaceId,
-          definition: input.definition,
-          definitionSource: input.definitionSource,
-          definitionHash: hashSource(input.definitionSource),
+          workflow: input.workflow,
+          source: input.source,
+          sourceHash: hashSource(input.source),
           args: input.args,
           agentOutputSchemaRequired: input.agentOutputSchemaRequired ?? true,
+          agentTypeAliasAllowed: input.agentTypeAliasAllowed ?? false,
           ...(input.parentWorkflow != null ? { parentWorkflow: input.parentWorkflow } : {}),
           status: "pending",
           createdAt: input.now,
@@ -324,6 +330,24 @@ export class WorkflowRunStore {
     options: AppendWorkflowRunEventOptions = {}
   ): Promise<WorkflowRunRecord> {
     return await this.appendNextEvent(runId, { type: "status", at, status }, options);
+  }
+
+  /**
+   * Persist the attention policy on an existing run record. Used when a foreground/default run is
+   * resumed in the background and must become non-blocking (notify_on_terminal) for future
+   * stream-ends. No-op when the policy already matches.
+   */
+  async setAttentionPolicy(
+    runId: string,
+    attentionPolicy: BackgroundWorkAttentionPolicy
+  ): Promise<void> {
+    await this.withWorkflowMutationLock(runId, async () => {
+      const run = await this.getRunUnlocked(runId);
+      if (run.attentionPolicy === attentionPolicy) {
+        return;
+      }
+      await this.writeRunFile(runId, { ...run, attentionPolicy });
+    });
   }
 
   async recordStepStarted(
@@ -576,6 +600,31 @@ export class WorkflowRunStore {
     });
   }
 
+  async recordStepTimeoutMetadata(
+    runId: string,
+    input: {
+      stepId: string;
+      inputHash: string;
+      taskId: string;
+      startedAt: string;
+      timeout: NonNullable<WorkflowStepRecord["timeout"]>;
+    },
+    options: AppendWorkflowRunEventOptions = {}
+  ): Promise<void> {
+    await this.appendStepRecord(
+      runId,
+      {
+        stepId: input.stepId,
+        inputHash: input.inputHash,
+        taskId: input.taskId,
+        startedAt: input.startedAt,
+        status: "started",
+        timeout: input.timeout,
+      },
+      options
+    );
+  }
+
   async recordStepFailed(
     runId: string,
     input: {
@@ -782,27 +831,35 @@ export class WorkflowRunStore {
     }
   }
 
+  private async readWorkflowSource(runId: string): Promise<string> {
+    const runDir = this.runDir(runId);
+    try {
+      return await fs.readFile(path.join(runDir, WORKFLOW_SOURCE_FILENAME), "utf-8");
+    } catch (error) {
+      if (!isErrno(error, "ENOENT")) {
+        throw error;
+      }
+      return await fs.readFile(path.join(runDir, LEGACY_WORKFLOW_SOURCE_FILENAME), "utf-8");
+    }
+  }
+
   private async getRunFileSnapshot(runId: string): Promise<WorkflowRunRecord> {
     const rawRun = JSON.parse(await fs.readFile(this.runFile(runId), "utf-8")) as unknown;
-    const run = WorkflowRunRecordSchema.parse(rawRun);
-    const definitionSource = await fs.readFile(
-      path.join(this.runDir(runId), "definition.js"),
-      "utf-8"
-    );
+    const run = WorkflowRunRecordSchema.parse(normalizeWorkflowRunRecord(rawRun));
+    const source = await this.readWorkflowSource(runId);
     return WorkflowRunRecordSchema.parse({
       ...run,
-      definitionSource,
-      definitionHash: hashSource(definitionSource),
+      source,
+      sourceHash: hashSource(source),
     });
   }
 
   private async getRunUnlocked(runId: string): Promise<WorkflowRunRecord> {
     const rawRun = JSON.parse(await fs.readFile(this.runFile(runId), "utf-8")) as unknown;
-    const partial = WorkflowRunRecordSchema.omit({ events: true, steps: true }).parse(rawRun);
-    const definitionSource = await fs.readFile(
-      path.join(this.runDir(runId), "definition.js"),
-      "utf-8"
+    const partial = WorkflowRunRecordSchema.omit({ events: true, steps: true }).parse(
+      normalizeWorkflowRunRecord(rawRun)
     );
+    const source = await this.readWorkflowSource(runId);
     const events = await this.readEvents(runId);
     const steps = await this.readSteps(runId);
 
@@ -810,8 +867,8 @@ export class WorkflowRunStore {
     const status = getRunStatusFromEvents(events) ?? partial.status;
     return WorkflowRunRecordSchema.parse({
       ...partial,
-      definitionSource,
-      definitionHash: hashSource(definitionSource),
+      source,
+      sourceHash: hashSource(source),
       status,
       updatedAt: latestEvent?.at ?? partial.updatedAt,
       events,
@@ -943,6 +1000,10 @@ export class WorkflowRunStore {
   private async writeRunFile(runId: string, run: WorkflowRunRecord): Promise<void> {
     const runForDisk = WorkflowRunRecordSchema.parse(run);
     await writeJsonAtomic(this.runFile(runId), runForDisk);
+    // Notify live subscribers (workflows.subscribe) after the durable write. The hub is a
+    // module-level bus, so any store instance — regardless of which flow constructed it —
+    // feeds the same stream. Persist-before-notify keeps disk and observers consistent.
+    workflowRunStreamHub.notifyRunPersisted(runForDisk);
   }
 
   getStepArtifactsDir(runId: string, stepId: string, inputHash: string): string {
@@ -979,6 +1040,35 @@ export class WorkflowRunStore {
   }
 }
 
+function normalizeWorkflowRunRecord(rawRun: unknown): unknown {
+  if (!isRecord(rawRun)) {
+    return rawRun;
+  }
+  if (rawRun.workflow != null && rawRun.source != null && rawRun.sourceHash != null) {
+    return rawRun;
+  }
+  if (
+    rawRun.definition == null &&
+    rawRun.definitionSource == null &&
+    rawRun.definitionHash == null
+  ) {
+    return rawRun;
+  }
+
+  // Older run.json snapshots used definition* fields. Normalize before schema parsing so
+  // existing durable runs stay visible/resumable long enough to hydrate source from disk.
+  return {
+    ...rawRun,
+    workflow: rawRun.workflow ?? rawRun.definition,
+    source: rawRun.source ?? rawRun.definitionSource,
+    sourceHash: rawRun.sourceHash ?? rawRun.definitionHash,
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value != null && typeof value === "object" && !Array.isArray(value);
+}
+
 // API callers provide run IDs when reading/resuming; validate before path joins so a malformed
 // ID cannot escape the workspace-scoped workflows directory.
 function assertValidWorkflowRunId(runId: string): void {
@@ -995,7 +1085,7 @@ function assertSameWorkflowRunIdentity(
   const sameIdentity =
     run.id === input.id &&
     run.workspaceId === input.workspaceId &&
-    run.definition.name === input.definition.name &&
+    run.workflow.name === input.workflow.name &&
     JSON.stringify(run.args) === JSON.stringify(input.args) &&
     JSON.stringify(run.parentWorkflow ?? null) === JSON.stringify(input.parentWorkflow ?? null);
   assert(
@@ -1013,13 +1103,40 @@ function mergeWorkflowStepRecords(
   nextRecord?: WorkflowStepRecord
 ): WorkflowStepRecord[] {
   const byKey = new Map<string, WorkflowStepRecord>();
+  const mergeRecord = (record: WorkflowStepRecord): void => {
+    const key = getWorkflowStepKey(record);
+    const previous = byKey.get(key);
+    byKey.set(key, {
+      ...record,
+      timeout: mergeWorkflowStepTimeoutMetadata(previous, record),
+    });
+  };
   for (const record of records) {
-    byKey.set(getWorkflowStepKey(record), record);
+    mergeRecord(record);
   }
   if (nextRecord !== undefined) {
-    byKey.set(getWorkflowStepKey(nextRecord), nextRecord);
+    mergeRecord(nextRecord);
   }
   return Array.from(byKey.values());
+}
+
+function mergeWorkflowStepTimeoutMetadata(
+  previous: WorkflowStepRecord | undefined,
+  next: WorkflowStepRecord
+): WorkflowStepRecord["timeout"] {
+  if (next.timeout != null) {
+    if (previous?.timeout != null && previous.taskId === next.taskId) {
+      return { ...previous.timeout, ...next.timeout };
+    }
+    return next.timeout;
+  }
+  if (previous?.timeout == null) {
+    return undefined;
+  }
+  if (previous.taskId != null && next.taskId != null && previous.taskId !== next.taskId) {
+    return undefined;
+  }
+  return previous.timeout;
 }
 
 function hashSource(source: string): string {

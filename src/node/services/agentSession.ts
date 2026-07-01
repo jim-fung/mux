@@ -357,6 +357,10 @@ export class AgentSession {
   private activePreparedTurnAbortController: AbortController | null = null;
   // When true, stream-end skips auto-flushing queued messages so an edit can truncate first.
   private deferQueuedFlushUntilAfterEdit = false;
+  // A tool-end queued message should preempt the current turn after the next real tool result.
+  // We keep this set until the requested stream-abort arrives, so a re-queued replacement
+  // can still dispatch even if the original queued draft was edited while the abort was in flight.
+  private queuedToolEndAbortInFlight = false;
 
   private idleWaiters: Array<() => void> = [];
   private pendingExternalManualFollowUps = 0;
@@ -364,6 +368,7 @@ export class AgentSession {
   private readonly compactionHandler: CompactionHandler;
   private readonly compactionMonitor: CompactionMonitor;
 
+  private autoRetryStarting = false;
   private readonly retryManager: RetryManager;
   private lastAutoRetryResumeRequest?: AutoRetryResumeRequest;
   /** Startup recovery should run once per session to avoid duplicate retry timers on reconnect. */
@@ -558,7 +563,7 @@ export class AgentSession {
       async () => {
         await this.retryActiveStream();
       },
-      (event) => this.emitRetryEvent(event)
+      (event) => this.handleRetryStatusChange(event)
     );
 
     this.attachAiListeners();
@@ -773,6 +778,15 @@ export class AgentSession {
     this.preparingRuntimeStatus = null;
   }
 
+  private handleRetryStatusChange(event: RetryStatusEvent): void {
+    if (event.type === "auto-retry-starting") {
+      this.autoRetryStarting = true;
+    } else if (event.type === "auto-retry-scheduled" || event.type === "auto-retry-abandoned") {
+      this.autoRetryStarting = false;
+    }
+    this.emitRetryEvent(event);
+  }
+
   private emitRetryEvent(event: RetryStatusEvent): void {
     if (this.disposed) {
       return;
@@ -840,52 +854,57 @@ export class AgentSession {
   }
 
   private async retryActiveStream(): Promise<void> {
-    const request = this.lastAutoRetryResumeRequest;
-    if (!request) {
-      this.emitRetryEvent({ type: "auto-retry-abandoned", reason: "missing_retry_options" });
-      return;
-    }
-
-    const result = await this.resumeStream(request.options, {
-      agentInitiated: request.agentInitiated === true ? true : undefined,
-      goalKind: request.goalKind,
-    });
-    if (result.success) {
-      if (!result.data.started) {
-        // resumeStream can defer when a turn is still PREPARING/COMPLETING.
-        // Treat this as retriable so auto-retry keeps progressing instead of
-        // stalling after the "auto-retry-starting" status event.
-        await this.handleStreamFailureForAutoRetry({
-          type: "unknown",
-          message: "retry_deferred_busy",
-        });
+    this.autoRetryStarting = true;
+    try {
+      const request = this.lastAutoRetryResumeRequest;
+      if (!request) {
+        this.emitRetryEvent({ type: "auto-retry-abandoned", reason: "missing_retry_options" });
         return;
       }
 
-      // Retry resumed the stream successfully. Clear stale startup-abandon markers now
-      // (not only on stream-end) so a crash/restart mid-stream doesn't suppress recovery.
-      await this.clearStartupAutoRetryAbandon();
-      return;
-    }
+      const result = await this.resumeStream(request.options, {
+        agentInitiated: request.agentInitiated === true ? true : undefined,
+        goalKind: request.goalKind,
+      });
+      if (result.success) {
+        if (!result.data.started) {
+          // resumeStream can defer when a turn is still PREPARING/COMPLETING.
+          // Treat this as retriable so auto-retry keeps progressing instead of
+          // stalling after the "auto-retry-starting" status event.
+          await this.handleStreamFailureForAutoRetry({
+            type: "unknown",
+            message: "retry_deferred_busy",
+          });
+          return;
+        }
 
-    if (this.activeStreamFailureHandled) {
-      // resumeStream() failure paths already flowed through streamWithHistory() /
-      // handleStreamError(), which scheduled retry and persisted abandon state.
-      // Re-processing here would double-increment backoff attempts.
-      return;
-    }
+        // Retry resumed the stream successfully. Clear stale startup-abandon markers now
+        // (not only on stream-end) so a crash/restart mid-stream doesn't suppress recovery.
+        await this.clearStartupAutoRetryAbandon();
+        return;
+      }
 
-    // Fallback: resumeStream() can fail before stream error handlers run
-    // (for example commitPartial/history read failures). Handle those here so
-    // auto-retry continues instead of stalling after auto-retry-starting.
-    await this.handleStreamFailureForAutoRetry({
-      type: result.error.type,
-      message: this.extractRetryFailureMessage(result.error),
-    });
-    await this.updateStartupAutoRetryAbandonFromFailure(
-      result.error.type,
-      this.activeStreamUserMessageId
-    );
+      if (this.activeStreamFailureHandled) {
+        // resumeStream() failure paths already flowed through streamWithHistory() /
+        // handleStreamError(), which scheduled retry and persisted abandon state.
+        // Re-processing here would double-increment backoff attempts.
+        return;
+      }
+
+      // Fallback: resumeStream() can fail before stream error handlers run
+      // (for example commitPartial/history read failures). Handle those here so
+      // auto-retry continues instead of stalling after auto-retry-starting.
+      await this.handleStreamFailureForAutoRetry({
+        type: result.error.type,
+        message: this.extractRetryFailureMessage(result.error),
+      });
+      await this.updateStartupAutoRetryAbandonFromFailure(
+        result.error.type,
+        this.activeStreamUserMessageId
+      );
+    } finally {
+      this.autoRetryStarting = false;
+    }
   }
 
   private getAutoRetryPreferencePath(): string {
@@ -2272,7 +2291,9 @@ export class AgentSession {
       goalContinuation?: boolean;
       goalKind?: GoalSyntheticMessageKind;
       startStreamInBackground?: boolean;
+      onAccepted?: () => Promise<void> | void;
       onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
+      onCanceled?: (reason: string) => Promise<void> | void;
     }
   ): Promise<Result<void, SendMessageError>> {
     this.assertNotDisposed("sendMessage");
@@ -2795,6 +2816,12 @@ export class AgentSession {
     // Same-session retry should resume the exact accepted request we just finalized
     // in history, even if runtime warmup fails before streamWithHistory() starts.
     this.setAutoRetryResumeState(optionsForStream, agentInitiated, goalKind);
+    try {
+      await internal?.onAccepted?.();
+    } catch (error) {
+      return Err(createUnknownSendMessageError(getErrorMessage(error)));
+    }
+
     const preparedTurnAbortController = new AbortController();
     this.activePreparedTurnAbortController = preparedTurnAbortController;
     this.setTurnPhase(TurnPhase.PREPARING);
@@ -3407,6 +3434,10 @@ export class AgentSession {
     // Explicit user interruption should immediately stop any pending auto-retry loop.
     this.retryManager.cancel();
 
+    if (options?.soft !== true) {
+      this.queuedToolEndAbortInFlight = false;
+    }
+
     // For hard interrupts, delete partial BEFORE stopping to prevent abort handler
     // from committing it. For soft interrupts, defer to stream-abort handler since
     // the stream continues running and would recreate the partial.
@@ -3608,8 +3639,7 @@ export class AgentSession {
       workspaceGoalService: this.workspaceGoalService,
       experiments: options?.experiments,
       disableWorkspaceAgents: options?.disableWorkspaceAgents,
-      hasQueuedMessage: () =>
-        !this.messageQueue.isEmpty() && this.messageQueue.getQueueDispatchMode() === "tool-end",
+      hasQueuedMessages: this.hasQueuedMessages.bind(this),
       openaiTruncationModeOverride,
     });
 
@@ -4511,6 +4541,10 @@ export class AgentSession {
       ) {
         this.onPostCompactionStateChange?.();
       }
+
+      if (payload.type === "tool-call-end" && payload.replay !== true) {
+        this.requestQueuedToolEndDispatchAfterCurrentTool();
+      }
     });
     forward("reasoning-delta", (payload) => {
       this.markActiveStreamHadAnyOutput();
@@ -4605,6 +4639,7 @@ export class AgentSession {
         );
 
         this.emitChatEvent(payload);
+        this.queuedToolEndAbortInFlight = false;
         return;
       }
 
@@ -4624,6 +4659,7 @@ export class AgentSession {
       const failedUserMessageId = this.activeStreamUserMessageId;
       const hadCompactionRequest = this.activeCompactionRequest !== undefined;
       const abortReason = "abortReason" in payload ? payload.abortReason : undefined;
+      const isQueuedToolEndAbort = this.queuedToolEndAbortInFlight && abortReason !== "user";
       if (abortReason === "user") {
         await this.workspaceGoalService?.recordUserStoppedStream(this.workspaceId);
       }
@@ -4652,13 +4688,20 @@ export class AgentSession {
       if (hadCompactionRequest && !this.disposed) {
         this.clearQueue();
       }
-      await this.handleStreamFailureForAutoRetry({
-        type: "aborted",
-        message: abortReason,
-      });
+      // A queued tool-end dispatch deliberately soft-stops the stream (abortReason "system")
+      // to preempt the turn, so that abort is intentional rather than a failure: skip auto-retry.
+      if (!isQueuedToolEndAbort) {
+        await this.handleStreamFailureForAutoRetry({
+          type: "aborted",
+          message: abortReason,
+        });
+      }
       await this.updateStartupAutoRetryAbandonFromAbort(abortReason, failedUserMessageId);
       this.emitChatEvent(payload);
-      this.setTurnPhase(TurnPhase.IDLE);
+      const dispatchedQueuedMessage = this.dispatchQueuedToolEndMessageAfterAbort(abortReason);
+      if (!dispatchedQueuedMessage) {
+        this.setTurnPhase(TurnPhase.IDLE);
+      }
     });
     forward("runtime-status", (payload) => {
       if (payload.type === "runtime-status") {
@@ -4761,6 +4804,7 @@ export class AgentSession {
         const hadQueuedMessages = this.hasPendingManualFollowUp();
         if (this.deferQueuedFlushUntilAfterEdit) {
           // Clear the queued message flag so the next turn's tools don't early-return.
+          this.queuedToolEndAbortInFlight = false;
           this.backgroundProcessManager.setMessageQueued(this.workspaceId, false);
           // Do not dispatch stream-end follow-ups while the edit flow is waiting
           // for IDLE; truncation must run before any synthetic turn resumes.
@@ -4997,7 +5041,13 @@ export class AgentSession {
   queueMessage(
     message: string,
     options?: SendMessageOptions & { fileParts?: FilePart[] },
-    internal?: { synthetic?: boolean; agentInitiated?: boolean }
+    internal?: {
+      synthetic?: boolean;
+      agentInitiated?: boolean;
+      onAccepted?: () => Promise<void> | void;
+      onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
+      onCanceled?: (reason: string) => Promise<void> | void;
+    }
   ): "tool-end" | "turn-end" | null {
     this.assertNotDisposed("queueMessage");
     const didEnqueue = this.messageQueue.add(message, options, internal);
@@ -5015,15 +5065,89 @@ export class AgentSession {
     return effectiveDispatchMode;
   }
 
-  clearQueue(): void {
+  clearQueue(cancelReason = "Queued message cleared before dispatch."): void {
     this.assertNotDisposed("clearQueue");
+    const callbacks = this.messageQueue.getClearCallbacks();
     this.messageQueue.clear();
     this.emitQueuedMessageChanged();
     this.backgroundProcessManager.setMessageQueued(this.workspaceId, false);
+    this.notifyQueuedMessageCleared(callbacks, cancelReason);
   }
 
-  hasQueuedMessages(): boolean {
-    return !this.messageQueue.isEmpty();
+  private notifyQueuedMessageCleared(
+    callbacks: {
+      onCanceled?: (reason: string) => Promise<void> | void;
+      onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
+    },
+    cancelReason: string
+  ): void {
+    const notify = async () => {
+      if (callbacks.onCanceled != null) {
+        await callbacks.onCanceled(cancelReason);
+        return;
+      }
+      await callbacks.onAcceptedPreStreamFailure?.(createUnknownSendMessageError(cancelReason));
+    };
+    notify().catch((error: unknown) => {
+      log.error("Queued message clear callback failed", {
+        workspaceId: this.workspaceId,
+        error: getErrorMessage(error),
+      });
+    });
+  }
+
+  hasQueuedWorkspaceTurn(handleId: string): boolean {
+    assert(handleId.length > 0, "hasQueuedWorkspaceTurn requires handleId");
+    return this.messageQueue.hasWorkspaceTurn(handleId);
+  }
+
+  hasQueuedMessages(dispatchMode?: "tool-end" | "turn-end"): boolean {
+    return (
+      !this.messageQueue.isEmpty() &&
+      (dispatchMode == null || this.messageQueue.getQueueDispatchMode() === dispatchMode)
+    );
+  }
+
+  private requestQueuedToolEndDispatchAfterCurrentTool(): void {
+    if (
+      this.turnPhase !== TurnPhase.STREAMING ||
+      this.queuedToolEndAbortInFlight ||
+      !this.hasQueuedMessages("tool-end")
+    ) {
+      return;
+    }
+
+    this.queuedToolEndAbortInFlight = true;
+    void this.aiService
+      .stopStream(this.workspaceId, { soft: true, abortReason: "system" })
+      .then((result) => {
+        if (!result.success) {
+          this.queuedToolEndAbortInFlight = false;
+          log.warn("Failed to stop stream for queued tool-end message dispatch", {
+            workspaceId: this.workspaceId,
+            error: result.error,
+          });
+        }
+      });
+  }
+
+  private dispatchQueuedToolEndMessageAfterAbort(
+    abortReason: StreamAbortReason | undefined
+  ): boolean {
+    if (!this.queuedToolEndAbortInFlight) {
+      return false;
+    }
+
+    const shouldDispatch =
+      abortReason !== "user" && !this.deferQueuedFlushUntilAfterEdit && this.hasQueuedMessages();
+    this.queuedToolEndAbortInFlight = false;
+
+    if (!shouldDispatch) {
+      return false;
+    }
+
+    this.sendQueuedMessages();
+    return true;
   }
 
   async waitForPendingStreamErrorRecoveryDecision(): Promise<void> {
@@ -5031,7 +5155,7 @@ export class AgentSession {
   }
 
   hasPendingAutoRetry(): boolean {
-    return this.retryManager.isRetryPending;
+    return this.retryManager.isRetryPending || this.autoRetryStarting;
   }
 
   hasPendingManualFollowUp(): boolean {
@@ -5086,6 +5210,7 @@ export class AgentSession {
     }
 
     // Clear the queued message flag (even if queue is empty, to handle race conditions)
+    this.queuedToolEndAbortInFlight = false;
     this.backgroundProcessManager.setMessageQueued(this.workspaceId, false);
 
     if (!this.messageQueue.isEmpty()) {
@@ -5098,11 +5223,14 @@ export class AgentSession {
       this.setTurnPhase(TurnPhase.PREPARING);
 
       void this.sendMessage(message, options, internal)
-        .then((result) => {
+        .then(async (result) => {
           // If sendMessage fails before it can start streaming, ensure we don't
-          // leave the session stuck in PREPARING.
-          if (!result.success && this.turnPhase === TurnPhase.PREPARING) {
-            this.setTurnPhase(TurnPhase.IDLE);
+          // leave the session stuck in PREPARING and notify correlated internal callers.
+          if (!result.success) {
+            await internal?.onAcceptedPreStreamFailure?.(result.error);
+            if (this.turnPhase === TurnPhase.PREPARING) {
+              this.setTurnPhase(TurnPhase.IDLE);
+            }
           }
         })
         .catch(() => {

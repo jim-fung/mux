@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { AgentReportToolCall } from "../AgentReportToolCall";
+import { AgentSkillListToolCall } from "../AgentSkillListToolCall";
 import { AgentSkillReadFileToolCall } from "../AgentSkillReadFileToolCall";
 import { AgentSkillReadToolCall } from "../AgentSkillReadToolCall";
 import { CompleteGoalToolCall } from "../CompleteGoalToolCall";
@@ -10,18 +11,20 @@ import { GenericToolCall } from "../GenericToolCall";
 import { GoogleSearchToolCall } from "../GoogleSearchToolCall";
 import { SetGoalToolCall } from "../SetGoalToolCall";
 import { WorkflowResumeToolCall, WorkflowRunToolCall } from "../WorkflowRunToolCall";
-import { WorkflowListToolCall, WorkflowReadToolCall } from "../WorkflowDefinitionToolCall";
 import { GetGoalToolCall } from "../GetGoalToolCall";
+import { HeartbeatToolCall } from "../HeartbeatToolCall";
 import { getToolComponent } from "./getToolComponent";
 
 describe("getToolComponent", () => {
-  test("returns workflow definition tool components", () => {
-    expect(getToolComponent("workflow_list", {})).toBe(WorkflowListToolCall);
-    expect(getToolComponent("workflow_read", { name: "deep-research" })).toBe(WorkflowReadToolCall);
+  test("falls back to generic rendering for removed workflow discovery tools", () => {
+    expect(getToolComponent("workflow_list", {})).toBe(GenericToolCall);
+    expect(getToolComponent("workflow_read", { name: "deep-research" })).toBe(GenericToolCall);
   });
 
   test("returns WorkflowRunToolCall for workflow_run", () => {
-    const component = getToolComponent("workflow_run", { name: "deep-research" });
+    const component = getToolComponent("workflow_run", {
+      script_path: "skill://deep-research/workflow.js",
+    });
     expect(component).toBe(WorkflowRunToolCall);
   });
 
@@ -61,6 +64,20 @@ describe("getToolComponent", () => {
     expect(component).toBe(AgentSkillReadFileToolCall);
   });
 
+  test("returns AgentSkillListToolCall for agent_skill_list", () => {
+    expect(getToolComponent("agent_skill_list", {})).toBe(AgentSkillListToolCall);
+    expect(getToolComponent("agent_skill_list", { includeUnadvertised: true })).toBe(
+      AgentSkillListToolCall
+    );
+  });
+
+  test("agent_skill_list falls back to GenericToolCall when args don't conform", () => {
+    // includeUnadvertised is boolean.nullish(); a string fails the schema.
+    expect(getToolComponent("agent_skill_list", { includeUnadvertised: "yes" })).toBe(
+      GenericToolCall
+    );
+  });
+
   test("returns DesktopScreenshotToolCall for desktop_screenshot", () => {
     const component = getToolComponent("desktop_screenshot", { scaledWidth: 640 });
     expect(component).toBe(DesktopScreenshotToolCall);
@@ -89,6 +106,20 @@ describe("getToolComponent", () => {
   test("complete_goal falls back to GenericToolCall when summary is empty (zod min(1) fails)", () => {
     const component = getToolComponent("complete_goal", { summary: "" });
     expect(component).toBe(GenericToolCall);
+  });
+
+  test("returns HeartbeatToolCall for heartbeat", () => {
+    expect(getToolComponent("heartbeat", { action: "get" })).toBe(HeartbeatToolCall);
+    expect(getToolComponent("heartbeat", { action: "set", intervalMs: 30 * 60_000 })).toBe(
+      HeartbeatToolCall
+    );
+  });
+
+  test("heartbeat falls back to GenericToolCall when intervalMs is out of range", () => {
+    // 30s is below HEARTBEAT_MIN_INTERVAL_MS (5min); the schema's .min() rejects it.
+    expect(getToolComponent("heartbeat", { action: "set", intervalMs: 30_000 })).toBe(
+      GenericToolCall
+    );
   });
 
   test("falls back to GenericToolCall when args validation fails", () => {

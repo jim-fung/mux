@@ -1,6 +1,10 @@
 import { addEphemeralMessage } from "@/browser/stores/WorkspaceStore";
 import type { MuxMessage } from "@/common/types/message";
 import type { WorkflowRunRecord } from "@/common/types/workflow";
+import {
+  getWorkflowScriptDisplayPath,
+  workflowScriptMatchesPath,
+} from "@/browser/utils/workflowRunScriptPaths";
 import assert from "@/common/utils/assert";
 import {
   WORKFLOW_RUN_CARD_DISPLAY_METADATA_TYPE,
@@ -29,14 +33,36 @@ function getOutputRunId(output: unknown): string | null {
   return null;
 }
 
-function getWorkflowInput(input: unknown): WorkflowRunCardInput | null {
+function getWorkflowInput(
+  input: unknown
+):
+  | { scriptPath: string; scriptSource?: never; args: unknown }
+  | { scriptSource: string; scriptPath?: never; args: unknown }
+  | null {
   if (input != null && typeof input === "object") {
     const record = input as Record<string, unknown>;
-    if (typeof record.name === "string" && record.name.length > 0) {
-      return { name: record.name, args: record.args ?? {} };
+    const scriptPath = record.script_path ?? record.name;
+    if (typeof scriptPath === "string" && scriptPath.length > 0) {
+      return { scriptPath, args: record.args ?? {} };
+    }
+    if (typeof record.script_source === "string" && record.script_source.length > 0) {
+      return { scriptSource: record.script_source, args: record.args ?? {} };
     }
   }
   return null;
+}
+
+function workflowRunMatchesInput(
+  run: Pick<WorkflowRunRecord, "workflow" | "args" | "source">,
+  input: NonNullable<ReturnType<typeof getWorkflowInput>>
+): boolean {
+  if (!jsonEqual(input.args, run.args)) {
+    return false;
+  }
+  if (input.scriptSource != null) {
+    return run.workflow.sourceKind === "inline" && run.source === input.scriptSource;
+  }
+  return workflowScriptMatchesPath(run.workflow, input.scriptPath);
 }
 
 function jsonEqual(left: unknown, right: unknown): boolean {
@@ -115,7 +141,7 @@ export function findProjectedWorkflowRunCardMessage(
 
 export function hasWorkflowRunToolCallMessage(
   messages: readonly MuxMessage[],
-  run: Pick<WorkflowRunRecord, "id" | "definition" | "args">
+  run: Pick<WorkflowRunRecord, "id" | "workflow" | "args" | "source">
 ): boolean {
   assert(run.id.length > 0, "hasWorkflowRunToolCallMessage: run id is required");
   return messages.some((message) =>
@@ -126,20 +152,20 @@ export function hasWorkflowRunToolCallMessage(
       if (part.state === "output-available") {
         return getOutputRunId(part.output) === run.id;
       }
-      // The name+args heuristic deliberately stays workflow_run-only: workflow_resume
-      // inputs carry a run_id, not a workflow name/args pair.
+      // The scriptPath+args heuristic deliberately stays workflow_run-only: workflow_resume
+      // inputs carry a run_id, not a workflow script path/args pair.
       if (part.toolName !== "workflow_run") {
         return false;
       }
       const input = getWorkflowInput(part.input);
-      return input?.name === run.definition.name && jsonEqual(input.args, run.args);
+      return input != null && workflowRunMatchesInput(run, input);
     })
   );
 }
 
 export function getWorkflowRunCardProjection(
   messages: readonly MuxMessage[],
-  run: Pick<WorkflowRunRecord, "id" | "definition" | "args" | "status">
+  run: Pick<WorkflowRunRecord, "id" | "workflow" | "args" | "status" | "source">
 ): { shouldProject: boolean; existingMessage: MuxMessage | null } {
   assert(run.id.length > 0, "getWorkflowRunCardProjection: run id is required");
   const existingMessage = findProjectedWorkflowRunCardMessage(messages, run.id);
@@ -185,7 +211,7 @@ export function addWorkflowRunCardMessageForRun(
 ): void {
   addWorkflowRunCardMessage(
     workspaceId,
-    { name: run.definition.name, args: run.args },
+    { scriptPath: getWorkflowScriptDisplayPath(run.workflow), args: run.args },
     { runId: run.id, status: run.status, result: getLatestWorkflowResult(run), run },
     options
   );

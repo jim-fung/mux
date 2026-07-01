@@ -1,3 +1,4 @@
+import { z } from "zod";
 import { RUNTIME_MODE } from "@/common/types/runtime";
 import {
   buildTaskToolAgentArgsSchema,
@@ -5,7 +6,9 @@ import {
   getAvailableTools,
   supportsGoogleNativeToolsWithFunctionTools,
   TaskToolArgsSchema,
+  TaskWorkspaceLifecycleToolArgsSchema,
   TOOL_DEFINITIONS,
+  WorkflowRunToolArgsSchema,
 } from "./toolDefinitions";
 
 describe("TOOL_DEFINITIONS", () => {
@@ -146,6 +149,46 @@ describe("TOOL_DEFINITIONS", () => {
         prompt: "Summarize ${variant}",
         title: "Repository summary",
         variants: ["frontend", "backend"],
+      }).success
+    ).toBe(false);
+  });
+
+  it("validates task workspace lifecycle targets and optional nulls", () => {
+    expect(
+      TaskWorkspaceLifecycleToolArgsSchema.safeParse({
+        action: "archive",
+        targets: [{ taskId: "wst_child" }],
+        interrupt_active: null,
+        force: null,
+        acknowledged_untracked_paths: null,
+      }).success
+    ).toBe(true);
+
+    expect(
+      TaskWorkspaceLifecycleToolArgsSchema.safeParse({
+        action: "delete_worktree",
+        targets: [{ workspaceId: "child-workspace" }],
+      }).success
+    ).toBe(true);
+
+    expect(
+      TaskWorkspaceLifecycleToolArgsSchema.safeParse({
+        action: "remove",
+        targets: [{ taskId: "wst_child", workspaceId: "child-workspace" }],
+      }).success
+    ).toBe(false);
+
+    expect(
+      TaskWorkspaceLifecycleToolArgsSchema.safeParse({
+        action: "archive",
+        targets: [{}],
+      }).success
+    ).toBe(false);
+
+    expect(
+      TaskWorkspaceLifecycleToolArgsSchema.safeParse({
+        action: "destroy",
+        targets: [{ workspaceId: "child-workspace" }],
       }).success
     ).toBe(false);
   });
@@ -456,6 +499,38 @@ describe("TOOL_DEFINITIONS", () => {
     );
   });
 
+  it("accepts workspace turn queue dispatch mode", () => {
+    const parsed = TOOL_DEFINITIONS.task.schema.safeParse({
+      kind: "workspace",
+      prompt: "follow up",
+      title: "Follow-up",
+      run_in_background: true,
+      workspace: {
+        mode: "existing",
+        workspaceId: "child-workspace",
+        queueDispatchMode: "turn-end",
+      },
+    });
+
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.workspace?.queueDispatchMode).toBe("turn-end");
+    }
+
+    expect(
+      TOOL_DEFINITIONS.task.schema.safeParse({
+        kind: "workspace",
+        prompt: "follow up",
+        title: "Follow-up",
+        workspace: {
+          mode: "existing",
+          workspaceId: "child-workspace",
+          queueDispatchMode: "after-breakfast",
+        },
+      }).success
+    ).toBe(false);
+  });
+
   describe("task tool isolation parameter", () => {
     const validArgs = { agentId: "explore", prompt: "investigate", title: "Investigate" };
 
@@ -567,6 +642,96 @@ describe("TOOL_DEFINITIONS", () => {
     expect(subAgentTools).not.toContain("review_pane_get");
   });
 
+  it("requires workflow_run calls to use exactly one launch source", () => {
+    expect(
+      WorkflowRunToolArgsSchema.safeParse({
+        script_path: "skill://deep-research/workflow.js",
+        args: { topic: "workflow tools" },
+        run_in_background: false,
+      }).success
+    ).toBe(true);
+
+    expect(
+      WorkflowRunToolArgsSchema.safeParse({
+        script_source: "export default function workflow() { return { reportMarkdown: 'ok' }; }",
+        args: { topic: "workflow tools" },
+        run_in_background: false,
+      }).success
+    ).toBe(true);
+
+    const both = WorkflowRunToolArgsSchema.safeParse({
+      script_path: "skill://deep-research/workflow.js",
+      script_source: "export default function workflow() {}",
+      args: { topic: "workflow tools" },
+      run_in_background: false,
+    });
+    expect(both.success).toBe(false);
+    expect(both.error?.issues.map((issue) => issue.message)).toContain(
+      "Provide exactly one of script_path or script_source."
+    );
+
+    const neither = WorkflowRunToolArgsSchema.safeParse({
+      args: { topic: "workflow tools" },
+      run_in_background: false,
+    });
+    expect(neither.success).toBe(false);
+    expect(neither.error?.issues.map((issue) => issue.message)).toContain(
+      "Provide exactly one of script_path or script_source."
+    );
+
+    expect(
+      WorkflowRunToolArgsSchema.safeParse({
+        script_path: null,
+        script_source: "export default function workflow() {}",
+      }).success
+    ).toBe(true);
+    expect(
+      WorkflowRunToolArgsSchema.safeParse({ script_path: null, script_source: null }).success
+    ).toBe(false);
+
+    expect(WorkflowRunToolArgsSchema.safeParse({ script_source: "" }).success).toBe(false);
+    expect(
+      WorkflowRunToolArgsSchema.safeParse({
+        name: "deep-research",
+        args: { topic: "workflow tools" },
+        run_in_background: false,
+      }).success
+    ).toBe(false);
+  });
+
+  it("keeps workflow_run launch fields nullable in generated tool schemas", () => {
+    const workflowSchema = z.toJSONSchema(WorkflowRunToolArgsSchema);
+    const properties = workflowSchema.properties;
+    const schemaHasAnyOfEntry = (schema: unknown, expected: Record<string, unknown>) => {
+      if (schema == null || typeof schema !== "object") {
+        return false;
+      }
+      const anyOf = (schema as { anyOf?: unknown }).anyOf;
+      return (
+        Array.isArray(anyOf) &&
+        anyOf.some(
+          (entry) =>
+            entry != null &&
+            typeof entry === "object" &&
+            Object.entries(expected).every(
+              ([key, value]) => (entry as Record<string, unknown>)[key] === value
+            )
+        )
+      );
+    };
+
+    expect(schemaHasAnyOfEntry(properties?.script_path, { type: "string", minLength: 1 })).toBe(
+      true
+    );
+    expect(schemaHasAnyOfEntry(properties?.script_path, { type: "null" })).toBe(true);
+    expect(schemaHasAnyOfEntry(properties?.script_source, { type: "string", minLength: 1 })).toBe(
+      true
+    );
+    expect(schemaHasAnyOfEntry(properties?.script_source, { type: "null" })).toBe(true);
+    expect(workflowSchema.required).not.toContain("script_path");
+    expect(workflowSchema.required).not.toContain("script_source");
+  });
+
   it("only includes workflow tools when dynamic workflows are enabled", () => {
     const disabledTools = getAvailableTools("openai:gpt-4o", { enableDynamicWorkflows: false });
     expect(disabledTools).not.toContain("workflow_list");
@@ -575,8 +740,8 @@ describe("TOOL_DEFINITIONS", () => {
     expect(disabledTools).not.toContain("workflow_resume");
 
     const enabledTools = getAvailableTools("openai:gpt-4o", { enableDynamicWorkflows: true });
-    expect(enabledTools).toContain("workflow_list");
-    expect(enabledTools).toContain("workflow_read");
+    expect(enabledTools).not.toContain("workflow_list");
+    expect(enabledTools).not.toContain("workflow_read");
     expect(enabledTools).toContain("workflow_run");
     expect(enabledTools).toContain("workflow_resume");
   });

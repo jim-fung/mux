@@ -1,32 +1,32 @@
 import * as crypto from "node:crypto";
+import * as path from "node:path";
 
 import {
   isTerminalWorkflowRunStatus,
-  type WorkflowDefinitionDescriptor,
+  type WorkflowScriptDescriptor,
   type WorkflowRunRecord,
   type WorkflowRunStatus,
 } from "@/common/types/workflow";
+import type { BackgroundWorkAttentionPolicy } from "@/common/types/backgroundWorkAttention";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { getWorkflowCheckpointRetryEligibility } from "@/common/utils/workflowRetryEligibility";
 import { log } from "@/node/services/log";
 import type { IJSRuntimeFactory } from "@/node/services/ptc/runtime";
 import { WORKFLOW_RUN_TASK_ID_PREFIX } from "@/node/services/tools/taskId";
-import type {
-  WorkflowDefinitionStore,
-  WorkflowDefinitionReadResult,
-  WorkflowDefinitionSummary,
-  WorkflowPromotionLocation,
-} from "./WorkflowDefinitionStore";
 import type { WorkflowRunStatusSnapshot, WorkflowRunStore } from "./WorkflowRunStore";
 import {
   WorkflowRunBackgroundedError,
   WorkflowRunner,
+  type WorkflowNestedWorkflowSpec,
   type WorkflowRunnerClock,
   type WorkflowRunnerRunOptions,
   type WorkflowTaskAdapter,
 } from "./WorkflowRunner";
+import { deriveChildWorkflowRunId, MAX_NESTED_WORKFLOW_DEPTH } from "./nestedWorkflowRuns";
 import { normalizeWorkflowArgsForSource } from "./workflowArgs";
+import { parseWorkflowDescription, parseWorkflowName } from "./workflowDescription";
+import type { ResolvedWorkflowScript } from "./workflowScriptResolver";
 
 export interface WorkflowBackgroundRunTerminalEvent {
   runId: string;
@@ -42,12 +42,12 @@ export interface WorkflowRunStatusChangedEvent {
 }
 
 export interface WorkflowServiceOptions {
-  definitionStore: WorkflowDefinitionStore;
   runStore: WorkflowRunStore;
   runtimeFactory: IJSRuntimeFactory;
   taskAdapter?: WorkflowTaskAdapter;
-  /** workflowName is the human-readable definition name, used to label spawned tasks. */
+  /** workflowName is the human-readable display name, used to label spawned tasks. */
   taskAdapterFactory?: (runId: string, workflowName?: string) => WorkflowTaskAdapter;
+  resolveWorkflowScript?: (scriptPath: string) => Promise<ResolvedWorkflowScript>;
   onBackgroundRunTerminal?: (event: WorkflowBackgroundRunTerminalEvent) => Promise<void> | void;
   onRunStatusChanged?: (event: WorkflowRunStatusChangedEvent) => Promise<void> | void;
   /** When true, background terminal notifications also fire for interrupted runs. */
@@ -74,8 +74,8 @@ export interface WorkflowBackgroundRunCreatedEvent {
   run: WorkflowRunRecord;
 }
 
-export interface StartNamedWorkflowInput {
-  name: string;
+export interface StartWorkflowInput {
+  script: ResolvedWorkflowScript;
   workspaceId: string;
   projectTrusted: boolean;
   args: unknown;
@@ -86,25 +86,12 @@ export interface StartNamedWorkflowInput {
   onBackgroundRunCreated?: (event: WorkflowBackgroundRunCreatedEvent) => Promise<void> | void;
   abortSignal?: AbortSignal;
   backgroundOnMessageQueued?: boolean;
-}
-
-export interface PromoteScratchDefinitionInput {
-  workspaceId: string;
-  name: string;
-  description: string;
-  location: WorkflowPromotionLocation;
-  overwrite: boolean;
-  projectTrusted: boolean;
-}
-
-export interface PromoteScratchWorkflowInput {
-  workspaceId: string;
-  runId: string;
-  name: string;
-  description: string;
-  location: WorkflowPromotionLocation;
-  overwrite: boolean;
-  projectTrusted: boolean;
+  /**
+   * Background runs persist "notify_on_terminal" so the owner's stream-end does not force a
+   * task_await; foreground/default runs omit this (blocking). Terminal wake-up for background runs
+   * is handled by AIService.onBackgroundRunTerminal.
+   */
+  attentionPolicy?: BackgroundWorkAttentionPolicy;
 }
 
 export interface StartNamedWorkflowResult {
@@ -125,7 +112,6 @@ const activeWorkflowInterruptStatusWrites = new Map<string, Promise<void>>();
 const activeWorkflowRunnerAbortControllers = new Map<string, AbortController>();
 
 export class WorkflowService {
-  private readonly definitionStore: WorkflowDefinitionStore;
   private readonly runStore: WorkflowRunStore;
   private readonly runtimeFactory: IJSRuntimeFactory;
   private readonly taskAdapter?: WorkflowTaskAdapter;
@@ -133,6 +119,7 @@ export class WorkflowService {
     runId: string,
     workflowName?: string
   ) => WorkflowTaskAdapter;
+  private readonly resolveWorkflowScript?: (scriptPath: string) => Promise<ResolvedWorkflowScript>;
   private readonly onBackgroundRunTerminal?: (
     event: WorkflowBackgroundRunTerminalEvent
   ) => Promise<void> | void;
@@ -149,7 +136,6 @@ export class WorkflowService {
 
   constructor(options: WorkflowServiceOptions) {
     assert(options.runnerId.length > 0, "WorkflowService: runnerId is required");
-    this.definitionStore = options.definitionStore;
     this.runStore = options.runStore;
     this.runtimeFactory = options.runtimeFactory;
     assert(
@@ -158,6 +144,7 @@ export class WorkflowService {
     );
     this.taskAdapter = options.taskAdapter;
     this.taskAdapterFactory = options.taskAdapterFactory;
+    this.resolveWorkflowScript = options.resolveWorkflowScript;
     this.onBackgroundRunTerminal = options.onBackgroundRunTerminal;
     this.onRunStatusChanged = options.onRunStatusChanged;
     this.notifyInterruptedBackgroundRunTerminal =
@@ -166,27 +153,6 @@ export class WorkflowService {
     this.getCurrentProjectTrusted = options.getCurrentProjectTrusted;
     this.runnerId = options.runnerId;
     this.clock = options.clock;
-  }
-
-  async listDefinitions(options: {
-    projectTrusted: boolean;
-  }): Promise<WorkflowDefinitionDescriptor[]> {
-    return await this.definitionStore.listDefinitions(options);
-  }
-
-  async listDefinitionsWithMetadata(options: {
-    projectTrusted: boolean;
-  }): Promise<WorkflowDefinitionSummary[]> {
-    return await this.definitionStore.listDefinitionsWithMetadata(options);
-  }
-
-  async readDefinition(input: {
-    name: string;
-    projectTrusted: boolean;
-  }): Promise<WorkflowDefinitionReadResult> {
-    return await this.definitionStore.readDefinition(input.name, {
-      projectTrusted: input.projectTrusted,
-    });
   }
 
   async listRuns(input: { workspaceId: string }): Promise<WorkflowRunRecord[]> {
@@ -337,7 +303,7 @@ export class WorkflowService {
         !isTerminalWorkflowRunStatus(snapshot.status)
     );
     for (const childRun of childRuns) {
-      // Child workflow runs from older workflow definitions are still persisted separately;
+      // Child workflow runs from older workflow scripts are still persisted separately;
       // interrupting the parent must also stop their run-scoped agents before returning.
       await this.interruptRunTree(
         { workspaceId: input.workspaceId, runId: childRun.id },
@@ -355,6 +321,9 @@ export class WorkflowService {
     const run = await this.requireRunForWorkspace(input);
     assertRunCanResumeWithCurrentTrust(run, input.projectTrusted);
     assertWorkflowRunCanRetryFromCheckpoint(run);
+    // A checkpoint retry dispatched in the background is non-blocking just like background resume:
+    // persist notify_on_terminal before starting the background runner.
+    await this.runStore.setAttentionPolicy(input.runId, "notify_on_terminal");
     await this.runInBackground(input.runId, "Background workflow checkpoint retry failed:", {
       allowRetryFromFailedCheckpoint: true,
       projectTrusted: input.projectTrusted,
@@ -371,6 +340,9 @@ export class WorkflowService {
     const run = await this.requireRunForWorkspace(input);
     assertRunCanResumeWithCurrentTrust(run, input.projectTrusted);
     assertWorkflowRunCanTransition(run.status, "running");
+    // A run resumed in the background becomes non-blocking; persist so future stream-ends do not
+    // re-force a task_await even if the run was originally started in the foreground.
+    await this.runStore.setAttentionPolicy(input.runId, "notify_on_terminal");
     await this.runInBackground(input.runId, "Background workflow resume failed:", {
       allowResumeFromInterrupted: run.status === "interrupted",
       projectTrusted: input.projectTrusted,
@@ -473,6 +445,7 @@ export class WorkflowService {
         // silently reverted back to `running`. Likewise skip the continuation entirely
         // when this call was aborted (interruptRunOnAbort aborts our runner controller and
         // is concurrently transitioning the run to `interrupted`).
+        await this.runStore.setAttentionPolicy(runId, "notify_on_terminal");
         await this.notifyRunStatusChanged(input.run, "backgrounded");
         if (!runnerAbortController.signal.aborted) {
           void this.runInBackground(runId, input.backgroundedFailureMessage, {
@@ -494,56 +467,11 @@ export class WorkflowService {
     }
   }
 
-  async promoteScratchDefinition(
-    input: PromoteScratchDefinitionInput
-  ): Promise<WorkflowDefinitionDescriptor> {
-    assert(
-      input.workspaceId.length > 0,
-      "WorkflowService.promoteScratchDefinition: workspaceId is required"
-    );
-    if (!input.projectTrusted) {
-      throw new Error("Project trust is required to promote scratch workflow definitions");
-    }
-    const definition = await this.definitionStore.readDefinition(input.name, {
-      projectTrusted: input.projectTrusted,
+  async startWorkflowInBackground(input: StartWorkflowInput): Promise<StartNamedWorkflowResult> {
+    const createdRun = await this.createWorkflowRun({
+      ...input,
+      attentionPolicy: "notify_on_terminal",
     });
-    if (definition.descriptor.scope !== "scratch") {
-      throw new Error("Only scratch workflow definitions can be promoted");
-    }
-    return await this.definitionStore.promoteDefinition({
-      name: input.name,
-      description: input.description,
-      source: definition.source,
-      location: input.location,
-      overwrite: input.overwrite,
-      projectTrusted: input.projectTrusted,
-    });
-  }
-
-  async promoteScratchWorkflow(
-    input: PromoteScratchWorkflowInput
-  ): Promise<WorkflowDefinitionDescriptor> {
-    const run = await this.requireRunForWorkspace(input);
-    if (run.definition.scope !== "scratch") {
-      throw new Error("Only scratch workflow runs can be promoted");
-    }
-    if (!input.projectTrusted) {
-      throw new Error("Project trust is required to promote scratch workflow runs");
-    }
-    return await this.definitionStore.promoteDefinition({
-      name: input.name,
-      description: input.description,
-      source: run.definitionSource,
-      location: input.location,
-      overwrite: input.overwrite,
-      projectTrusted: input.projectTrusted,
-    });
-  }
-
-  async startNamedWorkflowInBackground(
-    input: StartNamedWorkflowInput
-  ): Promise<StartNamedWorkflowResult> {
-    const createdRun = await this.createNamedWorkflowRun(input);
     const runId = createdRun.id;
     await this.notifyRunStatusChanged(createdRun);
     await input.onRunCreated?.({ runId, status: "pending", result: null, run: createdRun });
@@ -560,8 +488,8 @@ export class WorkflowService {
     return { runId, status: "running", result: null };
   }
 
-  async startNamedWorkflow(input: StartNamedWorkflowInput): Promise<StartNamedWorkflowResult> {
-    const createdRun = await this.createNamedWorkflowRun(input);
+  async startWorkflow(input: StartWorkflowInput): Promise<StartNamedWorkflowResult> {
+    const createdRun = await this.createWorkflowRun(input);
     const runId = createdRun.id;
     await this.notifyRunStatusChanged(createdRun);
     await input.onRunCreated?.({ runId, status: "pending", result: null, run: createdRun });
@@ -596,10 +524,13 @@ export class WorkflowService {
       return { runId, status: "completed", result };
     } catch (error) {
       if (error instanceof WorkflowRunBackgroundedError) {
+        await this.runStore.setAttentionPolicy(runId, "notify_on_terminal");
         await this.notifyRunStatusChanged(createdRun, "backgrounded");
-        void this.runInBackground(runId, "Backgrounded workflow run failed:", {
-          projectTrusted: input.projectTrusted,
-        }).catch(() => undefined);
+        if (!runnerAbortController.signal.aborted) {
+          void this.runInBackground(runId, "Backgrounded workflow run failed:", {
+            projectTrusted: input.projectTrusted,
+          }).catch(() => undefined);
+        }
         return { runId, status: "backgrounded", result: null };
       }
       await this.notifyLatestRunStatus(runId);
@@ -749,29 +680,24 @@ export class WorkflowService {
     };
   }
 
-  private async createNamedWorkflowRun(input: StartNamedWorkflowInput): Promise<WorkflowRunRecord> {
+  private async createWorkflowRun(input: StartWorkflowInput): Promise<WorkflowRunRecord> {
     assert(
       input.workspaceId.length > 0,
-      "WorkflowService.createNamedWorkflowRun: workspaceId is required"
+      "WorkflowService.createWorkflowRun: workspaceId is required"
     );
-    const definition = await this.definitionStore.readDefinition(input.name, {
-      projectTrusted: input.projectTrusted,
-    });
     const runId = this.generateRunId();
-    assert(
-      runId.length > 0,
-      "WorkflowService.createNamedWorkflowRun: generated run id is required"
-    );
+    assert(runId.length > 0, "WorkflowService.createWorkflowRun: generated run id is required");
 
-    const normalized = normalizeWorkflowArgsForSource(definition.source, input.args, {
+    const normalized = normalizeWorkflowArgsForSource(input.script.source, input.args, {
       defaultArgs: input.defaultArgs,
     });
     return await this.runStore.createRun({
       id: runId,
       workspaceId: input.workspaceId,
-      definition: definition.descriptor,
-      definitionSource: definition.source,
+      workflow: buildWorkflowScriptDescriptor(input.script),
+      source: input.script.source,
       args: normalized.args,
+      ...(input.attentionPolicy != null ? { attentionPolicy: input.attentionPolicy } : {}),
       now: this.clock?.nowIso() ?? new Date().toISOString(),
     });
   }
@@ -891,17 +817,74 @@ export class WorkflowService {
     }
   }
 
+  private async createNestedWorkflowRun(input: {
+    parentRunId: string;
+    stepId: string;
+    inputHash: string;
+    spec: WorkflowNestedWorkflowSpec;
+  }): Promise<WorkflowRunRecord> {
+    assert(
+      input.parentRunId.length > 0,
+      "WorkflowService.createNestedWorkflowRun: parentRunId required"
+    );
+    const childRunId = deriveChildWorkflowRunId({
+      parentRunId: input.parentRunId,
+      stepId: input.stepId,
+      inputHash: input.inputHash,
+    });
+    try {
+      return await this.runStore.getRun(childRunId);
+    } catch {
+      // No existing child run for this replay identity; resolve and snapshot below.
+    }
+
+    const resolveScript = this.resolveWorkflowScript;
+    assert(resolveScript != null, "Nested workflows are not supported by this workflow service");
+    const parentRun = await this.runStore.getRun(input.parentRunId);
+    const childDepth = (parentRun.parentWorkflow?.depth ?? -1) + 1;
+    assert(
+      childDepth < MAX_NESTED_WORKFLOW_DEPTH,
+      `Nested workflow depth limit exceeded (${MAX_NESTED_WORKFLOW_DEPTH})`
+    );
+    const script = await resolveScript(input.spec.scriptPath);
+    const normalized = normalizeWorkflowArgsForSource(script.source, input.spec.args);
+    return await this.runStore.createRunIfAbsent({
+      id: childRunId,
+      workspaceId: parentRun.workspaceId,
+      workflow: buildWorkflowScriptDescriptor(script),
+      source: script.source,
+      args: normalized.args,
+      parentWorkflow: {
+        runId: input.parentRunId,
+        stepId: input.stepId,
+        inputHash: input.inputHash,
+        depth: childDepth,
+      },
+      now: this.clock?.nowIso() ?? new Date().toISOString(),
+    });
+  }
+
   private async createRunner(runId: string): Promise<WorkflowRunner> {
     // The run record always exists by the time a runner is created (create/resume/retry
-    // paths persist it first), so resolve the definition name for task labeling here.
+    // paths persist it first), so resolve the display name for task labeling here.
     const workflowName =
       this.taskAdapterFactory != null
-        ? (await this.runStore.getRun(runId)).definition.name
+        ? (await this.runStore.getRun(runId)).workflow.name
         : undefined;
     return new WorkflowRunner({
       runStore: this.runStore,
       runtimeFactory: this.runtimeFactory,
       taskAdapter: this.taskAdapterFactory?.(runId, workflowName) ?? this.requireTaskAdapter(),
+      nestedWorkflowAdapter: {
+        createRun: async (input) => {
+          const run = await this.createNestedWorkflowRun(input);
+          return { runId: run.id, name: run.workflow.name };
+        },
+        run: async (childRunId, options) => {
+          const childRunner = await this.createRunner(childRunId);
+          return await childRunner.run(childRunId, options);
+        },
+      },
       runnerId: generateWorkflowRunnerOwnerId(this.runnerId, runId),
       ...(this.clock != null ? { clock: this.clock } : {}),
     });
@@ -926,6 +909,41 @@ export class WorkflowService {
   }
 }
 
+export function buildWorkflowScriptDescriptor(
+  script: ResolvedWorkflowScript
+): WorkflowScriptDescriptor {
+  return {
+    name: getWorkflowScriptDefinitionName(script),
+    description:
+      parseWorkflowDescription(script.source) ?? `Workflow script ${script.canonicalScriptPath}`,
+    scope: script.sourceKind === "skill" ? (script.scope ?? "global") : "project",
+    sourcePath: script.canonicalScriptPath,
+    requestedScriptPath: script.requestedScriptPath,
+    canonicalScriptPath: script.canonicalScriptPath,
+    sourceKind: script.sourceKind,
+    sourceHash: script.sourceHash,
+    executable: true,
+  };
+}
+
+function getWorkflowScriptDefinitionName(
+  script: ResolvedWorkflowScript
+): WorkflowScriptDescriptor["name"] {
+  const displayName = parseWorkflowName(script.source);
+  const fallbackSource =
+    script.sourceKind === "inline"
+      ? `inline-${script.sourceHash.slice(0, 12)}`
+      : (script.relativePath ?? script.resolvedPath ?? script.canonicalScriptPath);
+  const basename = displayName ?? path.basename(fallbackSource, ".js");
+  const normalized = basename
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/gu, "-")
+    .replace(/^-+|-+$/gu, "")
+    .slice(0, 64)
+    .replace(/-+$/u, "");
+  return normalized.length > 0 ? normalized : "workflow";
+}
+
 function isWorkflowRunAlreadyActiveError(error: unknown, runId: string): boolean {
   return error instanceof Error && error.message === `Workflow run is already active: ${runId}`;
 }
@@ -944,14 +962,12 @@ function isAbortSignalAborted(abortSignal?: AbortSignal): boolean {
 }
 
 function canResumeRunWithCurrentTrust(run: WorkflowRunRecord, projectTrusted: boolean): boolean {
-  return (
-    (run.definition.scope !== "project" && run.definition.scope !== "scratch") || projectTrusted
-  );
+  return run.workflow.scope !== "project" || projectTrusted;
 }
 
 function assertRunCanResumeWithCurrentTrust(run: WorkflowRunRecord, projectTrusted: boolean): void {
   if (!canResumeRunWithCurrentTrust(run, projectTrusted)) {
-    throw new Error("Project trust is required to resume project-local or scratch workflow runs");
+    throw new Error("Project trust is required to resume project-local workflow runs");
   }
 }
 

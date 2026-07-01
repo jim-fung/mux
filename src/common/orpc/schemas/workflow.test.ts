@@ -2,7 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { EXPERIMENTS, EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { WorkflowTaskMetadataSchema } from "./workspace";
 import {
-  WorkflowDefinitionDescriptorSchema,
+  StructuredTaskOutputSchema,
+  WorkflowScriptDescriptorSchema,
   WorkflowEventSequenceSchema,
   WorkflowNameSchema,
   WorkflowRunIdSchema,
@@ -15,14 +16,14 @@ describe("workflow domain schemas", () => {
     const run = WorkflowRunRecordSchema.parse({
       id: "wfr_123",
       workspaceId: "workspace-1",
-      definition: {
+      workflow: {
         name: "deep-research",
         description: "Research a topic",
         scope: "built-in",
         executable: true,
       },
-      definitionSource: "export default async function workflow() { return null; }",
-      definitionHash: "sha256:abc123",
+      source: "export default async function workflow() { return null; }",
+      sourceHash: "sha256:abc123",
       args: { topic: "workflow replay" },
       status: "running",
       createdAt: "2026-05-29T00:00:00.000Z",
@@ -53,8 +54,46 @@ describe("workflow domain schemas", () => {
       steps: [],
     });
 
-    expect(run.definition.name).toBe("deep-research");
+    expect(run.workflow.name).toBe("deep-research");
     expect(run.events.map((event) => event.sequence)).toEqual([1, 2, 3]);
+  });
+
+  test("workflow run records default to no attentionPolicy and accept notify_on_terminal", () => {
+    const baseRun = {
+      id: "wfr_123",
+      workspaceId: "workspace-1",
+      workflow: { name: "deep-research", description: "x", scope: "built-in", executable: true },
+      source: "export default async function workflow() { return null; }",
+      sourceHash: "sha256:abc123",
+      args: {},
+      status: "running",
+      createdAt: "2026-05-29T00:00:00.000Z",
+      updatedAt: "2026-05-29T00:00:01.000Z",
+      events: [],
+      steps: [],
+    };
+    // Legacy record without the field still parses.
+    expect(WorkflowRunRecordSchema.parse(baseRun).attentionPolicy).toBeUndefined();
+    // Background runs persist notify_on_terminal.
+    expect(
+      WorkflowRunRecordSchema.parse({ ...baseRun, attentionPolicy: "notify_on_terminal" })
+        .attentionPolicy
+    ).toBe("notify_on_terminal");
+    // Invalid policy values are rejected.
+    expect(
+      WorkflowRunRecordSchema.safeParse({ ...baseRun, attentionPolicy: "bogus" }).success
+    ).toBe(false);
+  });
+
+  test("accepts plan file path metadata on structured task output", () => {
+    const parsed = StructuredTaskOutputSchema.parse({
+      taskId: "task-plan",
+      title: "Proposed plan",
+      reportMarkdown: "Plan content",
+      planFilePath: "/tmp/mux/plans/repo/task-plan.md",
+    });
+
+    expect(parsed.planFilePath).toBe("/tmp/mux/plans/repo/task-plan.md");
   });
 
   test("rejects workflow run ids that could escape the run directory", () => {
@@ -68,12 +107,28 @@ describe("workflow domain schemas", () => {
     expect(WorkflowNameSchema.safeParse("bad--name").success).toBe(false);
     expect(WorkflowNameSchema.safeParse("DeepResearch").success).toBe(false);
 
-    const result = WorkflowDefinitionDescriptorSchema.safeParse({
+    const result = WorkflowScriptDescriptorSchema.safeParse({
       name: "local-workflow",
       description: "Project local workflow",
       scope: "project",
       executable: false,
       blockedReason: "Project is not trusted",
+    });
+
+    expect(result.success).toBe(true);
+  });
+
+  test("accepts inline workflow script descriptors as project-scoped provenance", () => {
+    const result = WorkflowScriptDescriptorSchema.safeParse({
+      name: "inline-abcdef123456",
+      description: "Inline smoke test",
+      scope: "project",
+      sourcePath: "inline://workflow-abcdef123456.js",
+      requestedScriptPath: "inline://workflow-abcdef123456.js",
+      canonicalScriptPath: "inline://workflow-abcdef123456.js",
+      sourceKind: "inline",
+      sourceHash: "abcdef1234567890",
+      executable: true,
     });
 
     expect(result.success).toBe(true);

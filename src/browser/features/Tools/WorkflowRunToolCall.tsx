@@ -1,6 +1,7 @@
 import React, { useContext, useEffect, useRef, useState, useSyncExternalStore } from "react";
 
 import { APIContext, type APIClient } from "@/browser/contexts/API";
+import { useExperimentValue } from "@/browser/contexts/ExperimentsContext";
 import {
   Dialog,
   DialogContent,
@@ -13,11 +14,17 @@ import {
   useOptionalCommandRegistry,
   type CommandAction,
 } from "@/browser/contexts/CommandRegistryContext";
-import type {
-  WorkflowDefinitionDescriptor,
-  WorkflowRunEvent,
-  WorkflowRunRecord,
-  WorkflowStepRecord,
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { STRUCTURED_WORKFLOW_REPORT_PLACEHOLDER_MARKDOWN } from "@/common/constants/workflowReports";
+import { WorkflowTimeline } from "@/browser/features/RightSidebar/Workflows/WorkflowTimeline";
+import { projectWorkflowRun } from "@/browser/features/RightSidebar/Workflows/projectWorkflowRun";
+import { useWorkflowRunById } from "@/browser/hooks/useWorkflowRunById";
+import {
+  isActiveWorkflowChildEventStatus,
+  isActiveWorkflowRunStatus,
+  type WorkflowRunEvent,
+  type WorkflowRunRecord,
+  type WorkflowStepRecord,
 } from "@/common/types/workflow";
 import type {
   WorkflowResumeToolArgs,
@@ -47,23 +54,26 @@ import {
 } from "./Shared/toolUtils";
 import { HighlightedCode } from "./Shared/HighlightedCode";
 import {
-  WorkflowDefinitionCard,
+  WorkflowScriptCard,
   WorkflowJsonBlock,
   WorkflowKindBadge,
   WorkflowSection,
   WORKFLOW_ACTION_BUTTON_CLASS,
-  formatWorkflowSavedMessage,
-  type WorkflowPromotionTarget,
-} from "./WorkflowDefinitionToolCall";
+} from "./WorkflowToolShared";
 import {
   useWorkflowToolLiveRun,
   useWorkspaceStoreRaw,
   type WorkflowToolLiveRunState,
 } from "@/browser/stores/WorkspaceStore";
+import { workflowScriptMatchesPath } from "@/browser/utils/workflowRunScriptPaths";
 import { MarkdownRenderer } from "../Messages/MarkdownRenderer";
 
+type WorkflowRunToolDisplayArgs =
+  | WorkflowRunToolArgs
+  | (Omit<WorkflowRunToolArgs, "script_path"> & { script_path?: string; name: string });
+
 interface WorkflowRunToolCallProps {
-  args: WorkflowRunToolArgs;
+  args: WorkflowRunToolDisplayArgs;
   result?: WorkflowRunToolResult;
   status?: ToolStatus;
   workspaceId?: string;
@@ -189,10 +199,30 @@ function isWorkflowRunSuccessResult(
   return value != null && !isToolErrorResult(value);
 }
 
+// Schema-shaped workflow agent reports carry structuredOutput only; their placeholder
+// markdown exists for backend compatibility and should not create noisy Report buttons.
+function hasDisplayableReportMarkdown(
+  reportMarkdown: string,
+  result: { structuredOutput?: unknown } | null | undefined
+): boolean {
+  const trimmedReportMarkdown = reportMarkdown.trim();
+  if (trimmedReportMarkdown.length === 0) {
+    return false;
+  }
+  return !(
+    trimmedReportMarkdown === STRUCTURED_WORKFLOW_REPORT_PLACEHOLDER_MARKDOWN &&
+    result?.structuredOutput !== undefined
+  );
+}
+
 function getReportMarkdown(value: unknown): string | null {
   if (value != null && typeof value === "object") {
-    const reportMarkdown = (value as Record<string, unknown>).reportMarkdown;
-    if (typeof reportMarkdown === "string" && reportMarkdown.trim().length > 0) {
+    const result = value as Record<string, unknown>;
+    const reportMarkdown = result.reportMarkdown;
+    if (
+      typeof reportMarkdown === "string" &&
+      hasDisplayableReportMarkdown(reportMarkdown, result)
+    ) {
       return reportMarkdown;
     }
   }
@@ -217,8 +247,21 @@ type WorkflowDisplayRow =
   | { kind: "patch"; firstEvent: WorkflowPatchEvent; latestEvent: WorkflowPatchEvent };
 
 type WorkflowTaskRow = Extract<WorkflowDisplayRow, { kind: "task" }>;
-type WorkflowChildRow = Extract<WorkflowDisplayRow, { kind: "workflow" }>;
+type WorkflowChildDisplayRow = Extract<WorkflowDisplayRow, { kind: "workflow" }>;
 type WorkflowPatchRow = Extract<WorkflowDisplayRow, { kind: "patch" }>;
+
+const MAX_TOOL_INLINE_NESTED_WORKFLOW_DEPTH = 3;
+
+function getWorkflowChildProgressSummary(run: WorkflowRunRecord | null): string | null {
+  if (run == null) {
+    return null;
+  }
+  const view = projectWorkflowRun(run);
+  const activePhase = view.phases.find((phase) => phase.running) ?? view.phases.at(-1);
+  const phaseLabel =
+    activePhase != null && activePhase.label.length > 0 ? ` · ${activePhase.label}` : "";
+  return `${view.status} · ${view.stats.done}/${view.stats.total} steps${phaseLabel}`;
+}
 
 function getTaskEventKey(event: WorkflowTaskEvent): string {
   return `task:${event.stepId}:${event.taskId}`;
@@ -234,7 +277,7 @@ function getPatchEventKey(event: WorkflowPatchEvent): string {
 function getWorkflowDisplayRows(events: readonly WorkflowRunEvent[]): WorkflowDisplayRow[] {
   const rows: WorkflowDisplayRow[] = [];
   const taskRows = new Map<string, WorkflowTaskRow>();
-  const workflowRows = new Map<string, WorkflowChildRow>();
+  const workflowRows = new Map<string, WorkflowChildDisplayRow>();
   const patchRows = new Map<string, WorkflowPatchRow>();
 
   for (const event of events) {
@@ -267,7 +310,7 @@ function getWorkflowDisplayRows(events: readonly WorkflowRunEvent[]): WorkflowDi
         continue;
       }
 
-      const row: WorkflowChildRow = {
+      const row: WorkflowChildDisplayRow = {
         kind: "workflow",
         firstEvent: event,
         latestEvent: event,
@@ -329,6 +372,18 @@ function getWorkflowEventLabel(event: WorkflowRunEvent): string {
       // Prefer the human-readable sub-agent title (matches the spawned
       // workspace title); fall back to stepId for legacy events without one.
       return `${event.title ?? event.stepId} / ${event.taskId} / ${event.status}`;
+    case "timeout":
+      switch (event.phase) {
+        case "soft":
+          return `${event.stepId} / ${event.taskId} / Soft timeout reached; requesting final report`;
+        case "finalization_prompt_sent":
+          return `${event.stepId} / ${event.taskId} / Final report requested`;
+        case "recovered":
+          return `${event.stepId} / ${event.taskId} / Recovered during grace period`;
+        case "hard":
+          return `${event.stepId} / ${event.taskId} / Hard timeout; child terminated`;
+      }
+      return `${event.stepId} / ${event.taskId} / timeout`;
     case "workflow":
       return `${event.stepId} / ${event.name} / ${event.runId} / ${event.status}`;
     case "patch":
@@ -361,6 +416,8 @@ function getWorkflowEventDetail(event: WorkflowRunEvent): unknown {
     case "workflow":
       return event.details;
     case "patch":
+      return event.details;
+    case "timeout":
       return event.details;
     case "action":
       return event.details;
@@ -395,6 +452,9 @@ function getEventTone(event: WorkflowRunEvent): "normal" | "success" | "warning"
       return "success";
     }
     return event.status === "failed" ? "warning" : "normal";
+  }
+  if (event.type === "timeout") {
+    return event.phase === "recovered" ? "success" : "warning";
   }
   if (event.type === "workflow") {
     return event.status === "completed"
@@ -466,8 +526,9 @@ function getTaskReportMarkdown(
   steps: readonly WorkflowStepRecord[]
 ): string | null {
   const step = findTaskStepForEvent(event, steps);
-  const reportMarkdown = step?.result?.reportMarkdown;
-  return typeof reportMarkdown === "string" && reportMarkdown.trim().length > 0
+  const result = step?.result;
+  const reportMarkdown = result?.reportMarkdown;
+  return typeof reportMarkdown === "string" && hasDisplayableReportMarkdown(reportMarkdown, result)
     ? reportMarkdown
     : null;
 }
@@ -495,7 +556,7 @@ function WorkflowEventTooltip(props: {
   );
 }
 
-function getWorkflowMergedRowDetail(row: WorkflowChildRow | WorkflowPatchRow): unknown {
+function getWorkflowMergedRowDetail(row: WorkflowChildDisplayRow | WorkflowPatchRow): unknown {
   const firstDetail = getWorkflowEventDetail(row.firstEvent);
   const latestDetail = getWorkflowEventDetail(row.latestEvent);
   if (row.firstEvent === row.latestEvent || row.latestEvent.status === "started") {
@@ -574,6 +635,131 @@ function WorkflowEventRow(props: {
         ) : (
           <WorkflowJsonBlock value={detail} className="mx-2 mb-2 max-h-[140px]" />
         )}
+      </details>
+    </li>
+  );
+}
+
+function WorkflowChildEventDetailBlock(props: { detail: unknown }) {
+  if (props.detail === undefined) {
+    return null;
+  }
+  return (
+    <div className="mt-2 space-y-1">
+      <div className="text-muted text-[10px] tracking-wide uppercase">Workflow event details</div>
+      <WorkflowJsonBlock value={props.detail} className="max-h-[180px]" />
+    </div>
+  );
+}
+
+function WorkflowChildRunRow(props: {
+  row: WorkflowChildDisplayRow;
+  displayIndex: number;
+  workspaceId?: string;
+  depth: number;
+  parentRunActive: boolean;
+}) {
+  const event = props.row.latestEvent;
+  const [open, setOpen] = useState(
+    () =>
+      props.depth < MAX_TOOL_INLINE_NESTED_WORKFLOW_DEPTH &&
+      isActiveWorkflowChildEventStatus(event.status)
+  );
+  const withinDepthLimit = props.depth < MAX_TOOL_INLINE_NESTED_WORKFLOW_DEPTH;
+  const fallbackActive = isActiveWorkflowChildEventStatus(event.status);
+  const shouldPollChildRun = open || fallbackActive || props.parentRunActive;
+  // Fetch collapsed terminal-looking rows while the parent run is active: checkpoint retries reuse
+  // the child run id and may not emit another parent started event. Once the parent is terminal,
+  // collapsed terminal rows stop polling unless the user expands them.
+  const childRunState = useWorkflowRunById({
+    workspaceId: props.workspaceId,
+    runId: event.runId,
+    enabled: props.workspaceId != null && withinDepthLimit && shouldPollChildRun,
+    pollAfterTerminal: shouldPollChildRun,
+    pollWhileActive: true,
+  });
+  const childRun = childRunState.run;
+  const childView = childRun != null ? projectWorkflowRun(childRun) : null;
+  const childStatus = childRun?.status ?? event.status;
+  const childActive =
+    childRun != null ? isActiveWorkflowRunStatus(childRun.status) : fallbackActive;
+  const progressSummary = getWorkflowChildProgressSummary(childRun);
+  const fallbackDetail = getWorkflowMergedRowDetail(props.row);
+  const label = `${event.stepId} / ${event.name} / ${event.runId} / ${childStatus}`;
+
+  return (
+    <li className="hover:bg-background/50">
+      <details
+        className="group"
+        open={open}
+        onToggle={(toggleEvent) => setOpen(toggleEvent.currentTarget.open)}
+      >
+        <summary className="cursor-pointer list-none [&::-webkit-details-marker]:hidden">
+          <div className="border-plan-mode/70 bg-plan-mode-alpha grid grid-cols-[3rem_4.75rem_minmax(0,1fr)] items-center gap-2 border-l-2 px-2 py-1 text-[10px]">
+            <TooltipIfPresent
+              tooltip={
+                <WorkflowEventTooltip
+                  event={props.row.firstEvent}
+                  displayIndex={props.displayIndex}
+                  label={label}
+                />
+              }
+              side="top"
+              align="start"
+            >
+              <span
+                className="text-muted counter-nums-mono w-fit cursor-help"
+                aria-label={`Raw event #${props.row.firstEvent.sequence}`}
+              >
+                #{props.displayIndex}
+              </span>
+            </TooltipIfPresent>
+            <span className={`w-fit font-mono uppercase ${getEventTypeClass(event)}`}>
+              workflow
+            </span>
+            <span className="text-foreground flex min-w-0 items-center gap-1.5 truncate">
+              {childActive && <span className="bg-plan-mode h-1.5 w-1.5 shrink-0 rounded-full" />}
+              <span className="min-w-0 truncate">{label}</span>
+            </span>
+          </div>
+        </summary>
+        <div className="border-border bg-background/40 mx-2 mb-2 rounded border p-2">
+          <div className="flex min-w-0 flex-wrap items-center gap-2 text-[10px]">
+            <span className="text-plan-mode font-medium">Nested workflow</span>
+            <span className="text-foreground font-medium">{event.name}</span>
+            <span className="text-muted counter-nums-mono min-w-0 truncate">{event.runId}</span>
+          </div>
+          {progressSummary != null && (
+            <div className="text-muted mt-1 text-[11px]">{progressSummary}</div>
+          )}
+          {!withinDepthLimit ? (
+            <div className="text-muted mt-2 text-[11px]">
+              Nested workflow depth limit reached; showing summary only.
+            </div>
+          ) : childRunState.error != null ? (
+            <>
+              <ErrorBox className="mt-2">{childRunState.error}</ErrorBox>
+              <WorkflowChildEventDetailBlock detail={fallbackDetail} />
+            </>
+          ) : childRunState.loading && childRun == null ? (
+            <div className="text-muted mt-2 text-[11px]">Loading nested workflow…</div>
+          ) : childRun != null && childView != null ? (
+            <div className="border-border/70 mt-2 border-l pl-3">
+              <WorkflowTimeline
+                view={childView}
+                workspaceId={childRun.workspaceId}
+                nestedDepth={props.depth + 1}
+              />
+            </div>
+          ) : (
+            <>
+              <div className="text-muted mt-2 text-[11px]">
+                Nested workflow run is not available.
+              </div>
+              <WorkflowChildEventDetailBlock detail={fallbackDetail} />
+            </>
+          )}
+        </div>
       </details>
     </li>
   );
@@ -793,8 +979,6 @@ function WorkflowTaskRow(props: {
   );
 }
 
-const AUTO_COLLAPSE_WORKFLOW_STATUSES = new Set(["completed"]);
-
 const REFRESHING_WORKFLOW_STATUSES = new Set(["pending", "running", "backgrounded"]);
 
 const FOREGROUND_WORKFLOW_DISCOVERY_SKEW_MS = 1_000;
@@ -862,18 +1046,48 @@ function getNewestWorkflowRunSnapshot(
   return compareWorkflowRunSnapshots(current, next) > 0 ? current : next;
 }
 
+function getWorkflowRunSource(run: WorkflowRunRecord | null | undefined): string | null {
+  const source = (run as { source?: unknown } | null | undefined)?.source;
+  return typeof source === "string" && source.length > 0 ? source : null;
+}
+
+function getWorkflowRunScriptPath(args: WorkflowRunToolDisplayArgs): string {
+  return args.script_path ?? ("name" in args ? args.name : "");
+}
+
+function getWorkflowRunDisplayName(args: WorkflowRunToolDisplayArgs): string {
+  const scriptPath = getWorkflowRunScriptPath(args);
+  if (scriptPath.length > 0) {
+    return scriptPath;
+  }
+  return args.script_source != null ? "inline workflow" : "";
+}
+
+function workflowRunMatchesLaunchArgs(
+  run: WorkflowRunRecord,
+  args: WorkflowRunToolDisplayArgs
+): boolean {
+  const invocationArgs = args.args ?? {};
+  if (!workflowArgsEqual(run.args ?? {}, invocationArgs)) {
+    return false;
+  }
+  if (args.script_source != null) {
+    return run.workflow.sourceKind === "inline" && getWorkflowRunSource(run) === args.script_source;
+  }
+  const scriptPath = getWorkflowRunScriptPath(args);
+  assert(scriptPath.length > 0, "workflowRunMatchesLaunchArgs requires a script path");
+  return workflowScriptMatchesPath(run.workflow, scriptPath);
+}
+
 function findForegroundWorkflowRun(input: {
   runs: readonly WorkflowRunRecord[];
-  args: WorkflowRunToolArgs;
+  args: WorkflowRunToolDisplayArgs;
   startedAt?: number;
 }): WorkflowRunRecord | null {
-  assert(input.args.name.length > 0, "findForegroundWorkflowRun requires a workflow name");
-  const invocationArgs = input.args.args ?? {};
   const candidates = input.runs.filter(
     (run) =>
-      run.definition.name === input.args.name &&
+      workflowRunMatchesLaunchArgs(run, input.args) &&
       DISCOVERABLE_FOREGROUND_WORKFLOW_STATUSES.has(run.status) &&
-      workflowArgsEqual(run.args ?? {}, invocationArgs) &&
       isFreshEnoughForToolCall(run, input.startedAt)
   );
   if (candidates.length !== 1) {
@@ -908,6 +1122,10 @@ function selectWorkflowRunSnapshot(input: {
 
 function getLatestResultEvent(run: WorkflowRunRecord | null | undefined): unknown {
   return run?.events.findLast((event) => event.type === "result")?.result;
+}
+
+function isWorkflowDisplayStatusActive(status: string): boolean {
+  return status === "pending" || status === "running" || status === "backgrounded";
 }
 
 function shouldRefreshWorkflow(status: string): boolean {
@@ -979,6 +1197,7 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
     successResult?.run == null && successResult?.status != null && !hasRefreshedRunSnapshot
       ? successResult.status
       : (run?.status ?? successResult?.status ?? status);
+  const parentRunActive = isWorkflowDisplayStatusActive(displayStatus);
   const displayEventSequence = getLatestWorkflowEventSequence(run);
   const resultValue = successResult?.result ?? getLatestResultEvent(run);
   const reportMarkdown = getReportMarkdown(resultValue);
@@ -988,31 +1207,34 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
   const displayRows = getWorkflowDisplayRows(events);
   const headerStatus = toToolStatus(displayStatus);
   const workspaceStore = useWorkspaceStoreRaw();
+  // The Workflows right-sidebar tab (gated on the dynamic-workflows experiment) is the primary
+  // surface for run detail, so when it's available the in-chat card is redundant.
+  const workflowsTabEnabled = useExperimentValue(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS);
   const {
     expanded,
     setLocalExpanded,
     toggleExpanded,
     markInteracted: markExpansionInteracted,
   } = useAutoCollapsingToolExpansion(true, {
-    // Completed workflow runs can contain large reports and event logs. Collapse them for
-    // scanability without persisting that automatic presentation choice as user intent.
-    autoCollapsed: AUTO_COLLAPSE_WORKFLOW_STATUSES.has(displayStatus),
+    // With the Workflows tab available (dynamic-workflows experiment on), auto-collapse the
+    // in-chat card for ANY status — the tab is the primary detail surface. Without the tab,
+    // preserve the prior behavior of auto-collapsing only completed runs (which can carry large
+    // reports/event logs). But never auto-collapse a tool-error card: pre-run failures (invalid
+    // args / unresolved script path) create no durable run, so the Workflows tab has nothing to
+    // show and the failure reason lives only here. Manual expansion always wins, per run.
+    autoCollapsed: (workflowsTabEnabled || displayStatus === "completed") && errorResult == null,
     resetKey: runId,
   });
 
   const [actionError, setActionError] = useState<string | null>(null);
-  const [promotedDefinition, setPromotedDefinition] = useState<WorkflowDefinitionDescriptor | null>(
-    null
-  );
-  const [savingPromotionTarget, setSavingPromotionTarget] =
-    useState<WorkflowPromotionTarget | null>(null);
-  const savingPromotionTargetRef = useRef<WorkflowPromotionTarget | null>(null);
   const resumeOrRetryPendingForRun =
     runId != null && (resumingRunId === runId || workflowControlInFlightRunId === runId);
-  const displayDefinition = promotedDefinition ?? run?.definition;
+  const displayWorkflow = run?.workflow;
+  const runSource = getWorkflowRunSource(run);
+  const workflowWorkspaceId = run?.workspaceId ?? workspaceId;
   // workflow_resume cards only know the run ID until a snapshot loads; prefer the real
   // workflow name once available.
-  const displayName = displayDefinition?.name ?? args.name;
+  const displayName = displayWorkflow?.name ?? getWorkflowRunDisplayName(args);
   // A uniquely discovered foreground run is actionable before the blocking tool call returns.
   const discoveredForegroundRunConfirmed =
     status === "executing" &&
@@ -1055,18 +1277,6 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
     run?.workspaceId != null &&
     canRetryWorkflowFromCheckpoint(run) &&
     !resumeOrRetryPendingForRun;
-  const canPromote =
-    runIdentityConfirmed &&
-    run?.workspaceId != null &&
-    run.definition.scope === "scratch" &&
-    promotedDefinition == null;
-  const canSavePromotedWorkflow =
-    apiState?.api != null &&
-    runId != null &&
-    canPromote &&
-    savingPromotionTarget == null &&
-    savingPromotionTargetRef.current == null;
-
   const updateRunFromAction = async (action: WorkflowRunControlAction) => {
     if (apiState?.api == null || run?.workspaceId == null || runId == null) {
       return;
@@ -1099,49 +1309,6 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
   const updateRunFromActionRef = useRef(updateRunFromAction);
   updateRunFromActionRef.current = updateRunFromAction;
 
-  const saveScratchWorkflow = (location: WorkflowPromotionTarget) => {
-    const api = apiState?.api;
-    const sourceDefinition = run?.definition;
-    if (
-      api == null ||
-      run?.workspaceId == null ||
-      runId == null ||
-      sourceDefinition == null ||
-      !canPromote ||
-      savingPromotionTargetRef.current != null
-    ) {
-      return;
-    }
-
-    assert(sourceDefinition.scope === "scratch", "Only scratch workflow runs can be saved");
-    setActionError(null);
-    setSavingPromotionTarget(location);
-    savingPromotionTargetRef.current = location;
-    api.workflows
-      .promoteScratch({
-        workspaceId: run.workspaceId,
-        runId,
-        name: sourceDefinition.name,
-        description: sourceDefinition.description,
-        location,
-        overwrite: false,
-      })
-      .then((descriptor) => {
-        assert(
-          descriptor.scope === location,
-          "promoteScratch returned a descriptor for a different location"
-        );
-        setPromotedDefinition(descriptor);
-      })
-      .catch((error: unknown) => {
-        setActionError(error instanceof Error ? error.message : "Failed to save workflow");
-      })
-      .finally(() => {
-        savingPromotionTargetRef.current = null;
-        setSavingPromotionTarget(null);
-      });
-  };
-
   useEffect(() => {
     // Checkpoint retries briefly keep showing the old failed snapshot until polling observes a
     // post-retry event sequence, so don't clear that pending marker just because status is failed.
@@ -1153,9 +1320,6 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
       setResumingRunId(null);
     }
   }, [resumingRunId, run, runId]);
-
-  const saveScratchWorkflowRef = useRef(saveScratchWorkflow);
-  saveScratchWorkflowRef.current = saveScratchWorkflow;
 
   useEffect(() => {
     if (registerCommandSource == null || runId == null || run?.workspaceId == null) {
@@ -1195,32 +1359,6 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
           run: () => updateRunFromActionRef.current("retryFromCheckpoint"),
         });
       }
-      if (canPromote) {
-        actions.push(
-          {
-            id: `workflow:${runId}:save-project`,
-            title: `Save workflow to project workflows: ${displayName}`,
-            subtitle,
-            section: "Workflows",
-            keywords: ["workflow", "save", "project", "scratch", displayName, runId],
-            run: () => {
-              setLocalExpanded(true);
-              saveScratchWorkflowRef.current("project");
-            },
-          },
-          {
-            id: `workflow:${runId}:save-global`,
-            title: `Save workflow to global workflows: ${displayName}`,
-            subtitle,
-            section: "Workflows",
-            keywords: ["workflow", "save", "global", "scratch", displayName, runId],
-            run: () => {
-              setLocalExpanded(true);
-              saveScratchWorkflowRef.current("global");
-            },
-          }
-        );
-      }
       return actions;
     });
 
@@ -1230,7 +1368,6 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
     displayName,
     canInterrupt,
     canRetryFromCheckpoint,
-    canPromote,
     canResume,
     resumeOrRetryPendingForRun,
     registerCommandSource,
@@ -1314,6 +1451,40 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
     };
   }, [apiState?.api, exactDiscoveryRunId, run, status, workspaceId]);
 
+  // Tool output redaction can strip `run.source` from completed cards; fetch the full durable
+  // run lazily when the user expands the card so the Script source disclosure remains useful.
+  useEffect(() => {
+    if (
+      !expanded ||
+      apiState?.api == null ||
+      runId == null ||
+      workflowWorkspaceId == null ||
+      runSource != null
+    ) {
+      return;
+    }
+
+    let ignore = false;
+    const refresh = async () => {
+      try {
+        const nextRun = await apiState.api.workflows.getRun({
+          workspaceId: workflowWorkspaceId,
+          runId,
+        });
+        if (!ignore && nextRun != null) {
+          setRefreshedRun((current) => getNewestWorkflowRunSnapshot(current, nextRun));
+        }
+      } catch (error) {
+        console.error("Failed to load workflow run source:", error);
+      }
+    };
+
+    void refresh();
+    return () => {
+      ignore = true;
+    };
+  }, [apiState?.api, expanded, runId, runSource, workflowWorkspaceId]);
+
   useEffect(() => {
     if (
       apiState?.api == null ||
@@ -1373,12 +1544,12 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
           <div className="text-muted mb-2 flex flex-wrap items-center gap-2 text-[10px]">
             {runId && <span className="font-mono">{runId}</span>}
             <span>{displayStatus}</span>
-            {displayDefinition?.scope && <span>{displayDefinition.scope}</span>}
+            {displayWorkflow?.scope && <span>{displayWorkflow.scope}</span>}
           </div>
 
-          {displayDefinition && (
-            <WorkflowSection title="Definition">
-              <WorkflowDefinitionCard descriptor={displayDefinition} compact />
+          {displayWorkflow && (
+            <WorkflowSection title="Script">
+              <WorkflowScriptCard descriptor={displayWorkflow} compact />
             </WorkflowSection>
           )}
 
@@ -1387,19 +1558,15 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
             <WorkflowJsonBlock value={invocationArgs} className="max-h-[180px]" />
           </WorkflowDisclosureSection>
 
-          {run?.definitionSource && (
-            <WorkflowDisclosureSection title="Definition source">
+          {runSource && (
+            <WorkflowDisclosureSection title="Script source">
               <div className="border-border bg-code-bg max-h-[260px] overflow-auto rounded border p-2">
-                <HighlightedCode
-                  language="javascript"
-                  code={run.definitionSource.trimEnd()}
-                  showLineNumbers
-                />
+                <HighlightedCode language="javascript" code={runSource.trimEnd()} showLineNumbers />
               </div>
             </WorkflowDisclosureSection>
           )}
 
-          {(canInterrupt || canResume || canRetryFromCheckpoint || canPromote) && (
+          {(canInterrupt || canResume || canRetryFromCheckpoint) && (
             <div className="mb-2 flex flex-wrap gap-2 text-[10px]">
               {canInterrupt && (
                 <button
@@ -1437,42 +1604,6 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
                   Retry from checkpoint
                 </button>
               )}
-              {canPromote && (
-                <>
-                  <button
-                    type="button"
-                    className={WORKFLOW_ACTION_BUTTON_CLASS}
-                    disabled={!canSavePromotedWorkflow}
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      saveScratchWorkflow("project");
-                    }}
-                  >
-                    {savingPromotionTarget === "project"
-                      ? "Saving workflow..."
-                      : "Save to project workflows"}
-                  </button>
-                  <button
-                    type="button"
-                    className={WORKFLOW_ACTION_BUTTON_CLASS}
-                    disabled={!canSavePromotedWorkflow}
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      saveScratchWorkflow("global");
-                    }}
-                  >
-                    {savingPromotionTarget === "global"
-                      ? "Saving workflow..."
-                      : "Save to global workflows"}
-                  </button>
-                </>
-              )}
-            </div>
-          )}
-
-          {(promotedDefinition?.scope === "project" || promotedDefinition?.scope === "global") && (
-            <div className="text-success mb-2 text-[10px]">
-              {formatWorkflowSavedMessage(promotedDefinition.scope)}
             </div>
           )}
 
@@ -1500,7 +1631,19 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
                         />
                       );
                     }
-                    if (row.kind === "workflow" || row.kind === "patch") {
+                    if (row.kind === "workflow") {
+                      return (
+                        <WorkflowChildRunRow
+                          key={getDisplayRowKey(row)}
+                          row={row}
+                          displayIndex={index + 1}
+                          workspaceId={run?.workspaceId ?? workspaceId}
+                          parentRunActive={parentRunActive}
+                          depth={0}
+                        />
+                      );
+                    }
+                    if (row.kind === "patch") {
                       return (
                         <WorkflowEventRow
                           key={getDisplayRowKey(row)}
@@ -1564,7 +1707,7 @@ export const WorkflowResumeToolCall: React.FC<WorkflowResumeToolCallProps> = (pr
   return (
     <WorkflowRunToolCall
       args={{
-        name: props.args.run_id,
+        script_path: props.args.run_id,
         args: undefined,
         run_in_background: props.args.run_in_background ?? false,
       }}

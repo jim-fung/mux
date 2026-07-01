@@ -18,6 +18,7 @@ import { DesktopScreenshotToolCall } from "../DesktopScreenshotToolCall";
 import { FileEditToolCall } from "../FileEditToolCall";
 import { AgentSkillReadToolCall } from "../AgentSkillReadToolCall";
 import { AgentSkillReadFileToolCall } from "../AgentSkillReadFileToolCall";
+import { AgentSkillListToolCall } from "../AgentSkillListToolCall";
 import { FileReadToolCall } from "../FileReadToolCall";
 import { MemoryToolCall } from "../MemoryToolCall";
 import { WebFetchToolCall } from "../WebFetchToolCall";
@@ -42,10 +43,11 @@ import {
   TaskTerminateToolCall,
 } from "../TaskToolCall";
 import { TaskApplyGitPatchToolCall } from "../TaskApplyGitPatchToolCall";
+import { WorkspaceLifecycleToolCall } from "../WorkspaceLifecycleToolCall";
 import { SetGoalToolCall } from "../SetGoalToolCall";
 import { GetGoalToolCall } from "../GetGoalToolCall";
+import { HeartbeatToolCall } from "../HeartbeatToolCall";
 import { WorkflowResumeToolCall, WorkflowRunToolCall } from "../WorkflowRunToolCall";
-import { WorkflowListToolCall, WorkflowReadToolCall } from "../WorkflowDefinitionToolCall";
 import { CompleteGoalToolCall } from "../CompleteGoalToolCall";
 
 /**
@@ -129,6 +131,10 @@ const TOOL_REGISTRY: Record<string, ToolRegistryEntry> = {
     component: AgentSkillReadFileToolCall,
     schema: TOOL_DEFINITIONS.agent_skill_read_file.schema,
   },
+  agent_skill_list: {
+    component: AgentSkillListToolCall,
+    schema: TOOL_DEFINITIONS.agent_skill_list.schema,
+  },
   file_edit_replace_string: {
     component: FileEditToolCall,
     schema: TOOL_DEFINITIONS.file_edit_replace_string.schema,
@@ -183,13 +189,9 @@ const TOOL_REGISTRY: Record<string, ToolRegistryEntry> = {
     component: TaskApplyGitPatchToolCall,
     schema: TOOL_DEFINITIONS.task_apply_git_patch.schema,
   },
-  workflow_list: {
-    component: WorkflowListToolCall,
-    schema: TOOL_DEFINITIONS.workflow_list.schema,
-  },
-  workflow_read: {
-    component: WorkflowReadToolCall,
-    schema: TOOL_DEFINITIONS.workflow_read.schema,
+  task_workspace_lifecycle: {
+    component: WorkspaceLifecycleToolCall,
+    schema: TOOL_DEFINITIONS.task_workspace_lifecycle.schema,
   },
   workflow_run: {
     component: WorkflowRunToolCall,
@@ -209,6 +211,7 @@ const TOOL_REGISTRY: Record<string, ToolRegistryEntry> = {
     component: CompleteGoalToolCall,
     schema: TOOL_DEFINITIONS.complete_goal.schema,
   },
+  heartbeat: { component: HeartbeatToolCall, schema: TOOL_DEFINITIONS.heartbeat.schema },
   review_pane_update: {
     component: ReviewPaneUpdateToolCall,
     schema: TOOL_DEFINITIONS.review_pane_update.schema,

@@ -30,10 +30,9 @@ import type {
   TaskApplyGitPatchToolResultSchema,
   TaskListToolResultSchema,
   TaskTerminateToolResultSchema,
+  TaskWorkspaceLifecycleToolResultSchema,
   TOOL_DEFINITIONS,
   WebFetchToolResultSchema,
-  WorkflowListToolResultSchema,
-  WorkflowReadToolResultSchema,
   WorkflowRunToolResultSchema,
   WorkflowResumeToolResultSchema,
 } from "@/common/utils/tools/toolDefinitions";
@@ -57,7 +56,8 @@ export type AgentSkillReadFileToolArgs = z.infer<
 >;
 export type AgentSkillReadFileToolResult = z.infer<typeof AgentSkillReadFileToolResultSchema>;
 
-// agent_skill_list result
+// agent_skill_list args + result
+export type AgentSkillListToolArgs = z.infer<typeof TOOL_DEFINITIONS.agent_skill_list.schema>;
 export type AgentSkillListToolResult =
   | { success: true; skills: AgentSkillDescriptor[] }
   | { success: false; error: string };
@@ -273,19 +273,28 @@ export type TaskTerminateToolArgs = z.infer<typeof TOOL_DEFINITIONS.task_termina
 
 export type TaskTerminateToolSuccessResult = z.infer<typeof TaskTerminateToolResultSchema>;
 
+// Task Workspace Lifecycle Tool Types (parent-owned archive/delete_worktree/remove)
+export type TaskWorkspaceLifecycleToolArgs = z.infer<
+  typeof TOOL_DEFINITIONS.task_workspace_lifecycle.schema
+>;
+
+// Success shape is `{ results: [...] }` (no top-level `success`); a thrown execute()
+// surfaces as ToolErrorResult, so the renderable result is the union of both.
+export type TaskWorkspaceLifecycleToolSuccessResult = z.infer<
+  typeof TaskWorkspaceLifecycleToolResultSchema
+>;
+
+export type TaskWorkspaceLifecycleToolResult =
+  | TaskWorkspaceLifecycleToolSuccessResult
+  | ToolErrorResult;
+
+// One per-target outcome row, discriminated on `status` (12 lifecycle states).
+export type TaskWorkspaceLifecycleTargetResult =
+  TaskWorkspaceLifecycleToolSuccessResult["results"][number];
+
+export type TaskWorkspaceLifecycleStatus = TaskWorkspaceLifecycleTargetResult["status"];
+
 // Workflow Definition Tool Types
-export type WorkflowListToolArgs = z.infer<typeof TOOL_DEFINITIONS.workflow_list.schema>;
-
-export type WorkflowListToolSuccessResult = z.infer<typeof WorkflowListToolResultSchema>;
-
-export type WorkflowListToolResult = WorkflowListToolSuccessResult | ToolErrorResult;
-
-export type WorkflowReadToolArgs = z.infer<typeof TOOL_DEFINITIONS.workflow_read.schema>;
-
-export type WorkflowReadToolSuccessResult = z.infer<typeof WorkflowReadToolResultSchema>;
-
-export type WorkflowReadToolResult = WorkflowReadToolSuccessResult | ToolErrorResult;
-
 // Workflow Run Tool Types
 export type WorkflowRunToolArgs = z.infer<typeof TOOL_DEFINITIONS.workflow_run.schema>;
 

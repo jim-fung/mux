@@ -23,7 +23,11 @@ import {
 } from "@/common/types/message";
 import type { GoalRecordV1, GoalSetError, GoalStatus } from "@/common/types/goal";
 import type { ReviewNoteData } from "@/common/types/review";
-import type { WorkflowRunRecord } from "@/common/types/workflow";
+import {
+  isTerminalWorkflowRunStatus,
+  type WorkflowRunRecord,
+  type WorkflowRunStatus,
+} from "@/common/types/workflow";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { RUNTIME_MODE, parseRuntimeModeAndHost } from "@/common/types/runtime";
@@ -64,6 +68,10 @@ import { getProviderModelEntryId } from "@/common/utils/providers/modelEntries";
 import { isCustomOpenAICompatibleProviderConfig } from "@/common/utils/providers/customProviders";
 import { isValidProvider } from "@/common/constants/providers";
 import { openInEditor } from "@/browser/utils/openInEditor";
+import {
+  appendStagedAttachmentNotice,
+  getStagedAttachments,
+} from "@/browser/features/ChatInput/stagedAttachments";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 
 // ============================================================================
@@ -193,13 +201,10 @@ export interface SlashCommandContext extends Omit<CommandHandlerContext, "worksp
   attachedReviewIds?: string[];
 }
 
+export const WORKFLOW_FREEFORM_ARGS_ERROR_MESSAGE =
+  "Freeform workflow arguments are unsupported. Use JSON args or ask the agent to run the workflow.";
 const WORKFLOW_COMMAND_SUPERSEDED_MESSAGE = "Workflow command was superseded.";
-const WORKFLOW_TERMINAL_STATUSES = new Set(["completed", "failed", "interrupted"]);
 const WORKFLOW_POLL_INTERVAL_MS = 2_000;
-
-function isWorkflowTerminalStatus(status: string): boolean {
-  return WORKFLOW_TERMINAL_STATUSES.has(status);
-}
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
@@ -209,7 +214,7 @@ async function waitForWorkflowTerminalRun(input: {
   client: RouterClient<AppRouter>;
   workspaceId: string;
   runId: string;
-  initialStatus: string;
+  initialStatus: WorkflowRunStatus;
   isCurrent?: () => boolean;
 }): Promise<WorkflowRunRecord | null> {
   let run = await input.client.workflows.getRun({
@@ -218,7 +223,7 @@ async function waitForWorkflowTerminalRun(input: {
   });
   let status = run?.status ?? input.initialStatus;
 
-  while (!isWorkflowTerminalStatus(status)) {
+  while (!isTerminalWorkflowRunStatus(status)) {
     if (input.isCurrent?.() === false) {
       throw new Error(WORKFLOW_COMMAND_SUPERSEDED_MESSAGE);
     }
@@ -243,11 +248,11 @@ function parseWorkflowSlashArgs(argsText: string | undefined): unknown {
     return {};
   }
 
-  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+  try {
     return JSON.parse(trimmed) as unknown;
+  } catch {
+    throw new Error(WORKFLOW_FREEFORM_ARGS_ERROR_MESSAGE);
   }
-
-  return { input: trimmed };
 }
 
 // ============================================================================
@@ -425,9 +430,10 @@ export async function processSlashCommand(
     }
 
     const workspaceId = context.workspaceId;
+    const scriptPath = parsed.scriptPath;
     const rawInput = context.rawInput?.trim();
-    const rawCommand = rawInput && rawInput.length > 0 ? rawInput : `/${parsed.name}`;
-    const commandPrefix = rawCommand.split(/\s+/u)[0] ?? `/${parsed.name}`;
+    const rawCommand = rawInput && rawInput.length > 0 ? rawInput : `/${scriptPath}`;
+    const commandPrefix = rawCommand.split(/\s+/u)[0] ?? `/${scriptPath}`;
     const isCurrent =
       context.asyncCommandToken != null && context.isAsyncCommandCurrent != null
         ? () => context.isAsyncCommandCurrent?.(context.asyncCommandToken!, workspaceId) !== false
@@ -447,7 +453,7 @@ export async function processSlashCommand(
     try {
       const result = await activeClient.workflows.start({
         workspaceId,
-        name: parsed.name,
+        scriptPath,
         runInBackground: true,
         args,
         continuationOptions: context.sendMessageOptions,
@@ -461,7 +467,7 @@ export async function processSlashCommand(
         setToast({
           id: Date.now().toString(),
           type: "success",
-          message: `Workflow ${parsed.name} started`,
+          message: `Workflow ${scriptPath} started`,
         });
         return { clearInput: true, toastShown: true };
       }
@@ -478,13 +484,13 @@ export async function processSlashCommand(
         setToast({
           id: Date.now().toString(),
           type: "success",
-          message: `Workflow ${parsed.name} interrupted`,
+          message: `Workflow ${scriptPath} interrupted`,
         });
         return { clearInput: true, toastShown: true };
       }
       const workflowResultMessage = buildWorkflowResultContextMessage({
         rawCommand,
-        name: parsed.name,
+        name: scriptPath,
         runId: result.runId,
         status: terminalStatus,
         result: result.result,
@@ -515,7 +521,7 @@ export async function processSlashCommand(
       setToast({
         id: Date.now().toString(),
         type: "success",
-        message: `Workflow ${parsed.name} ${terminalStatus}`,
+        message: `Workflow ${scriptPath} ${terminalStatus}`,
       });
       return { clearInput: true, toastShown: true };
     } catch (error) {
@@ -1633,6 +1639,7 @@ export interface CommandHandlerContext {
   workspaceId: string;
   currentModel?: string | null;
   sendMessageOptions: SendMessageOptions;
+  attachments?: ChatAttachment[];
   fileParts?: FilePart[];
   /** Reviews attached to the message (from code review panel) */
   reviews?: ReviewNoteData[];
@@ -1770,12 +1777,16 @@ export async function handleCompactCommand(
   setSendingState(true);
 
   try {
-    // Build followUpContent directly from parsed command + context
+    // Build followUpContent directly from parsed command + context.
+    const stagedAttachments = context.attachments ? getStagedAttachments(context.attachments) : [];
     const hasContent =
-      parsed.continueMessage ?? context.fileParts?.length ?? context.reviews?.length;
+      parsed.continueMessage ??
+      context.fileParts?.length ??
+      context.reviews?.length ??
+      stagedAttachments.length;
     const followUpContent: CompactionFollowUpInput | undefined = hasContent
       ? {
-          text: parsed.continueMessage ?? "",
+          text: appendStagedAttachmentNotice(parsed.continueMessage ?? "", stagedAttachments),
           fileParts: context.fileParts,
           reviews: context.reviews,
         }

@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * `mux workflow` - Headless CLI runner for durable workflow definitions.
+ * `mux workflow` - Headless CLI runner for durable workflow scripts.
  */
 
 import * as fs from "node:fs/promises";
@@ -29,10 +29,13 @@ import { createCoreServices } from "@/node/services/coreServices";
 import { log, type LogLevel } from "@/node/services/log";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
-import { WorkflowDefinitionStore } from "@/node/services/workflows/WorkflowDefinitionStore";
+import { resolveWorkflowScript } from "@/node/services/workflows/workflowScriptResolver";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import { WorkflowService } from "@/node/services/workflows/WorkflowService";
-import { WorkflowTaskServiceAdapter } from "@/node/services/workflows/WorkflowTaskServiceAdapter";
+import {
+  DEFAULT_WORKFLOW_AGENT_ID,
+  WorkflowTaskServiceAdapter,
+} from "@/node/services/workflows/WorkflowTaskServiceAdapter";
 import { hasAnyConfiguredProvider, buildProvidersFromEnv } from "@/node/utils/providerRequirements";
 import { getParseOptions } from "./argv";
 import { exitAfterStdoutFlush } from "./processExit";
@@ -42,7 +45,6 @@ const VALID_EXPERIMENT_IDS = new Set<string>(Object.values(EXPERIMENT_IDS));
 const THINKING_LABELS_LIST = [...new Set(Object.values(THINKING_DISPLAY_LABELS))].join(", ");
 
 export interface ParseWorkflowArgsInput {
-  positionalInput?: string[];
   arg?: string[];
   argsJson?: string;
   argsFile?: string;
@@ -83,7 +85,6 @@ interface WorkflowContext {
 }
 
 export async function parseWorkflowArgs(input: ParseWorkflowArgsInput): Promise<unknown> {
-  const positionalInput = input.positionalInput ?? [];
   const structuredModes = [
     input.arg != null && input.arg.length > 0 ? "--arg" : null,
     input.argsJson != null ? "--args-json" : null,
@@ -91,9 +92,6 @@ export async function parseWorkflowArgs(input: ParseWorkflowArgsInput): Promise<
     input.argsStdin === true ? "--args-stdin" : null,
   ].filter((mode): mode is string => mode != null);
 
-  if (structuredModes.length > 0 && positionalInput.length > 0) {
-    throw new Error("Workflow positional input cannot be combined with structured args flags");
-  }
   if (structuredModes.length > 1) {
     throw new Error(`Only one structured args mode is allowed, got: ${structuredModes.join(", ")}`);
   }
@@ -114,8 +112,7 @@ export async function parseWorkflowArgs(input: ParseWorkflowArgsInput): Promise<
     return parseKeyValueArgs(input.arg);
   }
 
-  const inputText = positionalInput.join(" ").trim();
-  return inputText.length > 0 ? { input: inputText } : {};
+  return {};
 }
 
 function parseJsonArgs(text: string, label: string): unknown {
@@ -231,52 +228,6 @@ function buildExperimentsObject(experimentIds: readonly string[]) {
     dynamicWorkflows: true,
     workspaceHeartbeats: experimentIds.includes(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS),
   };
-}
-
-/**
- * Discovery silently omits project workflows from untrusted projects, which reads
- * like a discovery bug to users who just authored a workflow. Surface the trust
- * gate on stderr (so --json stdout stays machine-parseable) whenever skipped
- * project-local workflow candidates exist.
- */
-async function warnIfUntrustedProjectWorkflowsSkipped(
-  projectDir: string,
-  projectTrusted: boolean
-): Promise<void> {
-  if (projectTrusted) {
-    return;
-  }
-  const workflowsDir = path.join(projectDir, ".mux", "workflows");
-  const hasCandidates =
-    (await dirHasWorkflowFiles(workflowsDir)) ||
-    (await dirHasWorkflowFiles(path.join(workflowsDir, ".scratch")));
-  if (!hasCandidates) {
-    return;
-  }
-  process.stderr.write(
-    `Warning: skipped project workflows in ${workflowsDir} because this project is not trusted. Review the repository, then run \`mux trust\` (or trust the project in Settings → Security) to include repo-controlled workflows.\n`
-  );
-}
-
-async function dirHasWorkflowFiles(dir: string): Promise<boolean> {
-  try {
-    const entries = await fs.readdir(dir, { withFileTypes: true });
-    return entries.some((entry) => entry.isFile() && entry.name.endsWith(".js"));
-  } catch {
-    return false;
-  }
-}
-
-function createDefinitionStore(input: {
-  realConfig: Config;
-  projectDir: string;
-}): WorkflowDefinitionStore {
-  const projectRoot = path.join(input.projectDir, ".mux", "workflows");
-  return new WorkflowDefinitionStore({
-    projectRoot,
-    scratchRoot: path.join(projectRoot, ".scratch"),
-    globalRoot: path.join(input.realConfig.rootDir, "workflows"),
-  });
 }
 
 async function disposeWorkflowResources(input: {
@@ -410,10 +361,6 @@ function createWorkflowService(input: {
   const workspaceSessionDir = input.ctx.config.getSessionDir(input.ctx.workspaceId);
 
   return new WorkflowService({
-    definitionStore: createDefinitionStore({
-      realConfig: input.ctx.realConfig,
-      projectDir: input.ctx.projectDir,
-    }),
     runStore: new WorkflowRunStore({ sessionDir: workspaceSessionDir }),
     runtimeFactory: new QuickJSRuntimeFactory(),
     taskAdapterFactory: (runId) =>
@@ -421,7 +368,7 @@ function createWorkflowService(input: {
         taskService: input.ctx.services.taskService,
         parentWorkspaceId: input.ctx.workspaceId,
         workflowRunId: runId,
-        defaultAgentId: "explore",
+        defaultAgentId: DEFAULT_WORKFLOW_AGENT_ID,
         experiments,
         modelString: input.model,
         thinkingLevel: input.thinkingLevel,
@@ -435,83 +382,26 @@ function createWorkflowService(input: {
           trusted: input.ctx.projectTrusted,
         },
       }),
+    resolveWorkflowScript: (scriptPath) =>
+      resolveWorkflowScript({
+        scriptPath,
+        runtime,
+        workspacePath: input.ctx.workspacePath,
+        projectTrusted: input.ctx.projectTrusted,
+      }),
     getCurrentProjectTrusted: () => input.ctx.projectTrusted,
     runnerId: input.ctx.workspaceId,
   });
 }
 
-async function runList(options: WorkflowCLIOptions): Promise<number> {
+async function runWorkflow(scriptPath: string, options: WorkflowCLIOptions): Promise<number> {
   const projectDir = await resolveProjectDir({
     cwd: process.cwd(),
     explicitDir: options.dir,
   });
-  const realConfig = new Config();
-  const projectTrusted = await resolveProjectTrusted(realConfig, projectDir);
-  await warnIfUntrustedProjectWorkflowsSkipped(projectDir, projectTrusted);
-  const store = createDefinitionStore({ realConfig, projectDir });
-  const definitions = await store.listDefinitions({ projectTrusted });
-  if (options.json) {
-    process.stdout.write(`${JSON.stringify(definitions)}\n`);
-  } else {
-    for (const definition of definitions) {
-      process.stdout.write(`${definition.name}\t${definition.scope}\t${definition.description}\n`);
-    }
-  }
-  return 0;
-}
-
-async function runShow(
-  name: string,
-  options: WorkflowCLIOptions & { source?: boolean }
-): Promise<number> {
-  const projectDir = await resolveProjectDir({
-    cwd: process.cwd(),
-    explicitDir: options.dir,
-  });
-  const realConfig = new Config();
-  const projectTrusted = await resolveProjectTrusted(realConfig, projectDir);
-  await warnIfUntrustedProjectWorkflowsSkipped(projectDir, projectTrusted);
-  const store = createDefinitionStore({ realConfig, projectDir });
-  const definition = await store.readDefinition(name, { projectTrusted });
-  if (options.json) {
-    process.stdout.write(`${JSON.stringify(definition)}\n`);
-  } else {
-    process.stdout.write(`${definition.descriptor.name}\n`);
-    process.stdout.write(`scope: ${definition.descriptor.scope}\n`);
-    process.stdout.write(`description: ${definition.descriptor.description}\n`);
-    if (definition.descriptor.sourcePath != null) {
-      process.stdout.write(`source: ${definition.descriptor.sourcePath}\n`);
-    }
-    if (options.source === true) {
-      process.stdout.write("\n");
-      process.stdout.write(definition.source);
-      if (!definition.source.endsWith("\n")) process.stdout.write("\n");
-    }
-  }
-  return 0;
-}
-
-async function runWorkflow(
-  name: string,
-  positionalInput: string[],
-  options: WorkflowCLIOptions
-): Promise<number> {
-  const projectDir = await resolveProjectDir({
-    cwd: process.cwd(),
-    explicitDir: options.dir,
-  });
-  const realConfig = new Config();
   parseRuntimeConfig(options.runtime);
-  const store = createDefinitionStore({ realConfig, projectDir });
-  await assertProjectWorkflowTrusted({
-    name,
-    store,
-    projectDir,
-    projectTrusted: await resolveProjectTrusted(realConfig, projectDir),
-  });
 
   const args = await parseWorkflowArgs({
-    positionalInput,
     arg: options.arg,
     argsJson: options.argsJson,
     argsFile: options.argsFile,
@@ -527,12 +417,23 @@ async function runWorkflow(
   const ctx = await createWorkflowContext({ opts: options, projectDir });
   try {
     const workflowService = createWorkflowService({ ctx, opts: options, model, thinkingLevel });
-    writeLine(`workflow: ${name}`);
+    writeLine(`workflow: ${scriptPath}`);
     writeLine(`directory: ${projectDir}`);
     writeLine(`runtime: ${ctx.runtimeConfig.type}`);
 
-    const result = await workflowService.startNamedWorkflow({
-      name,
+    const runtime = createRuntime(ctx.runtimeConfig, {
+      projectPath: ctx.projectDir,
+      workspaceName: ctx.workspaceId,
+      workspacePath: ctx.workspacePath,
+    });
+    const script = await resolveWorkflowScript({
+      scriptPath,
+      runtime,
+      workspacePath: ctx.workspacePath,
+      projectTrusted: ctx.projectTrusted,
+    });
+    const result = await workflowService.startWorkflow({
+      script,
       workspaceId: ctx.workspaceId,
       projectTrusted: ctx.projectTrusted,
       args,
@@ -560,66 +461,6 @@ async function runWorkflow(
   }
 }
 
-async function assertProjectWorkflowTrusted(input: {
-  name: string;
-  store: WorkflowDefinitionStore;
-  projectDir: string;
-  projectTrusted: boolean;
-}): Promise<void> {
-  if (input.projectTrusted) {
-    return;
-  }
-  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(input.name)) {
-    return;
-  }
-  if (await hasRunnableNonProjectWorkflow(input.store, input.name)) {
-    return;
-  }
-
-  const workflowPath = path.join(input.projectDir, ".mux", "workflows", `${input.name}.js`);
-  try {
-    const stat = await fs.stat(workflowPath);
-    if (stat.isFile()) {
-      throw new Error(
-        `Project trust is required to execute project-local workflow: ${input.name}. Review the repository, then run \`mux trust\` (or trust the project in Settings → Security) before running repo-controlled workflow code.`
-      );
-    }
-  } catch (error) {
-    if (error instanceof Error && error.message.startsWith("Project trust is required")) {
-      throw error;
-    }
-    if (getNodeErrorCode(error) !== "ENOENT") {
-      log.debug("mux workflow: unable to inspect untrusted project workflow candidate", {
-        workflowPath,
-        error: getErrorMessage(error),
-      });
-    }
-  }
-}
-
-async function hasRunnableNonProjectWorkflow(
-  store: WorkflowDefinitionStore,
-  name: string
-): Promise<boolean> {
-  try {
-    const definition = await store.readDefinition(name, { projectTrusted: false });
-    return definition.descriptor.scope !== "project" && definition.descriptor.scope !== "scratch";
-  } catch (error) {
-    if (error instanceof Error && error.message.startsWith("Workflow definition not found")) {
-      return false;
-    }
-    throw error;
-  }
-}
-
-function getNodeErrorCode(error: unknown): string | null {
-  if (typeof error !== "object" || error == null || !("code" in error)) {
-    return null;
-  }
-  const code = (error as { code?: unknown }).code;
-  return typeof code === "string" ? code : null;
-}
-
 function extractReportMarkdown(result: unknown): string {
   if (typeof result === "object" && result != null && "reportMarkdown" in result) {
     const reportMarkdown = (result as { reportMarkdown?: unknown }).reportMarkdown;
@@ -645,7 +486,7 @@ export async function main(): Promise<number> {
   program
     .name("mux workflow")
     .description(
-      "List, inspect, and run mux workflow definitions.\n\nExperimental: invoking this command implicitly enables the dynamic-workflows\nexperiment for this invocation only."
+      "Run mux workflow scripts by explicit script path.\n\nExperimental: invoking this command implicitly enables the dynamic-workflows\nexperiment for this invocation only."
     )
     .option("-d, --dir <path>", "project directory")
     .option("-r, --runtime <runtime>", "runtime type (currently only local is supported)", "local")
@@ -676,38 +517,14 @@ export async function main(): Promise<number> {
     .option("--log-level <level>", "set log level: error, warn, info, debug");
 
   program
-    .command("list")
-    .description("List discovered workflows")
-    .action(async () => {
-      const options = program.opts<WorkflowCLIOptions>();
-      configureLogging(options);
-      process.exitCode = await runList(options);
-    });
-
-  program
-    .command("show")
-    .argument("<name>", "workflow name")
-    .option("--source", "include workflow source")
-    .description("Show a workflow definition")
-    .action(async (name: string, commandOptions: { source?: boolean }) => {
-      const options = {
-        ...program.opts<WorkflowCLIOptions>(),
-        ...commandOptions,
-      };
-      configureLogging(options);
-      process.exitCode = await runShow(name, options);
-    });
-
-  program
     .command("run")
-    .argument("<name>", "workflow name")
-    .argument("[input...]", "optional positional input mapped to { input }")
+    .argument("<script_path>", "explicit workflow script path")
+    .allowExcessArguments(false)
     .description("Run a workflow in the foreground")
-    .action(async (name: string, input: unknown) => {
+    .action(async (scriptPath: string) => {
       const options = program.opts<WorkflowCLIOptions>();
       configureLogging(options);
-      assert(Array.isArray(input), "mux workflow run input must be an array");
-      process.exitCode = await runWorkflow(name, input as string[], options);
+      process.exitCode = await runWorkflow(scriptPath, options);
     });
 
   await program.parseAsync(process.argv, getParseOptions());

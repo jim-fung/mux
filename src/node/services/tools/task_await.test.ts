@@ -27,9 +27,9 @@ function createWorkflowRun(
   return {
     id: "wfr_demo",
     workspaceId: "parent-workspace",
-    definition: { name: "demo", description: "Demo workflow", scope: "built-in", executable: true },
-    definitionSource: "export default function workflow() { return null; }\n",
-    definitionHash: "sha256:demo",
+    workflow: { name: "demo", description: "Demo workflow", scope: "built-in", executable: true },
+    source: "export default function workflow() { return null; }\n",
+    sourceHash: "sha256:demo",
     args: {},
     status,
     createdAt: "2026-01-01T00:00:00.000Z",
@@ -900,9 +900,11 @@ describe("task_await tool", () => {
       },
     ]);
 
+    const markWorkflowRunTerminalAttentionConsumed = mock(() => Promise.resolve());
     const taskService = {
       listActiveDescendantAgentTaskIds: mock(() => []),
       isDescendantAgentTask: mock(() => Promise.resolve(false)),
+      markWorkflowRunTerminalAttentionConsumed,
       waitForAgentReport: mock(() => {
         throw new Error("workflow run IDs should not be treated as agent tasks");
       }),
@@ -935,6 +937,11 @@ describe("task_await tool", () => {
     });
     expect(workflowService.getRun).toHaveBeenCalledWith({
       workspaceId: "parent-workspace",
+      runId: "wfr_demo",
+    });
+    expect(markWorkflowRunTerminalAttentionConsumed).toHaveBeenCalledWith({
+      ownerWorkspaceId: "parent-workspace",
+      status: "completed",
       runId: "wfr_demo",
     });
   });
@@ -1078,6 +1085,101 @@ describe("task_await tool", () => {
         },
       ],
     });
+  });
+
+  it("surfaces compact workflow progress for active workflow awaits", async () => {
+    using tempDir = new TestTempDir("test-task-await-tool-workflow-progress");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+    const runningRun = {
+      ...createWorkflowRun("running", [
+        {
+          sequence: 1,
+          type: "status" as const,
+          at: "2026-01-01T00:00:01.000Z",
+          status: "running" as const,
+        },
+        {
+          sequence: 2,
+          type: "phase" as const,
+          at: "2026-01-01T00:00:02.000Z",
+          name: "verify",
+          details: { claimCount: 2 },
+        },
+        {
+          sequence: 3,
+          type: "task" as const,
+          at: "2026-01-01T00:00:03.000Z",
+          stepId: "verify-1",
+          taskId: "child-task-id",
+          title: "Verify claim 1",
+          status: "started",
+        },
+        {
+          sequence: 4,
+          type: "log" as const,
+          at: "2026-01-01T00:00:04.000Z",
+          message: "Verification half done",
+          data: { verified: 1 },
+        },
+      ]),
+      steps: [
+        {
+          stepId: "scope",
+          inputHash: "sha256:scope",
+          status: "completed" as const,
+          taskId: "scope-task",
+          startedAt: "2026-01-01T00:00:01.000Z",
+          completedAt: "2026-01-01T00:00:02.000Z",
+        },
+        {
+          stepId: "verify-1",
+          inputHash: "sha256:verify-1",
+          status: "started" as const,
+          taskId: "child-task-id",
+          startedAt: "2026-01-01T00:00:03.000Z",
+        },
+      ],
+    };
+
+    const taskService = {
+      listActiveDescendantAgentTaskIds: mock(() => []),
+      isDescendantAgentTask: mock(() => Promise.resolve(false)),
+      waitForAgentReport: mock(() => {
+        throw new Error("workflow run IDs should not be treated as agent tasks");
+      }),
+    } as unknown as TaskService;
+    const workflowService = {
+      getRun: mock(() => Promise.resolve(runningRun)),
+    };
+    const tool = createTaskAwaitTool({
+      ...baseConfig,
+      taskService,
+      workflowService: workflowService as unknown as TestWorkflowService,
+    });
+
+    const result: unknown = await Promise.resolve(
+      tool.execute!({ task_ids: ["wfr_demo"], timeout_secs: 0 }, mockToolCallOptions)
+    );
+
+    const workflowResult = result as { results: Array<Record<string, unknown>> };
+    expect(workflowResult.results).toHaveLength(1);
+    expect(workflowResult.results[0]).toMatchObject({
+      status: "running",
+      taskId: "wfr_demo",
+      workflowProgress: {
+        name: "demo",
+        latestPhase: {
+          name: "verify",
+          at: "2026-01-01T00:00:02.000Z",
+        },
+        lastProgressAt: "2026-01-01T00:00:04.000Z",
+        stepCounts: { started: 1, completed: 1, failed: 0, interrupted: 0 },
+      },
+    });
+    expect(String(workflowResult.results[0]?.note)).toContain("Latest phase: verify");
+    expect(JSON.stringify(workflowResult.results[0])).not.toContain("claimCount");
+    expect(JSON.stringify(workflowResult.results[0])).not.toContain("recentEvents");
+    expect(JSON.stringify(workflowResult.results[0])).not.toContain("child-task-id");
   });
 
   it("discovers active workflow runs when task_ids is omitted", async () => {

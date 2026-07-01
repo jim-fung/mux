@@ -17,14 +17,14 @@ function buildRun(overrides: Partial<WorkflowRunRecord> = {}): WorkflowRunRecord
   return {
     id: "wfr_resume_me",
     workspaceId: "workspace-1",
-    definition: {
+    workflow: {
       name: "deep-research",
       description: "Deep research",
       scope: "built-in",
       executable: true,
     },
-    definitionSource: "export default function workflow() { return null; }",
-    definitionHash: "sha256:test",
+    source: "export default function workflow() { return null; }",
+    sourceHash: "sha256:test",
     args: {},
     status: "interrupted",
     createdAt: "2026-05-29T00:00:00.000Z",
@@ -63,17 +63,7 @@ interface WorkflowServiceMockOverrides {
 
 function buildWorkflowService(overrides: WorkflowServiceMockOverrides = {}) {
   return {
-    listDefinitions: mock(async () => []),
-    readDefinition: mock(async () => ({
-      descriptor: {
-        name: "deep-research",
-        description: "Deep research",
-        scope: "built-in",
-        executable: true,
-      },
-      source: "export default function workflow() { return null; }",
-    })),
-    startNamedWorkflow: mock(async () => {
+    startWorkflow: mock(async () => {
       throw new Error("workflow_resume must not start new workflows");
     }),
     getRun: overrides.getRun ?? mock(async () => buildRun()),

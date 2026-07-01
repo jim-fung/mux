@@ -215,6 +215,855 @@ function createFrontendWorkspaceMetadata(
   };
 }
 
+describe("WorkspaceService bash monitor wakes", () => {
+  test("sends a synthetic wake and marks the record delivered when monitor output matches", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-owner";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      const backgroundProcessManager = Object.assign(new EventEmitter(), {
+        cleanup: mock(() => Promise.resolve()),
+      }) as unknown as BackgroundProcessManager & EventEmitter;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => false) }),
+      });
+      const sendSpy = spyOn(workspaceService, "sendMessage").mockImplementation(
+        async (...args: Parameters<WorkspaceService["sendMessage"]>) => {
+          await args[3]?.onAccepted?.();
+          return Ok(undefined);
+        }
+      );
+
+      backgroundProcessManager.emit("monitor:match", workspaceId, {
+        processId: "proc-1",
+        taskId: "bash:proc-1",
+        workspaceId,
+        filter: "FAILED",
+        filterExclude: false,
+        lines: ["FAILED one"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+      });
+
+      await waitForCondition(() => sendSpy.mock.calls.length === 1);
+      expect(sendSpy.mock.calls[0][0]).toBe(workspaceId);
+      expect(sendSpy.mock.calls[0][1]).toContain("A background bash monitor matched output.");
+      expect(sendSpy.mock.calls[0][1]).toContain("FAILED one");
+      expect(sendSpy.mock.calls[0][2]).toMatchObject({ queueDispatchMode: "tool-end" });
+      expect(sendSpy.mock.calls[0][3]).toMatchObject({
+        synthetic: true,
+        agentInitiated: true,
+        skipAutoResumeReset: true,
+      });
+      expect(sendSpy.mock.calls[0][3]?.requireIdle).toBeUndefined();
+      const wakeStore = (
+        workspaceService as unknown as {
+          bashMonitorWakeStore: { listPending: (id: string) => Promise<unknown[]> };
+        }
+      ).bashMonitorWakeStore;
+      await waitForCondition(async () => (await wakeStore.listPending(workspaceId)).length === 0);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("queues monitor wakes immediately for a session-backed streaming owner", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-streaming-owner";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      const backgroundProcessManager = Object.assign(new EventEmitter(), {
+        cleanup: mock(() => Promise.resolve()),
+      }) as unknown as BackgroundProcessManager & EventEmitter;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => true) }),
+      });
+      spyOn(workspaceService, "isBusyForMessage").mockReturnValue(true);
+      spyOn(workspaceService, "hasQueuedMessages").mockReturnValue(false);
+      spyOn(workspaceService, "hasPendingQueuedOrPreparingTurn").mockReturnValue(false);
+      const waitForIdleSpy = spyOn(
+        workspaceService,
+        "waitForIdleAndNoQueuedMessages"
+      ).mockResolvedValue();
+      const sendSpy = spyOn(workspaceService, "sendMessage").mockImplementation(
+        async (...args: Parameters<WorkspaceService["sendMessage"]>) => {
+          await args[3]?.onAccepted?.();
+          return Ok(undefined);
+        }
+      );
+
+      backgroundProcessManager.emit("monitor:match", workspaceId, {
+        processId: "proc-1",
+        taskId: "bash:proc-1",
+        workspaceId,
+        filter: "FAILED",
+        filterExclude: false,
+        lines: ["FAILED streaming"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+      });
+
+      await waitForCondition(() => sendSpy.mock.calls.length === 1);
+      expect(sendSpy.mock.calls[0][2]).toMatchObject({ queueDispatchMode: "tool-end" });
+      expect(sendSpy.mock.calls[0][3]?.requireIdle).toBeUndefined();
+      expect(waitForIdleSpy).not.toHaveBeenCalled();
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("leaves monitor wakes pending and retries after idle when a busy queue send is rejected", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-busy-rejected-owner";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      const backgroundProcessManager = Object.assign(new EventEmitter(), {
+        cleanup: mock(() => Promise.resolve()),
+      }) as unknown as BackgroundProcessManager & EventEmitter;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => true) }),
+      });
+      spyOn(workspaceService, "isBusyForMessage").mockReturnValue(true);
+      spyOn(workspaceService, "hasQueuedMessages").mockReturnValue(false);
+      spyOn(workspaceService, "hasPendingQueuedOrPreparingTurn").mockReturnValue(false);
+      const waitForIdleSpy = spyOn(
+        workspaceService,
+        "waitForIdleAndNoQueuedMessages"
+      ).mockImplementation(() => new Promise(() => undefined));
+      const sendSpy = spyOn(workspaceService, "sendMessage").mockResolvedValue(
+        Err({ type: "unknown", raw: "busy rejection" })
+      );
+
+      backgroundProcessManager.emit("monitor:match", workspaceId, {
+        processId: "proc-1",
+        taskId: "bash:proc-1",
+        workspaceId,
+        filter: "FAILED",
+        filterExclude: false,
+        lines: ["FAILED rejected"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+      });
+
+      await waitForCondition(() => sendSpy.mock.calls.length === 1);
+      expect(waitForIdleSpy).toHaveBeenCalledWith(workspaceId);
+      const wakeStore = (
+        workspaceService as unknown as {
+          bashMonitorWakeStore: { listPending: (id: string) => Promise<unknown[]> };
+        }
+      ).bashMonitorWakeStore;
+      expect(await wakeStore.listPending(workspaceId)).toHaveLength(1);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("defers monitor wakes while the owner session is busy after streaming ends", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-completing-owner";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      const backgroundProcessManager = Object.assign(new EventEmitter(), {
+        cleanup: mock(() => Promise.resolve()),
+      }) as unknown as BackgroundProcessManager & EventEmitter;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => false) }),
+      });
+      spyOn(workspaceService, "isBusyForMessage").mockReturnValue(true);
+      spyOn(workspaceService, "hasPendingQueuedOrPreparingTurn").mockReturnValue(false);
+      const waitForIdleSpy = spyOn(
+        workspaceService,
+        "waitForIdleAndNoQueuedMessages"
+      ).mockImplementation(() => new Promise(() => undefined));
+      const sendSpy = spyOn(workspaceService, "sendMessage").mockResolvedValue(Ok(undefined));
+
+      backgroundProcessManager.emit("monitor:match", workspaceId, {
+        processId: "proc-1",
+        taskId: "bash:proc-1",
+        workspaceId,
+        filter: "FAILED",
+        filterExclude: false,
+        lines: ["FAILED completing"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+      });
+
+      await waitForCondition(() => waitForIdleSpy.mock.calls.length === 1);
+      expect(sendSpy).not.toHaveBeenCalled();
+      const wakeStore = (
+        workspaceService as unknown as {
+          bashMonitorWakeStore: { listPending: (id: string) => Promise<unknown[]> };
+        }
+      ).bashMonitorWakeStore;
+      expect(await wakeStore.listPending(workspaceId)).toHaveLength(1);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("leaves idle rejected monitor wakes pending without scheduling a retry loop", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-idle-rejected-owner";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      const backgroundProcessManager = Object.assign(new EventEmitter(), {
+        cleanup: mock(() => Promise.resolve()),
+      }) as unknown as BackgroundProcessManager & EventEmitter;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => false) }),
+      });
+      spyOn(workspaceService, "isBusyForMessage").mockReturnValue(false);
+      spyOn(workspaceService, "hasPendingQueuedOrPreparingTurn").mockReturnValue(false);
+      const waitForIdleSpy = spyOn(
+        workspaceService,
+        "waitForIdleAndNoQueuedMessages"
+      ).mockResolvedValue();
+      const sendSpy = spyOn(workspaceService, "sendMessage").mockResolvedValue(
+        Err({ type: "unknown", raw: "idle rejection" })
+      );
+
+      backgroundProcessManager.emit("monitor:match", workspaceId, {
+        processId: "proc-1",
+        taskId: "bash:proc-1",
+        workspaceId,
+        filter: "FAILED",
+        filterExclude: false,
+        lines: ["FAILED idle rejected"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+      });
+
+      await waitForCondition(() => sendSpy.mock.calls.length === 1);
+      expect(waitForIdleSpy).not.toHaveBeenCalled();
+      const wakeStore = (
+        workspaceService as unknown as {
+          bashMonitorWakeStore: { listPending: (id: string) => Promise<unknown[]> };
+        }
+      ).bashMonitorWakeStore;
+      expect(await wakeStore.listPending(workspaceId)).toHaveLength(1);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("keeps an accepted monitor wake pending when stream startup fails before streaming", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-startup-failure-owner";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      const backgroundProcessManager = Object.assign(new EventEmitter(), {
+        cleanup: mock(() => Promise.resolve()),
+      }) as unknown as BackgroundProcessManager & EventEmitter;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => false) }),
+      });
+      const sendSpy = spyOn(workspaceService, "sendMessage").mockImplementation(
+        async (...args: Parameters<WorkspaceService["sendMessage"]>) => {
+          await args[3]?.onAccepted?.();
+          return Err({ type: "unknown", raw: "startup failed" });
+        }
+      );
+
+      backgroundProcessManager.emit("monitor:match", workspaceId, {
+        processId: "proc-1",
+        taskId: "bash:proc-1",
+        workspaceId,
+        filter: "FAILED",
+        filterExclude: false,
+        lines: ["FAILED startup"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+      });
+
+      await waitForCondition(() => sendSpy.mock.calls.length === 1);
+      await drainPendingDispatches();
+      const wakeStore = (
+        workspaceService as unknown as {
+          bashMonitorWakeStore: { listPending: (id: string) => Promise<unknown[]> };
+        }
+      ).bashMonitorWakeStore;
+      expect(await wakeStore.listPending(workspaceId)).toHaveLength(1);
+      sendSpy.mockRestore();
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("keeps a queued monitor wake pending when accepted dispatch fails before stream start", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-queued-startup-failure-owner";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      const backgroundProcessManager = Object.assign(new EventEmitter(), {
+        cleanup: mock(() => Promise.resolve()),
+      }) as unknown as BackgroundProcessManager & EventEmitter;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => true) }),
+      });
+      spyOn(workspaceService, "isBusyForMessage").mockReturnValue(true);
+      spyOn(workspaceService, "hasPendingQueuedOrPreparingTurn").mockReturnValue(false);
+      spyOn(workspaceService, "waitForIdleAndNoQueuedMessages").mockImplementation(
+        () => new Promise(() => undefined)
+      );
+      const sendSpy = spyOn(workspaceService, "sendMessage").mockImplementation(
+        async (...args: Parameters<WorkspaceService["sendMessage"]>) => {
+          await args[3]?.onAccepted?.();
+          await args[3]?.onAcceptedPreStreamFailure?.({ type: "unknown", raw: "startup failed" });
+          return Ok(undefined);
+        }
+      );
+
+      backgroundProcessManager.emit("monitor:match", workspaceId, {
+        processId: "proc-1",
+        taskId: "bash:proc-1",
+        workspaceId,
+        filter: "FAILED",
+        filterExclude: false,
+        lines: ["FAILED queued startup"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+      });
+
+      await waitForCondition(() => sendSpy.mock.calls.length === 1);
+      await drainPendingDispatches();
+      const wakeStore = (
+        workspaceService as unknown as {
+          bashMonitorWakeStore: { listPending: (id: string) => Promise<unknown[]> };
+        }
+      ).bashMonitorWakeStore;
+      expect(await wakeStore.listPending(workspaceId)).toHaveLength(1);
+      sendSpy.mockRestore();
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("marks an accepted monitor wake delivered when startup retry later starts streaming", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-startup-retry-owner";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      const backgroundProcessManager = Object.assign(new EventEmitter(), {
+        cleanup: mock(() => Promise.resolve()),
+      }) as unknown as BackgroundProcessManager & EventEmitter;
+      const aiService = Object.assign(new EventEmitter(), {
+        isStreaming: mock(() => true),
+      }) as unknown as AIService & EventEmitter;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService,
+      });
+      spyOn(workspaceService, "isBusyForMessage").mockReturnValue(true);
+      spyOn(workspaceService, "hasPendingQueuedOrPreparingTurn").mockReturnValue(false);
+      spyOn(workspaceService, "waitForIdleAndNoQueuedMessages").mockImplementation(
+        () => new Promise(() => undefined)
+      );
+      const sendSpy = spyOn(workspaceService, "sendMessage").mockImplementation(
+        async (...args: Parameters<WorkspaceService["sendMessage"]>) => {
+          await args[3]?.onAccepted?.();
+          await args[3]?.onAcceptedPreStreamFailure?.({
+            type: "unknown",
+            raw: "runtime not ready",
+          });
+          return Ok(undefined);
+        }
+      );
+
+      backgroundProcessManager.emit("monitor:match", workspaceId, {
+        processId: "proc-1",
+        taskId: "bash:proc-1",
+        workspaceId,
+        filter: "FAILED",
+        filterExclude: false,
+        lines: ["FAILED retry"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+      });
+
+      await waitForCondition(() => sendSpy.mock.calls.length === 1);
+      aiService.emit("stream-start", { workspaceId, model: "openai:gpt-4o-mini" });
+
+      const wakeStore = (
+        workspaceService as unknown as {
+          bashMonitorWakeStore: { listPending: (id: string) => Promise<unknown[]> };
+        }
+      ).bashMonitorWakeStore;
+      await waitForCondition(async () => (await wakeStore.listPending(workspaceId)).length === 0);
+      sendSpy.mockRestore();
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("marks an accepted monitor wake delivered after the stream starts", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-started-owner";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      const backgroundProcessManager = Object.assign(new EventEmitter(), {
+        cleanup: mock(() => Promise.resolve()),
+      }) as unknown as BackgroundProcessManager & EventEmitter;
+      const aiService = Object.assign(new EventEmitter(), {
+        isStreaming: mock(() => true),
+      }) as unknown as AIService & EventEmitter;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService,
+      });
+      spyOn(workspaceService, "isBusyForMessage").mockReturnValue(true);
+      spyOn(workspaceService, "hasPendingQueuedOrPreparingTurn").mockReturnValue(false);
+      const sendSpy = spyOn(workspaceService, "sendMessage").mockImplementation(
+        async (...args: Parameters<WorkspaceService["sendMessage"]>) => {
+          await args[3]?.onAccepted?.();
+          aiService.emit("stream-start", { workspaceId, model: "openai:gpt-4o-mini" });
+          return Ok(undefined);
+        }
+      );
+
+      backgroundProcessManager.emit("monitor:match", workspaceId, {
+        processId: "proc-1",
+        taskId: "bash:proc-1",
+        workspaceId,
+        filter: "FAILED",
+        filterExclude: false,
+        lines: ["FAILED started"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+      });
+
+      await waitForCondition(() => sendSpy.mock.calls.length === 1);
+      const wakeStore = (
+        workspaceService as unknown as {
+          bashMonitorWakeStore: { listPending: (id: string) => Promise<unknown[]> };
+        }
+      ).bashMonitorWakeStore;
+      await waitForCondition(async () => (await wakeStore.listPending(workspaceId)).length === 0);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("canceled queued monitor wakes supersede only the canceled snapshot", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-canceled-owner";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      const backgroundProcessManager = Object.assign(new EventEmitter(), {
+        cleanup: mock(() => Promise.resolve()),
+      }) as unknown as BackgroundProcessManager & EventEmitter;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => true) }),
+      });
+      let queueHasPendingMonitorWake = false;
+      spyOn(workspaceService, "isBusyForMessage").mockReturnValue(true);
+      spyOn(workspaceService, "hasQueuedMessages").mockImplementation(
+        () => queueHasPendingMonitorWake
+      );
+      spyOn(workspaceService, "hasPendingQueuedOrPreparingTurn").mockImplementation(
+        () => queueHasPendingMonitorWake
+      );
+      spyOn(workspaceService, "waitForIdleAndNoQueuedMessages").mockImplementation(
+        () => new Promise(() => undefined)
+      );
+      type SendInternal = NonNullable<Parameters<WorkspaceService["sendMessage"]>[3]>;
+      let onCanceled: SendInternal["onCanceled"] | undefined;
+      const sendSpy = spyOn(workspaceService, "sendMessage").mockImplementation(
+        (...args: Parameters<WorkspaceService["sendMessage"]>) => {
+          onCanceled = args[3]?.onCanceled;
+          queueHasPendingMonitorWake = true;
+          return Promise.resolve(Ok(undefined));
+        }
+      );
+
+      backgroundProcessManager.emit("monitor:match", workspaceId, {
+        processId: "proc-1",
+        taskId: "bash:proc-1",
+        workspaceId,
+        filter: "FAILED",
+        filterExclude: false,
+        lines: ["FAILED first"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+      });
+      await waitForCondition(() => sendSpy.mock.calls.length === 1);
+      backgroundProcessManager.emit("monitor:match", workspaceId, {
+        processId: "proc-1",
+        taskId: "bash:proc-1",
+        workspaceId,
+        filter: "FAILED",
+        filterExclude: false,
+        lines: ["FAILED second"],
+        totalMatches: 2,
+        timestamp: Date.now(),
+      });
+      await drainPendingDispatches();
+      expect(sendSpy).toHaveBeenCalledTimes(1);
+
+      if (onCanceled == null) throw new Error("Expected monitor wake onCanceled callback");
+      await onCanceled("cleared by user");
+
+      const wakeStore = (
+        workspaceService as unknown as {
+          bashMonitorWakeStore: {
+            listPending: (id: string) => Promise<Array<{ lines: string[]; status: string }>>;
+          };
+        }
+      ).bashMonitorWakeStore;
+      const pending = await wakeStore.listPending(workspaceId);
+      expect(pending).toHaveLength(1);
+      expect(pending[0].lines).toEqual(["FAILED second"]);
+      expect(pending[0].status).toBe("pending");
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("does not requeue a canceled monitor wake while supersession is still writing", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-cancel-race-owner";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      const backgroundProcessManager = Object.assign(new EventEmitter(), {
+        cleanup: mock(() => Promise.resolve()),
+      }) as unknown as BackgroundProcessManager & EventEmitter;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => true) }),
+      });
+      let queueHasPendingMonitorWake = false;
+      spyOn(workspaceService, "isBusyForMessage").mockReturnValue(true);
+      spyOn(workspaceService, "hasPendingQueuedOrPreparingTurn").mockImplementation(
+        () => queueHasPendingMonitorWake
+      );
+      const idleDeferred = createDeferred<void>();
+      spyOn(workspaceService, "waitForIdleAndNoQueuedMessages").mockImplementation(
+        () => idleDeferred.promise
+      );
+      type SendInternal = NonNullable<Parameters<WorkspaceService["sendMessage"]>[3]>;
+      let onCanceled: SendInternal["onCanceled"] | undefined;
+      const sendSpy = spyOn(workspaceService, "sendMessage").mockImplementation(
+        (...args: Parameters<WorkspaceService["sendMessage"]>) => {
+          onCanceled = args[3]?.onCanceled;
+          queueHasPendingMonitorWake = true;
+          return Promise.resolve(Ok(undefined));
+        }
+      );
+
+      backgroundProcessManager.emit("monitor:match", workspaceId, {
+        processId: "proc-1",
+        taskId: "bash:proc-1",
+        workspaceId,
+        filter: "FAILED",
+        filterExclude: false,
+        lines: ["FAILED first"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+      });
+      await waitForCondition(() => sendSpy.mock.calls.length === 1);
+
+      backgroundProcessManager.emit("monitor:match", workspaceId, {
+        processId: "proc-1",
+        taskId: "bash:proc-1",
+        workspaceId,
+        filter: "FAILED",
+        filterExclude: false,
+        lines: ["FAILED second"],
+        totalMatches: 2,
+        timestamp: Date.now(),
+      });
+      await drainPendingDispatches();
+
+      const wakeStore = (
+        workspaceService as unknown as {
+          bashMonitorWakeStore: {
+            markSupersededSnapshot: (...args: unknown[]) => Promise<boolean>;
+            listPending: (id: string) => Promise<Array<{ lines: string[] }>>;
+          };
+        }
+      ).bashMonitorWakeStore;
+      const originalMarkSuperseded = wakeStore.markSupersededSnapshot.bind(wakeStore);
+      const supersedeStarted = createDeferred<void>();
+      const releaseSupersede = createDeferred<void>();
+      spyOn(wakeStore, "markSupersededSnapshot").mockImplementation(async (...args: unknown[]) => {
+        supersedeStarted.resolve();
+        await releaseSupersede.promise;
+        return originalMarkSuperseded(...args);
+      });
+
+      if (onCanceled == null) throw new Error("Expected monitor wake onCanceled callback");
+      const cancelPromise = onCanceled("cleared by user");
+      await supersedeStarted.promise;
+      queueHasPendingMonitorWake = false;
+      idleDeferred.resolve();
+
+      await drainPendingDispatches();
+      expect(sendSpy).toHaveBeenCalledTimes(1);
+
+      releaseSupersede.resolve();
+      await cancelPromise;
+      const pending = await wakeStore.listPending(workspaceId);
+      expect(pending).toHaveLength(1);
+      expect(pending[0].lines).toEqual(["FAILED second"]);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("does not send monitor wakes when the owner workspace is missing", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const backgroundProcessManager = Object.assign(new EventEmitter(), {
+        cleanup: mock(() => Promise.resolve()),
+      }) as unknown as BackgroundProcessManager & EventEmitter;
+      const workspaceService = createWorkspaceServiceForTest({ config, backgroundProcessManager });
+      const sendSpy = spyOn(workspaceService, "sendMessage").mockResolvedValue(Ok(undefined));
+
+      backgroundProcessManager.emit("monitor:match", "missing-owner", {
+        processId: "proc-1",
+        taskId: "bash:proc-1",
+        workspaceId: "missing-owner",
+        filter: "FAILED",
+        filterExclude: false,
+        lines: ["FAILED one"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+      });
+
+      await drainPendingDispatches();
+      expect(sendSpy).not.toHaveBeenCalled();
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("drains monitor wakes after stream errors", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-error-owner";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      const backgroundProcessManager = Object.assign(new EventEmitter(), {
+        cleanup: mock(() => Promise.resolve()),
+      }) as unknown as BackgroundProcessManager & EventEmitter;
+      let streaming = true;
+      const aiService = Object.assign(new EventEmitter(), {
+        isStreaming: mock(() => streaming),
+      }) as unknown as AIService & EventEmitter;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService,
+      });
+      const sendSpy = spyOn(workspaceService, "sendMessage").mockResolvedValue(Ok(undefined));
+
+      backgroundProcessManager.emit("monitor:match", workspaceId, {
+        processId: "proc-1",
+        taskId: "bash:proc-1",
+        workspaceId,
+        filter: "FAILED",
+        filterExclude: false,
+        lines: ["FAILED one"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+      });
+      await drainPendingDispatches();
+      expect(sendSpy).not.toHaveBeenCalled();
+
+      streaming = false;
+      aiService.emit("error", { workspaceId, error: "provider failed" });
+
+      await waitForCondition(() => sendSpy.mock.calls.length === 1);
+      expect(sendSpy.mock.calls[0][1]).toContain("FAILED one");
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("does not spin idle waiters when only aiService reports an owner stream", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-busy-owner";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      const backgroundProcessManager = Object.assign(new EventEmitter(), {
+        cleanup: mock(() => Promise.resolve()),
+      }) as unknown as BackgroundProcessManager & EventEmitter;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => true) }),
+      });
+      const waitForIdleSpy = spyOn(
+        workspaceService,
+        "waitForIdleAndNoQueuedMessages"
+      ).mockImplementation(() => new Promise(() => undefined));
+
+      backgroundProcessManager.emit("monitor:match", workspaceId, {
+        processId: "proc-1",
+        taskId: "bash:proc-1",
+        workspaceId,
+        filter: "FAILED",
+        filterExclude: false,
+        lines: ["FAILED one"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+      });
+      await drainPendingDispatches();
+      expect(waitForIdleSpy).not.toHaveBeenCalled();
+
+      backgroundProcessManager.emit("monitor:match", workspaceId, {
+        processId: "proc-1",
+        taskId: "bash:proc-1",
+        workspaceId,
+        filter: "FAILED",
+        filterExclude: false,
+        lines: ["FAILED two"],
+        totalMatches: 2,
+        timestamp: Date.now(),
+      });
+
+      await drainPendingDispatches();
+      expect(waitForIdleSpy).not.toHaveBeenCalled();
+    } finally {
+      await cleanup();
+    }
+  });
+});
+
 describe("WorkspaceService workflow activity", () => {
   test("caches active workflow run counts and updates emitted activity from status events", async () => {
     const { config, historyService, cleanup } = await createTestHistoryService();
@@ -248,16 +1097,16 @@ describe("WorkspaceService workflow activity", () => {
       await runStore.createRun({
         id: "wfr_active",
         workspaceId,
-        definition,
-        definitionSource: "export default function workflow() { return {}; }",
+        workflow: definition,
+        source: "export default function workflow() { return {}; }",
         args: {},
         now: "2026-06-17T00:00:00.000Z",
       });
       await runStore.createRun({
         id: "wfr_nested",
         workspaceId,
-        definition,
-        definitionSource: "export default function workflow() { return {}; }",
+        workflow: definition,
+        source: "export default function workflow() { return {}; }",
         args: {},
         parentWorkflow: { runId: "wfr_active", stepId: "child", inputHash: "hash", depth: 0 },
         now: "2026-06-17T00:00:01.000Z",
@@ -476,7 +1325,7 @@ describe("WorkspaceService workflow invocation events", () => {
         const persisted = await workspaceService.appendWorkflowRunInvocation({
           workspaceId,
           rawCommand: "/demo investigate live events",
-          name: "demo",
+          scriptPath: "./workflows/demo.js",
           args: { input: "investigate live events" },
           runId: "wfr_live_events",
           status: "running",
@@ -543,7 +1392,7 @@ describe("WorkspaceService workflow invocation events", () => {
             toolCallId: "workflow-call-1",
             toolName: "workflow_run",
             state: "output-available",
-            input: { name: "demo", args: {}, run_in_background: true },
+            input: { script_path: "./workflows/demo.js", args: {}, run_in_background: true },
             output: { status: "running", runId, result: null },
           },
         ])
@@ -608,7 +1457,7 @@ describe("WorkspaceService workflow invocation events", () => {
             toolCallId: "workflow-call-1",
             toolName: "workflow_run",
             state: "output-available",
-            input: { name: "demo", args: {}, run_in_background: true },
+            input: { script_path: "./workflows/demo.js", args: {}, run_in_background: true },
             output: { status: "running", runId, result: null },
           },
         ])
@@ -698,7 +1547,7 @@ describe("WorkspaceService workflow invocation events", () => {
             toolCallId: "workflow-call-1",
             toolName: "workflow_run",
             state: "output-available",
-            input: { name: "demo", args: {}, run_in_background: true },
+            input: { script_path: "./workflows/demo.js", args: {}, run_in_background: true },
             output: { status: "running", runId, result: null },
           },
         ])
@@ -767,7 +1616,7 @@ describe("WorkspaceService workflow invocation events", () => {
             toolCallId: "workflow-call-1",
             toolName: "workflow_run",
             state: "output-available",
-            input: { name: "demo", args: {}, run_in_background: true },
+            input: { script_path: "./workflows/demo.js", args: {}, run_in_background: true },
             output: { status: "running", runId, result: null },
           },
         ])
@@ -824,7 +1673,7 @@ describe("WorkspaceService workflow invocation events", () => {
       const persisted = await workspaceService.appendWorkflowRunInvocation({
         workspaceId,
         rawCommand: "/demo currentness boundary",
-        name: "demo",
+        scriptPath: "./workflows/demo.js",
         args: { input: "currentness boundary" },
         runId,
         status: "running",
@@ -882,7 +1731,7 @@ describe("WorkspaceService workflow invocation events", () => {
             toolCallId: "workflow-call-1",
             toolName: "workflow_run",
             state: "output-available",
-            input: { name: "demo", args: {}, run_in_background: true },
+            input: { script_path: "./workflows/demo.js", args: {}, run_in_background: true },
             output: { status: "running", runId, result: null },
           },
         ])
@@ -940,7 +1789,7 @@ describe("WorkspaceService workflow invocation events", () => {
             toolCallId: "workflow-call-1",
             toolName: "workflow_run",
             state: "output-available",
-            input: { name: "demo", args: {}, run_in_background: true },
+            input: { script_path: "./workflows/demo.js", args: {}, run_in_background: true },
             output: { status: "running", runId, result: null },
           },
         ])
@@ -1048,7 +1897,7 @@ describe("WorkspaceService workflow invocation events", () => {
             toolCallId: "workflow-call-1",
             toolName: "workflow_run",
             state: "output-available",
-            input: { name: "demo", args: {}, run_in_background: true },
+            input: { script_path: "./workflows/demo.js", args: {}, run_in_background: true },
             output: { status: "running", runId, result: null },
           },
         ])
@@ -1105,6 +1954,68 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
     workspaceService.setWorkspaceGoalService(goalService);
     return { aiService, config, historyService, workspaceService, goalService, cleanup };
   }
+
+  test("idle wait follows auto-retry startup into the resumed stream", async () => {
+    const { workspaceService, cleanup } = await createServices();
+    const workspaceId = "idle-wait-auto-retry-starting";
+    const chatEvents = new EventEmitter();
+    let busy = false;
+    let pendingAutoRetry = true;
+    const idleWaiters: Array<() => void> = [];
+    const waitForIdle = mock(() => {
+      if (!busy) {
+        return Promise.resolve();
+      }
+      return new Promise<void>((resolve) => {
+        idleWaiters.push(resolve);
+      });
+    });
+    interface WaitSessionEvent {
+      message: { type: string };
+    }
+    const session = {
+      isBusy: mock(() => busy),
+      hasQueuedMessages: mock(() => false),
+      hasPendingAutoRetry: mock(() => pendingAutoRetry),
+      waitForIdle,
+      onChatEvent: mock((listener: (event: WaitSessionEvent) => void) => {
+        chatEvents.on("chat-event", listener);
+        return () => chatEvents.off("chat-event", listener);
+      }),
+    } as unknown as AgentSession;
+    const internalWorkspaceService = workspaceService as unknown as {
+      sessions: Map<string, AgentSession>;
+    };
+
+    try {
+      internalWorkspaceService.sessions.set(workspaceId, session);
+      let resolved = false;
+      const waitPromise = workspaceService.waitForIdleAndNoQueuedMessages(workspaceId).then(() => {
+        resolved = true;
+      });
+      await Promise.resolve();
+
+      chatEvents.emit("chat-event", { message: { type: "auto-retry-starting" } });
+      await Promise.resolve();
+      expect(resolved).toBe(false);
+
+      busy = true;
+      chatEvents.emit("chat-event", { message: { type: "stream-lifecycle" } });
+      await waitForCondition(() => idleWaiters.length === 1);
+      expect(resolved).toBe(false);
+
+      busy = false;
+      pendingAutoRetry = false;
+      idleWaiters.splice(0).forEach((resolve) => resolve());
+      await waitPromise;
+
+      expect(resolved).toBe(true);
+      expect(waitForIdle).toHaveBeenCalledTimes(1);
+    } finally {
+      internalWorkspaceService.sessions.delete(workspaceId);
+      await cleanup();
+    }
+  });
 
   test("full chat clear preserves the goal and requires user acknowledgment", async () => {
     const { config, historyService, workspaceService, goalService, cleanup } =
@@ -1619,6 +2530,99 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
 
       const persisted = await goalService.getGoal(workspaceId);
       expect(persisted?.objective).toBe("Original objective");
+    } finally {
+      await cleanup();
+    }
+  });
+
+  // A goal set mid-stream is held as optimistic state until stream-end
+  // persistence, so goal.json keeps the pre-stream goal. Non-goal activity
+  // emits (status_set/todo_write/recency) read that persisted goal and, before
+  // this overlay, replaced the activity snapshot with the stale goal — the Goal
+  // tab flickered back to the old goal until the next goal read. The overlay
+  // keeps the optimistic goal visible, and clears once the goal service drops
+  // the pending mutation (abort / stream-end).
+  test("mid-stream activity emits surface the optimistic goal, then revert on user abort", async () => {
+    const aiEmitter = new EventEmitter();
+    const aiService = Object.assign(aiEmitter, {
+      isStreaming: mock(() => false),
+    }) as unknown as AIService;
+    const { config, workspaceService, goalService, cleanup } = await createServices(aiService);
+    const workspaceId = "midstream-goal-overlay";
+    try {
+      await config.addWorkspace("/tmp/midstream-goal-overlay-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath: "/tmp/midstream-goal-overlay-project",
+        runtimeConfig: { type: "local" },
+      });
+
+      const created = await setWorkspaceGoalOk(goalService, {
+        workspaceId,
+        objective: "Pre-stream goal",
+      });
+
+      // Queue a goal set mid-stream (publishes an optimistic, pendingPersistence
+      // snapshot without persisting goal.json).
+      const goalServiceAccess = goalService as unknown as {
+        isWorkspaceStreaming: (workspaceId: string) => Promise<boolean>;
+      };
+      const isStreamingOriginal = goalServiceAccess.isWorkspaceStreaming;
+      goalServiceAccess.isWorkspaceStreaming = () => Promise.resolve(true);
+      try {
+        const queued = await goalService.setGoal({
+          workspaceId,
+          objective: "Optimistic mid-stream goal",
+          expectedGoalId: created.goalId,
+        });
+        expect(queued.success).toBe(true);
+      } finally {
+        goalServiceAccess.isWorkspaceStreaming = isStreamingOriginal;
+      }
+
+      // The durable goal.json still holds the pre-stream goal.
+      expect((await goalService.getGoal(workspaceId))?.objective).toBe("Pre-stream goal");
+
+      const activityEvents: Array<{
+        workspaceId: string;
+        activity: WorkspaceActivitySnapshot | null;
+      }> = [];
+      const listener = (event: {
+        workspaceId: string;
+        activity: WorkspaceActivitySnapshot | null;
+      }) => activityEvents.push(event);
+      workspaceService.on("activity", listener);
+      try {
+        // A non-goal activity emit reads persisted metadata (still the pre-stream
+        // goal) but must surface the optimistic goal so the Goal tab is stable.
+        await workspaceService.updateAgentStatus(workspaceId, { emoji: "🛠️", message: "Working" });
+        expect(activityEvents.at(-1)?.activity?.goal).toMatchObject({
+          objective: "Optimistic mid-stream goal",
+          pendingPersistence: true,
+        });
+
+        // The bootstrap path (renderer reconnect/reload) builds straight from
+        // persisted metadata, so it must apply the same overlay.
+        const listed = await workspaceService.getActivityList();
+        expect(listed[workspaceId]?.goal).toMatchObject({
+          objective: "Optimistic mid-stream goal",
+          pendingPersistence: true,
+        });
+
+        // User aborts: the goal service drops the queued mutation and reverts the
+        // panel to the persisted goal. Subsequent activity emits must show that
+        // reverted goal, not the discarded optimistic one.
+        await goalService.recordUserStoppedStream(workspaceId);
+        await workspaceService.updateAgentStatus(workspaceId, { emoji: "💤", message: "Idle" });
+        expect(activityEvents.at(-1)?.activity?.goal).toMatchObject({
+          goalId: created.goalId,
+          objective: "Pre-stream goal",
+        });
+        expect(activityEvents.at(-1)?.activity?.goal?.pendingPersistence).toBeUndefined();
+      } finally {
+        workspaceService.off("activity", listener);
+      }
     } finally {
       await cleanup();
     }

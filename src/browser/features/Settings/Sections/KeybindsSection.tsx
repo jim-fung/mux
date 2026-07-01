@@ -17,6 +17,7 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   SAVE_EDIT: "Save edit",
   INTERRUPT_STREAM_VIM: "Interrupt stream (Vim mode)",
   INTERRUPT_STREAM_NORMAL: "Interrupt stream",
+  RESUME_STREAM: "Continue interrupted stream",
   FOCUS_INPUT_I: "Focus input (i)",
   FOCUS_INPUT_A: "Focus input (a)",
   NEW_WORKSPACE: "New workspace",
@@ -33,8 +34,6 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   OPEN_IN_EDITOR: "Open in editor",
   CONFIGURE_MCP: "Configure MCP servers",
   CONFIGURE_HEARTBEAT: "Configure heartbeat",
-  CONFIGURE_SCHEDULED_WORKFLOW: "Configure workspace automations",
-  CONFIGURE_PROJECT_AUTOMATIONS: "Configure project automations",
   OPEN_COMMAND_PALETTE: "Command palette",
   OPEN_COMMAND_PALETTE_ACTIONS: "Command palette (alternate)",
   TOGGLE_THINKING: "Toggle thinking",
@@ -103,8 +102,6 @@ const KEYBIND_GROUPS: Array<{ label: string; keys: Array<keyof typeof KEYBINDS> 
       "INCREASE_THINKING",
       "TOGGLE_NOTIFICATIONS",
       "CONFIGURE_MCP",
-      "CONFIGURE_SCHEDULED_WORKFLOW",
-      "CONFIGURE_PROJECT_AUTOMATIONS",
       "CONFIGURE_HEARTBEAT",
     ],
   },
@@ -121,6 +118,7 @@ const KEYBIND_GROUPS: Array<{ label: string; keys: Array<keyof typeof KEYBINDS> 
       "CANCEL",
       "INTERRUPT_STREAM_NORMAL",
       "INTERRUPT_STREAM_VIM",
+      "RESUME_STREAM",
       "TOGGLE_VOICE_INPUT",
     ],
   },
@@ -200,7 +198,6 @@ const KEYBIND_DISPLAY_ALTERNATES: Partial<
 };
 
 export function KeybindsSection() {
-  const dynamicWorkflowsEnabled = useExperimentValue(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS);
   const workspaceHeartbeatsEnabled = useExperimentValue(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS);
   const visibleKeybindGroups = KEYBIND_GROUPS.map((group) => ({
     ...group,
@@ -208,9 +205,7 @@ export function KeybindsSection() {
     keys: group.keys.filter(
       (key) =>
         !isKeybindDeprecated(KEYBINDS[key]) &&
-        (key !== "CONFIGURE_HEARTBEAT" || workspaceHeartbeatsEnabled) &&
-        (key !== "CONFIGURE_SCHEDULED_WORKFLOW" || dynamicWorkflowsEnabled) &&
-        (key !== "CONFIGURE_PROJECT_AUTOMATIONS" || dynamicWorkflowsEnabled)
+        (key !== "CONFIGURE_HEARTBEAT" || workspaceHeartbeatsEnabled)
     ),
   })).filter((group) => group.keys.length > 0);
 

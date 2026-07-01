@@ -4,13 +4,11 @@ description: Create a plan before coding
 ui:
   color: var(--color-plan-mode)
 subagent:
-  # Plan must not run as a sub-agent. Plan's whole job is to produce a plan for
-  # the user to review; nothing downstream consumes a plan sub-agent's report,
-  # and the auto-handoff that used to exist was removed. Allowing it would also
-  # invite the planner to spam file_edit_* calls that the runtime would reject
-  # in validatePlanModeAccess (src/node/services/tools/fileCommon.ts) but that
-  # still burn tokens and erode the "plan never touches code" guarantee.
+  # Plan must not run as a normal sub-agent. Workflow-owned plan steps are allowed
+  # to consume the proposed plan file as explicit step output; normal task callers
+  # still need an execution-capable agent that can report implementation results.
   runnable: false
+  workflow_runnable: true
 tools:
   add:
     # Allow all tools by default (includes MCP tools which have dynamic names)
@@ -21,6 +19,8 @@ tools:
     - image_.*
     # Plan should not apply sub-agent patches.
     - task_apply_git_patch
+    # Plan should not perform destructive workspace cleanup.
+    - task_workspace_lifecycle
     # Global config and catalog tools stay out of general-purpose agents
     - mux_agents_.*
     - agent_skill_write

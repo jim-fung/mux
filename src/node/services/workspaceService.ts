@@ -90,6 +90,14 @@ import { isWorktreeRuntime } from "@/node/runtime/worktreeLifecycleHooks";
 import { expandTilde, expandTildeForSSH } from "@/node/runtime/tildeExpansion";
 import { removeManagedGitWorktree } from "@/node/worktree/removeManagedGitWorktree";
 
+import {
+  copyStagedWorkspaceAttachments,
+  extractStagedAttachmentPathsFromText,
+  readStagedWorkspaceAttachment,
+  stageWorkspaceAttachment,
+  type DownloadedStagedWorkspaceAttachment,
+  type StagedWorkspaceAttachment,
+} from "@/node/utils/attachments/stageWorkspaceAttachment";
 import { ContainerManager } from "@/node/multiProject/containerManager";
 
 import type { PostCompactionExclusions } from "@/common/types/attachment";
@@ -111,7 +119,6 @@ import type {
   ProjectRef,
   WorkspaceActivitySnapshot,
   WorkspaceMetadata,
-  WorkspaceWorkflowSchedule,
 } from "@/common/types/workspace";
 import { isDynamicToolPart } from "@/common/types/toolParts";
 import { buildAskUserQuestionSummary } from "@/common/utils/tools/askUserQuestionSummary";
@@ -172,12 +179,6 @@ import {
   HEARTBEAT_RESET_BOUNDARY_MESSAGE,
   type HeartbeatContextMode,
 } from "@/constants/heartbeat";
-import {
-  WORKFLOW_SCHEDULE_CONTEXT_PREPARATION_TIMEOUT_MS,
-  WORKFLOW_SCHEDULE_DEFAULT_CONTEXT_MODE,
-  type WorkflowScheduleContextMode,
-} from "@/constants/workflowSchedule";
-import { getWorkflowScheduleNewWorkspaceTargetUnavailableReason } from "@/common/utils/workflowScheduleTarget";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import {
   GOAL_BUDGET_LIMIT_KIND,
@@ -208,7 +209,15 @@ import type {
   GoalContinuationRuntimeState,
   WorkspaceGoalService,
 } from "@/node/services/workspaceGoalService";
-import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
+import type {
+  BackgroundProcessManager,
+  MonitorMatchPayload,
+} from "@/node/services/backgroundProcessManager";
+import {
+  BashMonitorWakeStore,
+  buildBashMonitorWakePrompt,
+  type BashMonitorWakeRecord,
+} from "@/node/services/bashMonitorWakeStore";
 import type { WorkspaceLifecycleHooks } from "@/node/services/workspaceLifecycleHooks";
 import type { TaskService } from "@/node/services/taskService";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
@@ -867,20 +876,6 @@ function isCompactedSummaryMessage(message: MuxMessage): boolean {
   return isDurableCompactedMarker(message.metadata?.compacted);
 }
 
-function getLatestCompactionBoundaryEpoch(messages: MuxMessage[]): number {
-  let latestEpoch = 0;
-  for (const message of messages) {
-    if (
-      isDurableCompactedMarker(message.metadata?.compacted) &&
-      message.metadata?.compactionBoundary === true &&
-      isPositiveInteger(message.metadata.compactionEpoch)
-    ) {
-      latestEpoch = Math.max(latestEpoch, message.metadata.compactionEpoch);
-    }
-  }
-  return latestEpoch;
-}
-
 function getNextCompactionEpochForAppendBoundary(
   workspaceId: string,
   messages: MuxMessage[]
@@ -1078,6 +1073,23 @@ function rollUpAncestorWorkspaceIds(params: {
     params.newParentWorkspaceId,
     ...filtered.filter((id) => id !== params.newParentWorkspaceId),
   ];
+}
+
+async function collectReferencedStagedAttachmentPaths(sessionDir: string): Promise<string[]> {
+  const paths = new Set<string>();
+  for (const fileName of [CHAT_ARCHIVE_FILE_NAME, CHAT_FILE_NAME, "partial.json"] as const) {
+    try {
+      const content = await fsPromises.readFile(path.join(sessionDir, fileName), "utf8");
+      for (const stagedPath of extractStagedAttachmentPathsFromText(content)) {
+        paths.add(stagedPath);
+      }
+    } catch (error) {
+      if (!isErrnoWithCode(error, "ENOENT")) {
+        throw error;
+      }
+    }
+  }
+  return [...paths];
 }
 
 async function archiveChildSessionArtifactsIntoParentSessionDir(params: {
@@ -1537,6 +1549,18 @@ export class WorkspaceService extends EventEmitter {
     { chat: () => void; metadata: () => void }
   >();
 
+  private readonly bashMonitorWakeStore: BashMonitorWakeStore;
+  private readonly pendingBashMonitorWakeDrainsByOwner = new Map<string, Promise<void>>();
+  private readonly pendingBashMonitorWakeIdleWaitsByOwner = new Map<string, Promise<void>>();
+  private readonly cancelingBashMonitorWakeKeys = new Set<string>();
+  private readonly pendingBashMonitorWakeDrains = new Set<Promise<void>>();
+  private readonly bashMonitorMatchListener = (
+    _workspaceId: string,
+    payload: MonitorMatchPayload
+  ) => {
+    void this.handleBashMonitorMatch(payload);
+  };
+
   // Lazily bootstrapped workflow activity cache so sidebar refreshes don't rescan run history.
   private readonly activeWorkflowRunIdBootstrapsByWorkspace = new Map<
     string,
@@ -1618,12 +1642,285 @@ export class WorkspaceService extends EventEmitter {
     private readonly opResolver?: ExternalSecretResolver
   ) {
     super();
+    this.bashMonitorWakeStore = new BashMonitorWakeStore(config);
+    if (typeof this.backgroundProcessManager.on === "function") {
+      this.backgroundProcessManager.on("monitor:match", this.bashMonitorMatchListener);
+    }
+    void this.schedulePersistedBashMonitorWakeDrains();
     this.policyService = policyService;
     this.telemetryService = telemetryService;
     this.experimentsService = experimentsService;
     this.sessionTimingService = sessionTimingService;
     this.setupMetadataListeners();
     this.setupInitMetadataListeners();
+  }
+
+  private async schedulePersistedBashMonitorWakeDrains(): Promise<void> {
+    try {
+      const ownerWorkspaceIds = await this.bashMonitorWakeStore.listPendingOwnerWorkspaceIds();
+      for (const ownerWorkspaceId of ownerWorkspaceIds) {
+        this.scheduleBashMonitorWakeDrain(ownerWorkspaceId);
+      }
+    } catch (error) {
+      log.debug("Failed to schedule persisted bash monitor wake drains", { error });
+    }
+  }
+
+  private async handleBashMonitorMatch(payload: MonitorMatchPayload): Promise<void> {
+    try {
+      await this.bashMonitorWakeStore.enqueueOrMergePending(payload);
+      this.scheduleBashMonitorWakeDrain(payload.workspaceId);
+    } catch (error) {
+      log.error("Failed to enqueue bash monitor wake", { workspaceId: payload.workspaceId, error });
+    }
+  }
+
+  private scheduleBashMonitorWakeDrain(ownerWorkspaceId: string): void {
+    assert(ownerWorkspaceId.trim().length > 0, "scheduleBashMonitorWakeDrain requires workspaceId");
+    const previous = this.pendingBashMonitorWakeDrainsByOwner.get(ownerWorkspaceId);
+    const promise = (previous ?? Promise.resolve())
+      .catch(() => undefined)
+      .then(() => this.drainBashMonitorWakes(ownerWorkspaceId))
+      .catch((error: unknown) => {
+        log.error("Bash monitor wake drain failed", { ownerWorkspaceId, error });
+      })
+      .finally(() => {
+        this.pendingBashMonitorWakeDrains.delete(promise);
+        if (this.pendingBashMonitorWakeDrainsByOwner.get(ownerWorkspaceId) === promise) {
+          this.pendingBashMonitorWakeDrainsByOwner.delete(ownerWorkspaceId);
+        }
+      });
+    this.pendingBashMonitorWakeDrainsByOwner.set(ownerWorkspaceId, promise);
+    this.pendingBashMonitorWakeDrains.add(promise);
+  }
+
+  private scheduleBashMonitorWakeDrainAfterIdle(ownerWorkspaceId: string): void {
+    if (this.pendingBashMonitorWakeIdleWaitsByOwner.has(ownerWorkspaceId)) {
+      return;
+    }
+
+    const promise = this.waitForIdleAndNoQueuedMessages(ownerWorkspaceId)
+      .catch((error: unknown) => {
+        log.debug("Bash monitor idle wait failed; retrying drain anyway", {
+          ownerWorkspaceId,
+          error,
+        });
+      })
+      .then(() => {
+        this.scheduleBashMonitorWakeDrain(ownerWorkspaceId);
+      })
+      .finally(() => {
+        this.pendingBashMonitorWakeDrains.delete(promise);
+        if (this.pendingBashMonitorWakeIdleWaitsByOwner.get(ownerWorkspaceId) === promise) {
+          this.pendingBashMonitorWakeIdleWaitsByOwner.delete(ownerWorkspaceId);
+        }
+      });
+    this.pendingBashMonitorWakeIdleWaitsByOwner.set(ownerWorkspaceId, promise);
+    this.pendingBashMonitorWakeDrains.add(promise);
+  }
+
+  private bashMonitorWakeKey(ownerWorkspaceId: string, wakeId: string): string {
+    assert(ownerWorkspaceId.trim().length > 0, "bashMonitorWakeKey requires ownerWorkspaceId");
+    assert(wakeId.trim().length > 0, "bashMonitorWakeKey requires wakeId");
+    return `${ownerWorkspaceId}:${wakeId}`;
+  }
+
+  private async drainBashMonitorWakes(ownerWorkspaceId: string): Promise<void> {
+    const pending = (await this.bashMonitorWakeStore.listPending(ownerWorkspaceId)).filter(
+      (record) =>
+        !this.cancelingBashMonitorWakeKeys.has(this.bashMonitorWakeKey(ownerWorkspaceId, record.id))
+    );
+    if (pending.length === 0) return;
+
+    const cfg = this.config.loadConfigOrDefault();
+    const entry = findWorkspaceEntry(cfg, ownerWorkspaceId);
+    if (entry == null) {
+      for (const record of pending) {
+        await this.bashMonitorWakeStore.markSuperseded(ownerWorkspaceId, record.id);
+      }
+      return;
+    }
+
+    const ownerHasPendingQueuedPreparingOrRetry =
+      this.hasPendingQueuedOrPreparingTurn(ownerWorkspaceId);
+    const ownerHasSessionBackedBusyState = this.isBusyForMessage(ownerWorkspaceId);
+    const ownerHasAiServiceStream = this.aiService.isStreaming(ownerWorkspaceId);
+    if (
+      ownerHasPendingQueuedPreparingOrRetry ||
+      (ownerHasSessionBackedBusyState && !ownerHasAiServiceStream)
+    ) {
+      this.scheduleBashMonitorWakeDrainAfterIdle(ownerWorkspaceId);
+      return;
+    }
+
+    if (ownerHasAiServiceStream && !ownerHasSessionBackedBusyState) {
+      return;
+    }
+
+    const sendOptions = this.getWorkflowContinuationSendOptions(ownerWorkspaceId);
+    if (sendOptions == null) {
+      log.debug("Bash monitor wake has no send options; leaving pending", { ownerWorkspaceId });
+      return;
+    }
+
+    const prompt = buildBashMonitorWakePrompt(pending);
+    const retryAfterIdleIfBusy = (reason: string): void => {
+      if (
+        this.isBusyForMessage(ownerWorkspaceId) ||
+        this.hasPendingQueuedOrPreparingTurn(ownerWorkspaceId)
+      ) {
+        this.scheduleBashMonitorWakeDrainAfterIdle(ownerWorkspaceId);
+        return;
+      }
+      log.debug("Bash monitor wake left pending without immediate retry", {
+        ownerWorkspaceId,
+        reason,
+      });
+    };
+    const markDeliveredAfterAccepted = async (
+      records: readonly BashMonitorWakeRecord[]
+    ): Promise<void> => {
+      let hasUndeliveredMergedMatches = false;
+      for (const record of records) {
+        const delivered = await this.bashMonitorWakeStore.markDeliveredSnapshot(
+          ownerWorkspaceId,
+          record
+        );
+        if (!delivered) {
+          hasUndeliveredMergedMatches = true;
+        }
+      }
+      if (hasUndeliveredMergedMatches) {
+        this.scheduleBashMonitorWakeDrainAfterIdle(ownerWorkspaceId);
+      }
+    };
+    const markSupersededAfterCanceled = async (
+      records: readonly BashMonitorWakeRecord[]
+    ): Promise<void> => {
+      let hasNewMergedMatches = false;
+      for (const record of records) {
+        const superseded = await this.bashMonitorWakeStore.markSupersededSnapshot(
+          ownerWorkspaceId,
+          record
+        );
+        if (!superseded) {
+          hasNewMergedMatches = true;
+        }
+      }
+      if (hasNewMergedMatches) {
+        this.scheduleBashMonitorWakeDrainAfterIdle(ownerWorkspaceId);
+      }
+    };
+
+    // `onAccepted` only proves the synthetic user turn reached history; keep
+    // the wake pending until the provider stream starts so startup failures can retry it.
+    let accepted = false;
+    let delivered = false;
+    let startupFailed = false;
+    let removeStreamStartListener: (() => void) | undefined;
+    const removeDeliveryListener = (): void => {
+      removeStreamStartListener?.();
+      removeStreamStartListener = undefined;
+    };
+    const isOwnerStreamStart = (data: unknown): data is { workspaceId: string } =>
+      typeof data === "object" &&
+      data !== null &&
+      "workspaceId" in data &&
+      data.workspaceId === ownerWorkspaceId;
+    const markDeliveredOnce = async (): Promise<void> => {
+      if (delivered) return;
+      delivered = true;
+      removeDeliveryListener();
+      try {
+        await markDeliveredAfterAccepted(pending);
+      } catch (error) {
+        log.error("Failed to mark bash monitor wake delivered after accepted send", {
+          ownerWorkspaceId,
+          error,
+        });
+      }
+    };
+    const armDeliveryAfterStreamStart = (): void => {
+      removeDeliveryListener();
+      const onStreamStart = (data: unknown): void => {
+        if (isOwnerStreamStart(data)) {
+          void markDeliveredOnce();
+        }
+      };
+      this.aiService.on("stream-start", onStreamStart);
+      removeStreamStartListener = () => this.aiService.off("stream-start", onStreamStart);
+    };
+
+    const sendResult = await this.sendMessage(
+      ownerWorkspaceId,
+      prompt,
+      { ...sendOptions, queueDispatchMode: "tool-end" },
+      {
+        skipAutoResumeReset: true,
+        synthetic: true,
+        agentInitiated: true,
+        onAccepted: () => {
+          accepted = true;
+          armDeliveryAfterStreamStart();
+        },
+        onAcceptedPreStreamFailure: (error) => {
+          startupFailed = true;
+          if (!accepted) {
+            removeDeliveryListener();
+          }
+          if (delivered) return;
+          log.debug("Bash monitor wake accepted send failed before stream start; leaving pending", {
+            ownerWorkspaceId,
+            error,
+          });
+          retryAfterIdleIfBusy("pre-stream failure");
+        },
+        onCanceled: async (reason) => {
+          removeDeliveryListener();
+          if (delivered) return;
+          const cancelingKeys = pending.map((record) =>
+            this.bashMonitorWakeKey(ownerWorkspaceId, record.id)
+          );
+          for (const key of cancelingKeys) {
+            this.cancelingBashMonitorWakeKeys.add(key);
+          }
+          log.debug("Bash monitor wake queue was canceled; superseding canceled snapshot", {
+            ownerWorkspaceId,
+            reason,
+          });
+          try {
+            await markSupersededAfterCanceled(pending);
+          } catch (error) {
+            log.error("Failed to supersede canceled bash monitor wake snapshot", {
+              ownerWorkspaceId,
+              error,
+            });
+          } finally {
+            for (const key of cancelingKeys) {
+              this.cancelingBashMonitorWakeKeys.delete(key);
+            }
+          }
+        },
+      }
+    );
+
+    if (!sendResult.success) {
+      if (!accepted) {
+        removeDeliveryListener();
+      }
+      if (!delivered) {
+        log.debug("Bash monitor wake-up not accepted; leaving pending", {
+          ownerWorkspaceId,
+          error: sendResult.error,
+        });
+        retryAfterIdleIfBusy("sendMessage rejected");
+      }
+      return;
+    }
+
+    if (accepted && !startupFailed) {
+      await markDeliveredOnce();
+    }
   }
 
   private readonly policyService?: PolicyService;
@@ -1893,12 +2190,14 @@ export class WorkspaceService extends EventEmitter {
     this.aiService.on("stream-end", (data: unknown) => {
       if (isStreamEndEvent(data)) {
         void this.handleStreamCompletion(data.workspaceId);
+        this.scheduleBashMonitorWakeDrain(data.workspaceId);
       }
     });
 
     this.aiService.on("stream-abort", (data: unknown) => {
       if (isStreamAbortEvent(data)) {
         void this.stopStreamingStatus(data.workspaceId);
+        this.scheduleBashMonitorWakeDrain(data.workspaceId);
         // Goal mutations are drained by AgentSession after any abort accounting
         // runs. Draining here would race ahead of AgentSession's stream-abort
         // listener and could charge the aborted in-flight stream to a goal that
@@ -1918,6 +2217,7 @@ export class WorkspaceService extends EventEmitter {
           });
         }
         void this.stopStreamingStatus(data.workspaceId);
+        this.scheduleBashMonitorWakeDrain(data.workspaceId);
         void this.workspaceGoalService?.applyPendingAfterStreamEnd(data.workspaceId);
       }
     });
@@ -2076,8 +2376,40 @@ export class WorkspaceService extends EventEmitter {
   ): void {
     this.emit("activity", {
       workspaceId,
-      activity: this.mergeCachedActiveWorkflowRunCount(workspaceId, snapshot),
+      activity: this.mergeCachedActiveWorkflowRunCount(
+        workspaceId,
+        this.overlayPendingGoal(workspaceId, snapshot)
+      ),
     });
+  }
+
+  /**
+   * Overlay the optimistic mid-stream goal onto an activity snapshot.
+   *
+   * A goal set while the agent is streaming is held as optimistic state in the
+   * goal service until stream-end persistence; goal.json keeps the pre-stream
+   * goal. Activity snapshots built from persisted metadata (status_set,
+   * todo_write, recency, streaming) therefore still carry the pre-stream goal,
+   * and emitting them as-is makes the Goal tab flicker back to the stale goal
+   * mid-stream until the next goal read re-emits the optimistic one. Overlaying
+   * the pending snapshot here keeps the displayed goal stable across those
+   * emits. Authoritative goal emits authored by the goal service are left
+   * untouched: transient goal pushes already carry the optimistic goal
+   * (`transientGoalOnly`), and abort reverts / durable persistence clear the
+   * pending snapshot before emitting, so they win naturally.
+   */
+  private overlayPendingGoal(
+    workspaceId: string,
+    snapshot: WorkspaceActivitySnapshot | null
+  ): WorkspaceActivitySnapshot | null {
+    if (!snapshot || snapshot.transientGoalOnly === true) {
+      return snapshot;
+    }
+    const pending = this.workspaceGoalService?.getPendingGoalSnapshot(workspaceId);
+    if (!pending) {
+      return snapshot;
+    }
+    return { ...snapshot, goal: pending };
   }
 
   private async emitWorkspaceActivityUpdate(
@@ -4190,140 +4522,6 @@ export class WorkspaceService extends EventEmitter {
     }
   }
 
-  private normalizeWorkflowScheduleForPersist(
-    schedule: Omit<WorkspaceWorkflowSchedule, "lastRunStartedAt">,
-    source: { sourceProjectPath: string; sourceWorkspace: Workspace }
-  ): Omit<WorkspaceWorkflowSchedule, "lastRunStartedAt"> {
-    const workflowName = schedule.workflowName.trim();
-    assert(workflowName.length > 0, "Workflow schedule requires a non-empty workflowName");
-
-    const contextMode = schedule.contextMode ?? WORKFLOW_SCHEDULE_DEFAULT_CONTEXT_MODE;
-    assert(
-      contextMode === "normal" || contextMode === "compact" || contextMode === "reset",
-      `Unsupported workflow schedule context mode: ${String(contextMode)}`
-    );
-
-    const target = schedule.target;
-    let normalizedTarget: WorkspaceWorkflowSchedule["target"] | undefined;
-    if (target?.type === "new-workspace") {
-      const unsupportedReason = getWorkflowScheduleNewWorkspaceTargetUnavailableReason({
-        sourceProjectPath: source.sourceProjectPath,
-        projects: source.sourceWorkspace.projects,
-        runtimeConfig: source.sourceWorkspace.runtimeConfig,
-      });
-      assert(
-        unsupportedReason == null,
-        unsupportedReason ?? "Unsupported workflow schedule target"
-      );
-      const trunkBranch = target.trunkBranch.trim();
-      assert(
-        trunkBranch.length > 0,
-        "New-workspace workflow schedules require a non-empty trunkBranch"
-      );
-      const branchName = target.branchName?.trim();
-      if (branchName) {
-        const branchNameValidation = validateWorkspaceName(branchName);
-        assert(
-          branchNameValidation.valid,
-          branchNameValidation.error ?? "Invalid scheduled workflow target branch name"
-        );
-      }
-      const title = target.title?.trim();
-      normalizedTarget = {
-        type: "new-workspace",
-        trunkBranch,
-        ...(branchName ? { branchName } : {}),
-        ...(title ? { title } : {}),
-      };
-    } else if (target?.type === "current-workspace") {
-      normalizedTarget = undefined;
-    } else {
-      assert(target == null, "Unsupported workflow schedule target");
-    }
-
-    return {
-      enabled: schedule.enabled,
-      workflowName,
-      ...(schedule.args != null ? { args: schedule.args } : {}),
-      intervalMs: schedule.intervalMs,
-      ...(contextMode !== WORKFLOW_SCHEDULE_DEFAULT_CONTEXT_MODE ? { contextMode } : {}),
-      ...(normalizedTarget != null ? { target: normalizedTarget } : {}),
-    };
-  }
-
-  /**
-   * Set (or clear, with null) the workspace's scheduled workflow run.
-   * Input shape/bounds are enforced at the oRPC schema boundary
-   * (WorkspaceWorkflowScheduleSchema); this persists and emits metadata.
-   * Setting a schedule resets lastRunStartedAt so the new schedule is
-   * immediately due (at-least-once bootstrap).
-   */
-  async setWorkflowSchedule(
-    workspaceId: string,
-    schedule: Omit<WorkspaceWorkflowSchedule, "lastRunStartedAt"> | null
-  ): Promise<Result<void, string>> {
-    try {
-      const normalizedWorkspaceId = workspaceId.trim();
-      assert(
-        normalizedWorkspaceId.length > 0,
-        "setWorkflowSchedule requires a non-empty workspaceId"
-      );
-
-      let applied = false;
-      await this.config.editConfig((config) => {
-        for (const [sourceProjectPath, projectConfig] of config.projects) {
-          const workspaceEntry = projectConfig.workspaces.find(
-            (entry) => entry.id === normalizedWorkspaceId
-          );
-          if (!workspaceEntry) {
-            continue;
-          }
-          if (schedule == null) {
-            delete workspaceEntry.workflowSchedule;
-          } else {
-            const conflictingProjectSchedule = Array.from(config.projects.entries()).find(
-              ([candidateProjectPath, candidateProject]) => {
-                const candidateOwnerPath =
-                  candidateProject.parentProjectPath ?? candidateProjectPath;
-                if (candidateOwnerPath !== sourceProjectPath) {
-                  return false;
-                }
-                return (candidateProject.workflowSchedules ?? []).some(
-                  (projectSchedule) =>
-                    projectSchedule.target.type === "existing-workspace" &&
-                    projectSchedule.target.workspaceId === normalizedWorkspaceId
-                );
-              }
-            );
-            assert(
-              conflictingProjectSchedule == null,
-              "Workspace already has a project automation"
-            );
-            workspaceEntry.workflowSchedule = this.normalizeWorkflowScheduleForPersist(schedule, {
-              sourceProjectPath,
-              sourceWorkspace: workspaceEntry,
-            });
-          }
-          applied = true;
-          break;
-        }
-        return config;
-      });
-      if (!applied) {
-        return Err("Workspace not found");
-      }
-
-      await this.emitCurrentWorkspaceMetadata(normalizedWorkspaceId);
-      return Ok(undefined);
-    } catch (error) {
-      return Err(`Failed to set workflow schedule: ${getErrorMessage(error)}`);
-    }
-  }
-
-  async emitCurrentWorkflowScheduleMetadata(workspaceId: string): Promise<void> {
-    await this.emitCurrentWorkspaceMetadata(workspaceId);
-  }
-
   /**
    * Read the per-workspace goal-defaults override.
    *
@@ -6415,6 +6613,14 @@ export class WorkspaceService extends EventEmitter {
         log
       );
 
+      // Create a fresh source runtime handle because DockerRuntime.forkWorkspace() can
+      // mutate the original runtime's container identity to target the new workspace.
+      const freshSourceRuntime = createRuntime(sourceRuntimeConfig, {
+        projectPath: foundProjectPath,
+        workspaceName: sourceMetadata.name,
+        workspacePath: sourceWorkspace?.workspacePath,
+      });
+
       const sourceSessionDir = this.config.getSessionDir(sourceWorkspaceId);
       const newSessionDir = this.config.getSessionDir(newWorkspaceId);
 
@@ -6468,6 +6674,35 @@ export class WorkspaceService extends EventEmitter {
           targetWorkspaceId: newWorkspaceId,
         });
 
+        const referencedStagedAttachmentPaths =
+          await collectReferencedStagedAttachmentPaths(newSessionDir);
+        if (referencedStagedAttachmentPaths.length > 0) {
+          const sourceWorkspacePath = resolveWorkspaceExecutionPath(
+            sourceMetadata,
+            freshSourceRuntime
+          );
+          const targetWorkspacePath = resolveWorkspaceExecutionPath(
+            {
+              ...sourceMetadata,
+              name: resolvedName,
+              namedWorkspacePath: workspacePath,
+              projectPath: foundProjectPath,
+              runtimeConfig: forkedRuntimeConfig,
+            },
+            targetRuntime
+          );
+          const copyStagedAttachmentsResult = await copyStagedWorkspaceAttachments({
+            sourceRuntime: freshSourceRuntime,
+            targetRuntime,
+            sourceWorkspacePath,
+            stagedPaths: referencedStagedAttachmentPaths,
+            targetWorkspacePath,
+          });
+          if (!copyStagedAttachmentsResult.success) {
+            throw new Error(copyStagedAttachmentsResult.error);
+          }
+        }
+
         // Forks inherit chat history, but their cost ledger must start fresh.
         // Persist an explicit empty usage file so later reads do not rebuild
         // historical costs from the copied messages.
@@ -6488,17 +6723,10 @@ export class WorkspaceService extends EventEmitter {
         }
         initLogger.logComplete(-1);
         const message = getErrorMessage(copyError);
-        return Err(`Failed to copy chat history: ${message}`);
+        return Err(`Failed to copy fork state: ${message}`);
       }
 
       // Copy plan file using explicit source/target runtimes for cross-runtime safety.
-      // Create a fresh source runtime handle because DockerRuntime.forkWorkspace() can
-      // mutate the original runtime's container identity to target the new workspace.
-      const freshSourceRuntime = createRuntime(sourceRuntimeConfig, {
-        projectPath: foundProjectPath,
-        workspaceName: sourceMetadata.name,
-        workspacePath: sourceWorkspace?.workspacePath,
-      });
       await copyPlanFileAcrossRuntimes(
         freshSourceRuntime,
         targetRuntime,
@@ -6604,7 +6832,7 @@ export class WorkspaceService extends EventEmitter {
   async appendWorkflowRunInvocation(input: {
     workspaceId: string;
     rawCommand: string;
-    name: string;
+    scriptPath: string;
     args: unknown;
     runId: string;
     status: string;
@@ -6614,12 +6842,12 @@ export class WorkspaceService extends EventEmitter {
   }): Promise<boolean> {
     assert(input.workspaceId.length > 0, "appendWorkflowRunInvocation requires workspaceId");
     assert(input.rawCommand.trim().length > 0, "appendWorkflowRunInvocation requires rawCommand");
-    assert(input.name.length > 0, "appendWorkflowRunInvocation requires workflow name");
+    assert(input.scriptPath.length > 0, "appendWorkflowRunInvocation requires workflow scriptPath");
     assert(input.runId.length > 0, "appendWorkflowRunInvocation requires runId");
 
     const now = Date.now();
     void this.updateRecencyTimestamp(input.workspaceId, now);
-    const commandPrefix = input.rawCommand.trim().split(/\s+/u)[0] ?? `/${input.name}`;
+    const commandPrefix = input.rawCommand.trim().split(/\s+/u)[0] ?? "/workflow";
     const userMessage = createMuxMessage(
       `workflow-run-command-${input.runId}`,
       "user",
@@ -6636,7 +6864,7 @@ export class WorkspaceService extends EventEmitter {
       }
     );
     const workflowMessage = buildWorkflowRunCardMessage(
-      { name: input.name, args: input.args },
+      { scriptPath: input.scriptPath, args: input.args },
       {
         runId: input.runId,
         status: input.status,
@@ -6733,6 +6961,46 @@ export class WorkspaceService extends EventEmitter {
     return foundDecision && current;
   }
 
+  async stageAttachment(input: {
+    workspaceId: string;
+    filename: string;
+    mediaType?: string | null;
+    sizeBytes: number;
+    dataBase64: string;
+  }): Promise<Result<StagedWorkspaceAttachment, string>> {
+    const metadata = await this.getInfo(input.workspaceId);
+    if (metadata == null) {
+      return Err("Workspace not found");
+    }
+
+    const { runtime, workspacePath } = createRuntimeContextForWorkspace(metadata);
+    return stageWorkspaceAttachment({
+      runtime,
+      workspacePath,
+      filename: input.filename,
+      mediaType: input.mediaType,
+      sizeBytes: input.sizeBytes,
+      dataBase64: input.dataBase64,
+    });
+  }
+
+  async downloadStagedAttachment(input: {
+    workspaceId: string;
+    stagedPath: string;
+  }): Promise<Result<DownloadedStagedWorkspaceAttachment, string>> {
+    const metadata = await this.getInfo(input.workspaceId);
+    if (metadata == null) {
+      return Err("Workspace not found");
+    }
+
+    const { runtime, workspacePath } = createRuntimeContextForWorkspace(metadata);
+    return readStagedWorkspaceAttachment({
+      runtime,
+      workspacePath,
+      stagedPath: input.stagedPath,
+    });
+  }
+
   async sendMessage(
     workspaceId: string,
     message: string,
@@ -6749,6 +7017,8 @@ export class WorkspaceService extends EventEmitter {
       goalKind?: GoalSyntheticMessageKind;
       /** Force Copilot billing classification to "agent" for internal sends. */
       agentInitiated?: boolean;
+      onAccepted?: () => Promise<void> | void;
+      onCanceled?: (reason: string) => Promise<void> | void;
       onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
       /** Return once the user message is accepted; stream startup continues asynchronously. */
       startStreamInBackground?: boolean;
@@ -6860,6 +7130,8 @@ export class WorkspaceService extends EventEmitter {
             synthetic: internal?.synthetic,
             agentInitiated: internal?.agentInitiated,
             goalKind: internal?.goalKind,
+            onCanceled: internal?.onCanceled,
+            onAccepted: internal?.onAccepted,
             onAcceptedPreStreamFailure: internal?.onAcceptedPreStreamFailure,
             startStreamInBackground: internal?.startStreamInBackground,
             goalContinuation: internal?.goalContinuation,
@@ -6913,6 +7185,9 @@ export class WorkspaceService extends EventEmitter {
         const effectiveQueueDispatchMode = session.queueMessage(message, normalizedOptions, {
           synthetic: internal?.synthetic,
           agentInitiated: internal?.agentInitiated,
+          onCanceled: internal?.onCanceled,
+          onAccepted: internal?.onAccepted,
+          onAcceptedPreStreamFailure: internal?.onAcceptedPreStreamFailure,
         });
 
         if (effectiveQueueDispatchMode != null && !internal?.skipAutoResumeReset) {
@@ -6977,6 +7252,8 @@ export class WorkspaceService extends EventEmitter {
         goalKind: internal?.goalKind,
         goalContinuation: internal?.goalContinuation,
         startStreamInBackground: internal?.startStreamInBackground,
+        onCanceled: internal?.onCanceled,
+        onAccepted: internal?.onAccepted,
         onAcceptedPreStreamFailure,
       });
       if (!result.success) {
@@ -7534,10 +7811,10 @@ export class WorkspaceService extends EventEmitter {
     }
   }
 
-  clearQueue(workspaceId: string): Result<void> {
+  clearQueue(workspaceId: string, options?: { cancelReason?: string }): Result<void> {
     try {
       const session = this.getOrCreateSession(workspaceId);
-      session.clearQueue();
+      session.clearQueue(options?.cancelReason);
       return Ok(undefined);
     } catch (error) {
       const errorMessage = getErrorMessage(error);
@@ -7546,9 +7823,69 @@ export class WorkspaceService extends EventEmitter {
     }
   }
 
+  isBusyForMessage(workspaceId: string): boolean {
+    return this.sessions.get(workspaceId.trim())?.isBusy() === true;
+  }
+
+  hasQueuedWorkspaceTurn(workspaceId: string, handleId: string): boolean {
+    return this.sessions.get(workspaceId.trim())?.hasQueuedWorkspaceTurn(handleId) ?? false;
+  }
+
+  hasQueuedMessages(workspaceId: string, dispatchMode?: "tool-end" | "turn-end"): boolean {
+    return this.sessions.get(workspaceId.trim())?.hasQueuedMessages(dispatchMode) ?? false;
+  }
+
   async waitForPendingStreamErrorRecoveryDecision(workspaceId: string): Promise<void> {
     const session = this.sessions.get(workspaceId.trim());
     await session?.waitForPendingStreamErrorRecoveryDecision();
+  }
+
+  async waitForIdle(workspaceId: string): Promise<void> {
+    const session = this.sessions.get(workspaceId.trim());
+    await session?.waitForIdle();
+  }
+
+  async waitForIdleAndNoQueuedMessages(workspaceId: string): Promise<void> {
+    const session = this.sessions.get(workspaceId.trim());
+    if (!session) {
+      return;
+    }
+
+    while (session.isBusy() || session.hasQueuedMessages() || session.hasPendingAutoRetry()) {
+      if (session.isBusy()) {
+        await session.waitForIdle();
+        continue;
+      }
+
+      await new Promise<void>((resolve) => {
+        let settled = false;
+        const finish = () => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          unsubscribe();
+          resolve();
+        };
+        const unsubscribe = session.onChatEvent((event) => {
+          const eventType = event.message.type;
+          const retryStartedOrTurnPhaseChanged =
+            eventType === "auto-retry-starting" ||
+            eventType === "auto-retry-scheduled" ||
+            eventType === "stream-lifecycle";
+          const queuedOrRetryCleared =
+            (eventType === "queued-message-changed" || eventType === "auto-retry-abandoned") &&
+            !session.hasQueuedMessages() &&
+            !session.hasPendingAutoRetry();
+          if (retryStartedOrTurnPhaseChanged || queuedOrRetryCleared) {
+            finish();
+          }
+        });
+        if (!session.hasQueuedMessages() && !session.hasPendingAutoRetry()) {
+          finish();
+        }
+      });
+    }
   }
 
   hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean {
@@ -7747,56 +8084,6 @@ export class WorkspaceService extends EventEmitter {
     }
   }
 
-  async prepareScheduledWorkflowContext(
-    workspaceId: string,
-    contextMode: WorkflowScheduleContextMode
-  ): Promise<Result<"normal" | "reset" | "noop" | "compact", string>> {
-    switch (contextMode) {
-      case "normal":
-        return Ok("normal");
-      case "reset":
-        return this.resetContext(workspaceId);
-      case "compact": {
-        const historyResult = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
-        if (!historyResult.success) {
-          return Err(`Failed to read active context before compaction: ${historyResult.error}`);
-        }
-
-        const activeContextMessages = sliceMessagesForProviderFromLatestContextBoundary(
-          historyResult.data
-        );
-        if (!hasProviderEligibleMessages(activeContextMessages)) {
-          return Ok("noop");
-        }
-
-        const previousCompactionEpoch = getLatestCompactionBoundaryEpoch(historyResult.data);
-
-        try {
-          await this.executeIdleCompaction(workspaceId);
-          await this.waitForWorkspaceIdle(workspaceId, {
-            signal: AbortSignal.timeout(WORKFLOW_SCHEDULE_CONTEXT_PREPARATION_TIMEOUT_MS),
-          });
-          const compactedHistoryResult =
-            await this.historyService.getHistoryFromLatestBoundary(workspaceId);
-          if (!compactedHistoryResult.success) {
-            return Err(`Failed to verify compaction boundary: ${compactedHistoryResult.error}`);
-          }
-          const nextCompactionEpoch = getLatestCompactionBoundaryEpoch(compactedHistoryResult.data);
-          if (nextCompactionEpoch <= previousCompactionEpoch) {
-            return Err("Compaction finished without writing a new context boundary");
-          }
-          return Ok("compact");
-        } catch (error) {
-          return Err(getErrorMessage(error));
-        }
-      }
-      default: {
-        const exhaustiveContextMode: never = contextMode;
-        return Err(`Unsupported workflow schedule context mode: ${String(exhaustiveContextMode)}`);
-      }
-    }
-  }
-
   async replaceHistory(
     workspaceId: string,
     summaryMessage: MuxMessage,
@@ -7960,7 +8247,16 @@ export class WorkspaceService extends EventEmitter {
             }
             return [
               workspaceId,
-              mergeActiveWorkflowRunCount(snapshot, activeWorkflowRunCount),
+              // Overlay the optimistic mid-stream goal here too: the renderer
+              // bootstraps via this list (the subscription does not replay
+              // historical snapshots), and `getAllSnapshots()` returns the
+              // still-pre-stream persisted goal. Without this, a reconnect/reload
+              // during a mid-stream goal set would seed the UI with the stale
+              // goal until the next live emit or goal read.
+              mergeActiveWorkflowRunCount(
+                this.overlayPendingGoal(workspaceId, snapshot),
+                activeWorkflowRunCount
+              ),
             ] as const;
           }
         )
@@ -8487,19 +8783,33 @@ export class WorkspaceService extends EventEmitter {
       displayName?: string;
       startTime: number;
       status: "running" | "exited" | "killed" | "failed";
+      monitor?: {
+        filter: string;
+        filter_exclude: boolean;
+        cooldown_ms: number;
+        max_events?: number;
+        totalMatches: number;
+        droppedLines: number;
+        lastLines: string[];
+        stopped: boolean;
+      };
       exitCode?: number;
     }>
   > {
     const processes = await this.backgroundProcessManager.list(workspaceId);
-    return processes.map((p) => ({
-      id: p.id,
-      pid: p.pid,
-      script: p.script,
-      displayName: p.displayName,
-      startTime: p.startTime,
-      status: p.status,
-      exitCode: p.exitCode,
-    }));
+    return processes.map((p) => {
+      const monitor = this.backgroundProcessManager.getMonitorSnapshot(p);
+      return {
+        id: p.id,
+        pid: p.pid,
+        script: p.script,
+        displayName: p.displayName,
+        startTime: p.startTime,
+        status: p.status,
+        ...(monitor != null ? { monitor } : {}),
+        exitCode: p.exitCode,
+      };
+    });
   }
 
   /**

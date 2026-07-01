@@ -15,7 +15,6 @@ import {
 import type { Toast } from "@/browser/features/ChatInput/ChatInputToast";
 import { ConnectionStatusToast } from "@/browser/components/ConnectionStatusToast/ConnectionStatusToast";
 import { ChatInputToast } from "@/browser/features/ChatInput/ChatInputToast";
-import type { WorkflowDefinitionDescriptor } from "@/common/types/workflow";
 import type { SendMessageError } from "@/common/types/errors";
 import { createErrorToast } from "@/browser/features/ChatInput/ChatInputToasts";
 import { ConfirmationModal } from "@/browser/components/ConfirmationModal/ConfirmationModal";
@@ -138,7 +137,10 @@ import {
   chatAttachmentsToFileParts,
   processAttachmentFiles,
 } from "@/browser/utils/attachmentsHandling";
-import type { PendingUserMessage } from "@/browser/utils/chatEditing";
+import {
+  buildPendingFromRestoredInput,
+  type PendingUserMessage,
+} from "@/browser/utils/chatEditing";
 
 import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
@@ -196,6 +198,7 @@ import {
 } from "./utils";
 import { normalizeAgentId } from "@/common/utils/agentIds";
 import { isGoalRunning } from "@/common/types/goal";
+import { appendStagedAttachmentNotice, getStagedAttachments } from "./stagedAttachments";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 
 // localStorage quotas are environment-dependent and relatively small.
@@ -231,6 +234,10 @@ function estimateBase64DataUrlBytes(dataUrl: string): number | null {
   return Math.floor((base64.length * 3) / 4) - padding;
 }
 const MAX_PERSISTED_ATTACHMENT_DRAFT_CHARS = 4_000_000;
+
+// Shared so the three "blocked while editing a message" attachment guards surface identical copy
+// and can't drift if one is reworded.
+const EDIT_MODE_ATTACHMENT_ERROR_MESSAGE = "Attachments cannot be added while editing a message.";
 
 export type { ChatInputProps, ChatInputAPI };
 
@@ -399,9 +406,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const [showSymbolSuggestions, setShowSymbolSuggestions] = useState(false);
   const [symbolSuggestions, setSymbolSuggestions] = useState<SlashSuggestion[]>([]);
   const lastSymbolQueryRef = useRef<string>("");
-  const [workflowDefinitionDescriptors, setWorkflowDefinitionDescriptors] = useState<
-    WorkflowDefinitionDescriptor[]
-  >([]);
   const [agentSkillDescriptors, setAgentSkillDescriptors] = useState<AgentSkillDescriptor[]>([]);
   const [toast, setToast] = useState<Toast | null>(null);
   // State for destructive command confirmation modal (currently only /clear).
@@ -438,6 +442,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const [attachments, setAttachmentsState] = useState<ChatAttachment[]>(() => {
     return readPersistedChatAttachments(storageKeys.attachmentsKey);
   });
+  const [processingAttachmentCount, setProcessingAttachmentCount] = useState(0);
   // Reviews restored from edits/queued drafts override attached review state while active.
   const [draftReviews, setDraftReviews] = useState<ReviewNoteDataForDisplay[] | null>(null);
   const persistAttachments = useCallback(
@@ -1048,10 +1053,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const policyBlocksCreateSend = variant === "creation" && creationRuntimePolicyError != null;
   const coderPresetsLoading =
     coderState.enabled && !coderState.coderConfig?.existingWorkspace && coderState.loadingPresets;
+  const isProcessingAttachments = processingAttachmentCount > 0;
   const canSend =
     (hasTypedText || hasImages || hasReviews) &&
     !disabled &&
     !sendInFlightBlocksInput &&
+    !isProcessingAttachments &&
     !coderPresetsLoading &&
     !policyBlocksCreateSend;
   const runningGoalActive =
@@ -1196,9 +1203,17 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
   const applyDraftFromPending = useCallback(
     (pending: PendingUserMessage, attachmentKeyPrefix: string) => {
+      const providerAttachments = filePartsToChatAttachments(
+        pending.fileParts,
+        attachmentKeyPrefix
+      );
+      const stagedAttachments = pending.stagedAttachments.map((attachment, index) => ({
+        ...attachment,
+        id: `${attachmentKeyPrefix}-staged-${index}`,
+      }));
       setDraft({
         text: pending.content,
-        attachments: filePartsToChatAttachments(pending.fileParts, attachmentKeyPrefix),
+        attachments: [...providerAttachments, ...stagedAttachments],
       });
     },
     [setDraft]
@@ -1495,7 +1510,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   useLayoutEffect(() => {
     const suggestions = getSlashCommandSuggestions(input, {
       agentSkills: agentSkillDescriptors,
-      workflows: dynamicWorkflowsExperimentEnabled ? workflowDefinitionDescriptors : [],
       variant,
       isExperimentEnabled: (experimentId) =>
         resolveSlashCommandExperimentValue(experimentId, {
@@ -1510,7 +1524,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   }, [
     input,
     agentSkillDescriptors,
-    workflowDefinitionDescriptors,
     variant,
     workspaceHeartbeatsExperimentEnabled,
     dynamicWorkflowsExperimentEnabled,
@@ -1554,28 +1567,17 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       }),
   });
 
-  // Load workflow definitions for slash suggestions and slash invocation.
+  // Project live workflow run cards for foreground slash invocations after reloads.
   useEffect(() => {
     let isMounted = true;
     const requestId = ++workflowsRequestIdRef.current;
 
     const loadWorkflows = async () => {
-      const discoveryInput =
-        variant === "workspace" && workspaceId
-          ? { workspaceId }
-          : variant === "creation" && atMentionProjectPath
-            ? { projectPath: atMentionProjectPath }
-            : null;
-
-      if (!api || !discoveryInput || !dynamicWorkflowsExperimentEnabled) {
-        if (isMounted && workflowsRequestIdRef.current === requestId) {
-          setWorkflowDefinitionDescriptors([]);
-        }
+      if (!api || !dynamicWorkflowsExperimentEnabled) {
         return;
       }
 
       try {
-        const workflows = await api.workflows.listDefinitions(discoveryInput);
         const discoveryWorkspaceId = variant === "workspace" && workspaceId ? workspaceId : null;
         const runs =
           discoveryWorkspaceId != null && isTranscriptCaughtUp
@@ -1584,7 +1586,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         if (!isMounted || workflowsRequestIdRef.current !== requestId) {
           return;
         }
-        setWorkflowDefinitionDescriptors(Array.isArray(workflows) ? workflows : []);
         if (discoveryWorkspaceId == null) {
           return;
         }
@@ -1604,11 +1605,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           });
         }
       } catch (error) {
-        console.error("Failed to load workflow definitions:", error);
-        if (!isMounted || workflowsRequestIdRef.current !== requestId) {
-          return;
-        }
-        setWorkflowDefinitionDescriptors([]);
+        console.error("Failed to project workflow run cards:", error);
       }
     };
 
@@ -1747,36 +1744,38 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       }>;
 
       const { text, mode = "append", fileParts, reviews } = customEvent.detail;
-      const hasFileParts = !!fileParts && fileParts.length > 0;
-      const hasReviews = !!reviews && reviews.length > 0;
+      const restoredIdPrefix = `restored-${Date.now()}`;
+      const restoredPending = buildPendingFromRestoredInput({
+        content: text,
+        fileParts: fileParts ?? [],
+        reviews: reviews ?? [],
+        idPrefix: restoredIdPrefix,
+      });
+      const hasFileParts = restoredPending.fileParts.length > 0;
+      const hasStagedAttachments = restoredPending.stagedAttachments.length > 0;
+      const hasReviews = restoredPending.reviews.length > 0;
 
       if (mode === "replace") {
         if (editingMessageForUi) {
           return;
         }
-        if (hasFileParts || hasReviews) {
-          restoreDraft({
-            content: text,
-            fileParts: fileParts ?? [],
-            reviews: reviews ?? [],
-          });
+        if (hasFileParts || hasStagedAttachments || hasReviews) {
+          restoreDraft(restoredPending);
         } else {
-          restoreText(text);
+          restoreText(restoredPending.content);
         }
-      } else if (hasFileParts || hasReviews) {
+      } else if (hasFileParts || hasStagedAttachments || hasReviews) {
         const currentText = getDraft().text;
         const separator = currentText.trim() ? "\n\n" : "";
-        const nextText = currentText + separator + text;
         applyDraftFromPending(
           {
-            content: nextText,
-            fileParts: fileParts ?? [],
-            reviews: reviews ?? [],
+            ...restoredPending,
+            content: currentText + separator + restoredPending.content,
           },
-          `restored-${Date.now()}`
+          restoredIdPrefix
         );
       } else {
-        appendText(text);
+        appendText(restoredPending.content);
       }
     };
     window.addEventListener(CUSTOM_EVENTS.UPDATE_CHAT_INPUT, handler as EventListener);
@@ -1967,7 +1966,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
   const showResizeToast = useCallback(
     (nextAttachments: ChatAttachment[]) => {
-      const resized = nextAttachments.filter((attachment) => attachment.resizeInfo);
+      const resized = nextAttachments.filter(
+        (attachment): attachment is Extract<ChatAttachment, { kind: "provider" }> =>
+          attachment.kind === "provider" && attachment.resizeInfo != null
+      );
       if (resized.length === 0) {
         return;
       }
@@ -1988,6 +1990,39 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     [pushToast]
   );
 
+  const processAttachmentFilesForComposer = useCallback(
+    (files: File[]): Promise<ChatAttachment[]> => {
+      setProcessingAttachmentCount((count) => count + 1);
+      return processAttachmentFiles(files, {
+        stageAttachment:
+          variant === "workspace"
+            ? async (file, dataBase64) => {
+                if (!api) {
+                  throw new Error("Not connected to server");
+                }
+                if (workspaceId == null) {
+                  throw new Error("ZIP attachments can be added after opening a workspace.");
+                }
+                const result = await api.workspace.stageAttachment({
+                  workspaceId,
+                  filename: file.name,
+                  mediaType: file.type || null,
+                  sizeBytes: file.size,
+                  dataBase64,
+                });
+                if (!result.success) {
+                  throw new Error(result.error);
+                }
+                return result.data;
+              }
+            : undefined,
+      }).finally(() => {
+        setProcessingAttachmentCount((count) => Math.max(0, count - 1));
+      });
+    },
+    [api, variant, workspaceId]
+  );
+
   // Handle paste events to extract attachments
   const handlePaste = useCallback(
     (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
@@ -2002,14 +2037,14 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       if (editingMessageForUi) {
         pushToast({
           type: "error",
-          message: "Attachments cannot be added while editing a message.",
+          message: EDIT_MODE_ATTACHMENT_ERROR_MESSAGE,
         });
         return;
       }
 
       e.preventDefault(); // Prevent default paste behavior for attachments
 
-      processAttachmentFiles(attachmentFiles)
+      processAttachmentFilesForComposer(attachmentFiles)
         .then((nextAttachments) => {
           setAttachments((prev) => [...prev, ...nextAttachments]);
           showResizeToast(nextAttachments);
@@ -2022,7 +2057,13 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           });
         });
     },
-    [editingMessageForUi, pushToast, setAttachments, showResizeToast]
+    [
+      editingMessageForUi,
+      processAttachmentFilesForComposer,
+      pushToast,
+      setAttachments,
+      showResizeToast,
+    ]
   );
 
   // Handle removing an attachment
@@ -2041,12 +2082,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     if (editingMessageForUi) {
       pushToast({
         type: "error",
-        message: "Attachments cannot be added while editing a message.",
+        message: EDIT_MODE_ATTACHMENT_ERROR_MESSAGE,
       });
       return;
     }
     const results = files.map((file) =>
-      processAttachmentFiles([file]).then(
+      processAttachmentFilesForComposer([file]).then(
         (attachments) => ({ ok: true as const, attachments }),
         (error: unknown) => ({ ok: false as const, error })
       )
@@ -2109,6 +2150,16 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       return true;
     }
 
+    if (getStagedAttachments(attachments).length > 0 && parsed.type !== "compact") {
+      setToast({
+        id: Date.now().toString(),
+        type: "error",
+        message:
+          "This command cannot include staged ZIP attachments. Remove the ZIP or send a normal message.",
+      });
+      return true;
+    }
+
     const reviewsData = reviewData;
     const dispatchMode = options?.queueDispatchMode ?? "tool-end";
     // Thread dispatch mode into send options so queued command sends stay in sync with normal sends.
@@ -2158,6 +2209,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       editMessageId: editingMessageForUi?.id,
       onCancelEdit: commandOnCancelEdit,
       reviews: reviewsData,
+      attachments,
       fileParts: commandFileParts.length > 0 ? commandFileParts : undefined,
       onMessageSent: variant === "workspace" ? props.onMessageSent : undefined,
       onDetachAllReviews: variant === "workspace" ? props.onDetachAllReviews : undefined,
@@ -2219,12 +2271,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       if (editingMessageForUi) {
         pushToast({
           type: "error",
-          message: "Attachments cannot be added while editing a message.",
+          message: EDIT_MODE_ATTACHMENT_ERROR_MESSAGE,
         });
         return;
       }
 
-      processAttachmentFiles(attachmentFiles)
+      processAttachmentFilesForComposer(attachmentFiles)
         .then((nextAttachments) => {
           setAttachments((prev) => [...prev, ...nextAttachments]);
           showResizeToast(nextAttachments);
@@ -2237,7 +2289,13 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           });
         });
     },
-    [editingMessageForUi, pushToast, setAttachments, showResizeToast]
+    [
+      editingMessageForUi,
+      processAttachmentFilesForComposer,
+      pushToast,
+      setAttachments,
+      showResizeToast,
+    ]
   );
 
   // Handle suggestion selection
@@ -2373,7 +2431,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     const { parsed, skillInvocation } = await parseCommandWithSkillInvocation({
       messageText,
       agentSkillDescriptors,
-      workflowDefinitions: dynamicWorkflowsExperimentEnabled ? workflowDefinitionDescriptors : [],
       api,
       discovery: skillDiscovery,
     });
@@ -2387,12 +2444,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
     // Route to creation handler for creation variant
     if (variant === "creation") {
-      const initialSlashCommand =
-        parsed?.type === "goal-set" ||
-        (parsed?.type === "workflow-run" && dynamicWorkflowsExperimentEnabled)
-          ? parsed
-          : undefined;
-      if (!initialSlashCommand) {
+      const initialSlashCommand = parsed?.type === "goal-set" ? parsed : undefined;
+      if (!initialSlashCommand && parsed?.type !== "workflow-run") {
         const commandHandled = await executeParsedCommand(parsed, input);
         if (commandHandled) {
           return;
@@ -2503,7 +2556,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       // Regular message (or /<model-alias> one-shot override) - send directly via API
       const messageTextForSend = modelOneShot?.message ?? skillInvocation?.userText ?? messageText;
       const skillMuxMetadata = skillInvocation
-        ? buildSkillInvocationMetadata(messageText, skillInvocation.descriptor)
+        ? buildSkillInvocationMetadata(
+            appendStagedAttachmentNotice(messageText, attachments),
+            skillInvocation.descriptor
+          )
         : undefined;
 
       if (!api) {
@@ -2516,7 +2572,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
       // Preflight: if the message includes PDFs, ensure the selected model can accept them.
       const pdfAttachments = attachments.filter(
-        (attachment) => getBaseMediaType(attachment.mediaType) === PDF_MEDIA_TYPE
+        (attachment): attachment is Extract<ChatAttachment, { kind: "provider" }> =>
+          attachment.kind === "provider" &&
+          getBaseMediaType(attachment.mediaType) === PDF_MEDIA_TYPE
       );
       if (pdfAttachments.length > 0) {
         const caps = getModelCapabilitiesResolved(policyModel, providersConfig);
@@ -2583,6 +2641,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         }
         let compactionOptions: Partial<SendMessageOptions> = {};
 
+        let appendStagedNoticeToUserMessage = true;
         if (editMessageForSend && actualMessageText.startsWith("/")) {
           const parsed = parseCommand(messageText);
           if (parsed?.type === "compact") {
@@ -2597,9 +2656,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
               // Include current attachments + reviews in followUpContent so they're queued
               // after compaction completes, not just attached to the compaction request.
               followUpContent:
-                parsed.continueMessage || sendFileParts?.length || reviewsData?.length
+                parsed.continueMessage ||
+                sendFileParts?.length ||
+                reviewsData?.length ||
+                getStagedAttachments(attachments).length
                   ? {
-                      text: parsed.continueMessage ?? "",
+                      text: appendStagedAttachmentNotice(parsed.continueMessage ?? "", attachments),
                       fileParts: sendFileParts,
                       reviews: reviewsData,
                     }
@@ -2607,14 +2669,18 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
               model: parsed.model,
               sendMessageOptions,
             });
+            appendStagedNoticeToUserMessage = false;
             actualMessageText = regeneratedText;
             muxMetadata = metadata;
             compactionOptions = sendOptions;
           }
         }
 
+        const userMessageText = appendStagedNoticeToUserMessage
+          ? appendStagedAttachmentNotice(actualMessageText, attachments)
+          : actualMessageText;
         const { finalText: finalMessageText, metadata: reviewMetadata } = prepareUserMessageForSend(
-          { text: actualMessageText, reviews: reviewsData },
+          { text: userMessageText, reviews: reviewsData },
           muxMetadata
         );
         // When editing /compact, compactionOptions already includes the base sendMessageOptions.
@@ -2634,19 +2700,22 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
               .slice(0, messageText.trim().length - modelOneShot.message.length)
               .trimEnd()
           : undefined;
+        const oneshotRawCommand = oneshotCommandPrefix
+          ? appendStagedAttachmentNotice(messageText.trim(), attachments)
+          : undefined;
         muxMetadata = muxMetadata
           ? {
               ...muxMetadata,
               requestedModel: effectiveModel,
-              ...(oneshotCommandPrefix
-                ? { rawCommand: messageText.trim(), commandPrefix: oneshotCommandPrefix }
+              ...(oneshotRawCommand
+                ? { rawCommand: oneshotRawCommand, commandPrefix: oneshotCommandPrefix }
                 : {}),
             }
           : {
               type: "normal",
               requestedModel: effectiveModel,
-              ...(oneshotCommandPrefix
-                ? { rawCommand: messageText.trim(), commandPrefix: oneshotCommandPrefix }
+              ...(oneshotRawCommand
+                ? { rawCommand: oneshotRawCommand, commandPrefix: oneshotCommandPrefix }
                 : {}),
             };
 

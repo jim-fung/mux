@@ -62,7 +62,7 @@ describe("commandParser", () => {
     });
 
     it("should parse /model with full provider:model format", () => {
-      expectModelSet("/model anthropic:claude-sonnet-4-6", KNOWN_MODELS.SONNET.id);
+      expectModelSet("/model anthropic:claude-sonnet-5", KNOWN_MODELS.SONNET.id);
     });
 
     it("should parse /compact -m with alias", () => {
@@ -304,10 +304,10 @@ describe("plan commands", () => {
 });
 
 describe("init command", () => {
-  it("parses explicit workflow invocation", () => {
-    expect(parseCommand('/workflow deep-research {"topic":"mux"}')).toEqual({
+  it("parses explicit workflow script path invocation", () => {
+    expect(parseCommand('/workflow skill://deep-research/workflow.js {"topic":"mux"}')).toEqual({
       type: "workflow-run",
-      name: "deep-research",
+      scriptPath: "skill://deep-research/workflow.js",
       argsText: '{"topic":"mux"}',
     });
   });

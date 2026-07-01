@@ -1,12 +1,20 @@
 import { z } from "zod";
 
+import { BackgroundWorkAttentionPolicySchema } from "@/common/types/backgroundWorkAttention";
+
 export const WorkflowNameSchema = z
   .string()
   .min(1)
   .max(64)
   .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/);
 
-export const WorkflowDefinitionScopeSchema = z.enum(["project", "global", "built-in", "scratch"]);
+const WorkflowScriptScopeValues = ["project", "global", "built-in"] as const;
+const LegacyWorkflowScriptScopeValue = "scratch";
+
+export const WorkflowScriptScopeSchema = z.preprocess(
+  (value) => (value === LegacyWorkflowScriptScopeValue ? "project" : value),
+  z.enum(WorkflowScriptScopeValues)
+);
 
 export const WorkflowRunIdSchema = z
   .string()
@@ -38,16 +46,13 @@ export const JsonValueSchema: z.ZodType<unknown> = z.lazy(() =>
 // Kept only so older workflow run records with legacy host-step events remain parseable.
 const LegacyWorkflowHostStepEffectSchema = z.enum(["read", "workspace", "external"]);
 
-export const WorkflowDefinitionMetadataSchema = z.record(z.string(), JsonValueSchema);
+export const WorkflowMetadataSchema = z.record(z.string(), JsonValueSchema);
 
-export const WorkflowDefinitionArgSummarySchema = z
+export const WorkflowArgSummarySchema = z
   .object({
     name: z.string().min(1),
     types: z.array(z.string().min(1)).min(1),
     required: z.boolean(),
-    aliases: z.array(z.string().min(1)).optional(),
-    negatedAliases: z.array(z.string().min(1)).optional(),
-    positional: z.boolean().optional(),
     default: JsonValueSchema.optional(),
     enum: z.array(JsonValueSchema).optional(),
     minimum: z.number().optional(),
@@ -55,17 +60,21 @@ export const WorkflowDefinitionArgSummarySchema = z
   })
   .strict();
 
-export const WorkflowDefinitionDescriptorSchema = z
+export const WorkflowScriptDescriptorSchema = z
   .object({
     name: WorkflowNameSchema,
     description: z.string().min(1).max(1024),
-    scope: WorkflowDefinitionScopeSchema,
+    scope: WorkflowScriptScopeSchema,
     sourcePath: z.string().min(1).optional(),
+    requestedScriptPath: z.string().min(1).optional(),
+    canonicalScriptPath: z.string().min(1).optional(),
+    sourceKind: z.enum(["skill", "workspace-file", "inline"]).optional(),
+    sourceHash: z.string().min(1).optional(),
     executable: z.boolean(),
     blockedReason: z.string().min(1).optional(),
   })
   .refine((value) => value.executable || value.blockedReason != null, {
-    message: "Non-executable workflow definitions must include a blocked reason",
+    message: "Non-executable workflow scripts must include a blocked reason",
     path: ["blockedReason"],
   });
 
@@ -77,6 +86,7 @@ export const WorkflowResultSchema = z.object({
 export const StructuredTaskOutputSchema = z.object({
   reportMarkdown: z.string(),
   title: z.string().min(1).nullable().optional(),
+  planFilePath: z.string().min(1).optional(),
   structuredOutput: JsonValueSchema.optional(),
   taskId: z.string().min(1).optional(),
 });
@@ -112,6 +122,15 @@ export const WorkflowRunEventSchema = z.discriminatedUnion("type", [
     // Human-readable sub-agent title (matches the spawned workspace title).
     // Optional so legacy persisted events without it still parse.
     title: z.string().min(1).optional(),
+  }),
+  z.object({
+    sequence: z.number().int().positive(),
+    type: z.literal("timeout"),
+    at: IsoDateTimeSchema,
+    stepId: z.string().min(1),
+    taskId: z.string().min(1),
+    phase: z.enum(["soft", "finalization_prompt_sent", "recovered", "hard"]),
+    details: JsonValueSchema.optional(),
   }),
   z.object({
     sequence: z.number().int().positive(),
@@ -184,6 +203,18 @@ export const WorkflowEventSequenceSchema = z
 
 export const WorkflowStepStatusSchema = z.enum(["started", "completed", "failed", "interrupted"]);
 
+export const WorkflowStepTimeoutMetadataSchema = z
+  .object({
+    executionStartedAt: IsoDateTimeSchema.optional(),
+    softDeadlineAt: IsoDateTimeSchema.optional(),
+    hardDeadlineAt: IsoDateTimeSchema.optional(),
+    softTimedOutAt: IsoDateTimeSchema.optional(),
+    finalizationToken: z.string().min(1).optional(),
+    finalizationPromptSentAt: IsoDateTimeSchema.optional(),
+    hardTimedOutAt: IsoDateTimeSchema.optional(),
+  })
+  .strict();
+
 export const WorkflowStepRecordSchema = z.object({
   stepId: z.string().min(1),
   inputHash: z.string().min(1),
@@ -192,6 +223,7 @@ export const WorkflowStepRecordSchema = z.object({
   startedAt: IsoDateTimeSchema,
   completedAt: IsoDateTimeSchema.optional(),
   result: StructuredTaskOutputSchema.optional(),
+  timeout: WorkflowStepTimeoutMetadataSchema.optional(),
   error: z.string().min(1).optional(),
 });
 
@@ -229,15 +261,42 @@ export const WorkflowRunParentSchema = z
 export const WorkflowRunRecordSchema = z.object({
   id: WorkflowRunIdSchema,
   workspaceId: z.string().min(1),
-  definition: WorkflowDefinitionDescriptorSchema,
-  definitionSource: z.string().min(1),
-  definitionHash: z.string().min(1),
+  workflow: WorkflowScriptDescriptorSchema,
+  source: z.string().min(1),
+  sourceHash: z.string().min(1),
   args: JsonValueSchema,
   agentOutputSchemaRequired: z.boolean().optional(),
+  agentTypeAliasAllowed: z.boolean().optional(),
   parentWorkflow: WorkflowRunParentSchema.optional(),
+  // How the owner workspace's stream-end treats this run while active. Background
+  // runs are "notify_on_terminal"; missing/legacy records default to blocking.
+  attentionPolicy: BackgroundWorkAttentionPolicySchema.optional(),
   status: WorkflowRunStatusSchema,
   createdAt: IsoDateTimeSchema,
   updatedAt: IsoDateTimeSchema,
   events: WorkflowEventSequenceSchema,
   steps: z.array(WorkflowStepRecordSchema),
+});
+
+// Live stream events for `workflows.subscribe`: an initial snapshot of all
+// top-level runs, then a full-record delta whenever any run is persisted. The
+// client upserts by id, so a snapshot followed by an in-flight delta converges.
+export const WorkflowRunStreamEventSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("snapshot"),
+    runs: z.array(WorkflowRunRecordSchema),
+  }),
+  z.object({
+    type: z.literal("run-changed"),
+    run: WorkflowRunRecordSchema,
+  }),
+]);
+
+// A workflow script available to run in a workspace, with its declared args, for
+// the Workflows tab's empty-state launcher. `scriptPath` is the canonical path
+// to pass back to `workflows.start`.
+export const AvailableWorkflowSchema = z.object({
+  descriptor: WorkflowScriptDescriptorSchema,
+  scriptPath: z.string().min(1),
+  args: z.array(WorkflowArgSummarySchema),
 });

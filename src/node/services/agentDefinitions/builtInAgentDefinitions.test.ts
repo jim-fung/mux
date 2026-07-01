@@ -54,6 +54,16 @@ describe("built-in agent definitions", () => {
     expect(desktop?.body).toContain("screenshot");
   });
 
+  test("plan is workflow-runnable but not a general subagent", () => {
+    const pkgs = getBuiltInAgentDefinitions();
+    const byId = new Map(pkgs.map((pkg) => [pkg.id, pkg] as const));
+
+    const plan = byId.get("plan");
+    expect(plan).toBeTruthy();
+    expect(plan?.frontmatter.subagent?.runnable).toBe(false);
+    expect(plan?.frontmatter.subagent?.workflow_runnable).toBe(true);
+  });
+
   test("explore agent allows skill tools", () => {
     const pkgs = getBuiltInAgentDefinitions();
     const byId = new Map(pkgs.map((pkg) => [pkg.id, pkg] as const));
@@ -76,6 +86,19 @@ describe("built-in agent definitions", () => {
     const plan = byId.get("plan");
     expect(plan).toBeTruthy();
     expect(plan?.frontmatter.tools?.remove ?? []).toContain("analytics_query");
+  });
+
+  test("workspace lifecycle cleanup is unavailable in plan mode", () => {
+    const pkgs = getBuiltInAgentDefinitions();
+    const byId = new Map(pkgs.map((pkg) => [pkg.id, pkg] as const));
+
+    const exec = byId.get("exec");
+    expect(exec).toBeTruthy();
+    expect(exec?.frontmatter.tools?.remove ?? []).not.toContain("task_workspace_lifecycle");
+
+    const plan = byId.get("plan");
+    expect(plan).toBeTruthy();
+    expect(plan?.frontmatter.tools?.remove ?? []).toContain("task_workspace_lifecycle");
   });
 
   test("task_apply_git_patch is restricted to exec", () => {

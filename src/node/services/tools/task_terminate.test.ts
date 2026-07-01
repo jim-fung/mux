@@ -123,14 +123,14 @@ describe("task_terminate tool", () => {
   const buildWorkflowRun = (status: string) => ({
     id: "wfr_run_1",
     workspaceId: "root-workspace",
-    definition: {
+    workflow: {
       name: "deep-research",
       description: "Deep research",
       scope: "built-in" as const,
       executable: true,
     },
-    definitionSource: "export default function workflow() { return null; }",
-    definitionHash: "sha256:test",
+    source: "export default function workflow() { return null; }",
+    sourceHash: "sha256:test",
     args: {},
     status,
     createdAt: "2026-05-29T00:00:00.000Z",
@@ -155,9 +155,6 @@ describe("task_terminate tool", () => {
       ...baseConfig,
       taskService,
       workflowService: {
-        listDefinitions: mock(() => Promise.resolve([])),
-        readDefinition: mock(() => Promise.reject(new Error("unused"))),
-        startNamedWorkflow: mock(() => Promise.reject(new Error("unused"))),
         getRun,
         interruptRun,
       },
@@ -192,9 +189,6 @@ describe("task_terminate tool", () => {
       ...baseConfig,
       taskService: {} as unknown as TaskService,
       workflowService: {
-        listDefinitions: mock(() => Promise.resolve([])),
-        readDefinition: mock(() => Promise.reject(new Error("unused"))),
-        startNamedWorkflow: mock(() => Promise.reject(new Error("unused"))),
         getRun: mock(() => Promise.resolve(buildWorkflowRun("interrupted"))),
         interruptRun,
       },
@@ -225,9 +219,6 @@ describe("task_terminate tool", () => {
       ...baseConfig,
       taskService: {} as unknown as TaskService,
       workflowService: {
-        listDefinitions: mock(() => Promise.resolve([])),
-        readDefinition: mock(() => Promise.reject(new Error("unused"))),
-        startNamedWorkflow: mock(() => Promise.reject(new Error("unused"))),
         getRun: mock(() => Promise.resolve(buildWorkflowRun("completed"))),
         interruptRun,
       },
@@ -257,9 +248,6 @@ describe("task_terminate tool", () => {
       ...baseConfig,
       taskService: {} as unknown as TaskService,
       workflowService: {
-        listDefinitions: mock(() => Promise.resolve([])),
-        readDefinition: mock(() => Promise.reject(new Error("unused"))),
-        startNamedWorkflow: mock(() => Promise.reject(new Error("unused"))),
         getRun: mock(() => Promise.resolve(null)),
         interruptRun: mock(() => Promise.reject(new Error("unused"))),
       },

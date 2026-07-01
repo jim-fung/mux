@@ -26,6 +26,8 @@ import {
   type TaskApplyGitPatchResult,
 } from "@/node/services/tools/task_apply_git_patch";
 
+export const DEFAULT_WORKFLOW_AGENT_ID = "exec";
+
 interface WorkflowTaskExperiments {
   programmaticToolCalling?: boolean;
   programmaticToolCallingExclusive?: boolean;
@@ -36,42 +38,34 @@ interface WorkflowTaskExperiments {
   dynamicWorkflows?: boolean;
 }
 
+// Shared shape for agent task creation so the single-step `create` and the
+// batched `createMany` stay in lockstep; adding a field (e.g. onRefusal) in one
+// place must not silently diverge from the other.
+interface WorkflowTaskCreateArgs {
+  parentWorkspaceId: string;
+  kind: "agent";
+  agentId: string;
+  prompt: string;
+  title: string;
+  workflowTask: {
+    runId: string;
+    stepId: string;
+    workflowName?: string;
+    outputSchema?: unknown;
+  };
+  experiments?: WorkflowTaskExperiments;
+  modelString?: string;
+  thinkingLevel?: ParsedThinkingInput;
+  isolation?: "fork" | "none";
+  onRefusal?: "fail" | "fallback";
+}
+
 interface WorkflowTaskServiceLike {
-  create(args: {
-    parentWorkspaceId: string;
-    kind: "agent";
-    agentId: string;
-    prompt: string;
-    title: string;
-    workflowTask: {
-      runId: string;
-      stepId: string;
-      workflowName?: string;
-      outputSchema?: unknown;
-    };
-    experiments?: WorkflowTaskExperiments;
-    modelString?: string;
-    thinkingLevel?: ParsedThinkingInput;
-    isolation?: "fork" | "none";
-  }): Promise<{ success: true; data: TaskCreateResult } | { success: false; error: string }>;
+  create(
+    args: WorkflowTaskCreateArgs
+  ): Promise<{ success: true; data: TaskCreateResult } | { success: false; error: string }>;
   createMany?(
-    args: Array<{
-      parentWorkspaceId: string;
-      kind: "agent";
-      agentId: string;
-      prompt: string;
-      title: string;
-      workflowTask: {
-        runId: string;
-        stepId: string;
-        workflowName?: string;
-        outputSchema?: unknown;
-      };
-      experiments?: WorkflowTaskExperiments;
-      modelString?: string;
-      thinkingLevel?: ParsedThinkingInput;
-      isolation?: "fork" | "none";
-    }>,
+    args: WorkflowTaskCreateArgs[],
     options?: {
       onTaskReserved?: (index: number, result: TaskCreateResult) => Promise<void> | void;
     }
@@ -82,7 +76,31 @@ interface WorkflowTaskServiceLike {
       requestingWorkspaceId: string;
       backgroundOnMessageQueued: boolean;
     }
-  ): Promise<{ reportMarkdown: string; title?: string; structuredOutput?: unknown }>;
+  ): Promise<{
+    reportMarkdown: string;
+    title?: string;
+    structuredOutput?: unknown;
+    planFilePath?: string;
+  }>;
+  requestAgentFinalReportForTimeout?(
+    taskId: string,
+    options: {
+      workflowRunId: string;
+      stepId: string;
+      inputHash: string;
+      finalizationToken: string;
+      finalInstructions?: string;
+    }
+  ): Promise<"prompted" | "queued" | "already_reported" | "not_active">;
+  failAgentTaskForHardTimeout?(
+    taskId: string,
+    options: {
+      workflowRunId: string;
+      stepId: string;
+      inputHash: string;
+      reason: string;
+    }
+  ): Promise<void>;
   terminateAllDescendantAgentTasks?(
     workspaceId: string,
     options?: { workflowRunId?: string }
@@ -100,7 +118,7 @@ export interface WorkflowTaskServiceAdapterOptions {
   parentWorkspaceId: string;
   workflowRunId: string;
   /**
-   * Human-readable workflow definition name, stamped onto spawned tasks so the
+   * Human-readable workflow display name, stamped onto spawned tasks so the
    * sidebar can label workflow run groups. Optional: interrupt-only adapters
    * and legacy call sites may not know the name.
    */
@@ -398,6 +416,8 @@ export class WorkflowTaskServiceAdapter implements WorkflowTaskAdapter {
 
     const agentId = spec.agentId ?? this.defaultAgentId;
     const experiments = this.getExperimentsForAgent(agentId);
+    const modelString = spec.modelString ?? this.modelString;
+    const thinkingLevel = spec.thinkingLevel ?? this.thinkingLevel;
     return {
       parentWorkspaceId: this.parentWorkspaceId,
       kind: "agent",
@@ -407,8 +427,8 @@ export class WorkflowTaskServiceAdapter implements WorkflowTaskAdapter {
       workflowTask,
       ...(spec.isolation !== undefined ? { isolation: spec.isolation } : {}),
       ...(experiments !== undefined ? { experiments } : {}),
-      ...(this.modelString !== undefined ? { modelString: this.modelString } : {}),
-      ...(this.thinkingLevel !== undefined ? { thinkingLevel: this.thinkingLevel } : {}),
+      ...(modelString !== undefined ? { modelString } : {}),
+      ...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
       // Refusal policy must survive both the single-step and parallel
       // (createAgentTasks) paths: a verifier step marked onRefusal: "fail"
       // must fail honestly instead of silently continuing on a fallback model.
@@ -449,6 +469,34 @@ export class WorkflowTaskServiceAdapter implements WorkflowTaskAdapter {
     return { ...experiments, subagentFileReports: false };
   }
 
+  async requestAgentFinalReportForTimeout(
+    taskId: string,
+    options: {
+      workflowRunId: string;
+      stepId: string;
+      inputHash: string;
+      finalizationToken: string;
+      finalInstructions?: string;
+    }
+  ): Promise<"prompted" | "queued" | "already_reported" | "not_active"> {
+    assert(
+      this.taskService.requestAgentFinalReportForTimeout != null,
+      "WorkflowTaskServiceAdapter requires TaskService timeout finalization support"
+    );
+    return await this.taskService.requestAgentFinalReportForTimeout(taskId, options);
+  }
+
+  async failAgentTaskForHardTimeout(
+    taskId: string,
+    options: { workflowRunId: string; stepId: string; inputHash: string; reason: string }
+  ): Promise<void> {
+    assert(
+      this.taskService.failAgentTaskForHardTimeout != null,
+      "WorkflowTaskServiceAdapter requires TaskService hard timeout support"
+    );
+    await this.taskService.failAgentTaskForHardTimeout(taskId, options);
+  }
+
   async waitForAgentTask(
     taskId: string,
     _spec: WorkflowAgentSpec,
@@ -457,6 +505,9 @@ export class WorkflowTaskServiceAdapter implements WorkflowTaskAdapter {
     const report = await this.taskService.waitForAgentReport(taskId, {
       ...(waitOptions?.abortSignal != null ? { abortSignal: waitOptions.abortSignal } : {}),
       ...(waitOptions?.timeoutMs != null ? { timeoutMs: waitOptions.timeoutMs } : {}),
+      ...(waitOptions?.onExecutionStarted != null
+        ? { onExecutionStarted: waitOptions.onExecutionStarted }
+        : {}),
       requestingWorkspaceId: this.parentWorkspaceId,
       backgroundOnMessageQueued: waitOptions?.backgroundOnMessageQueued ?? true,
     });
@@ -465,6 +516,7 @@ export class WorkflowTaskServiceAdapter implements WorkflowTaskAdapter {
       taskId,
       reportMarkdown: report.reportMarkdown,
       ...(report.title != null ? { title: report.title } : {}),
+      ...(report.planFilePath !== undefined ? { planFilePath: report.planFilePath } : {}),
       ...(report.structuredOutput !== undefined
         ? { structuredOutput: report.structuredOutput }
         : {}),

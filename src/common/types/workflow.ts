@@ -1,10 +1,11 @@
 import type { z } from "zod";
 import type {
+  AvailableWorkflowSchema,
   StructuredTaskOutputSchema,
-  WorkflowDefinitionArgSummarySchema,
-  WorkflowDefinitionDescriptorSchema,
-  WorkflowDefinitionMetadataSchema,
-  WorkflowDefinitionScopeSchema,
+  WorkflowArgSummarySchema,
+  WorkflowScriptDescriptorSchema,
+  WorkflowMetadataSchema,
+  WorkflowScriptScopeSchema,
   WorkflowNameSchema,
   WorkflowResultSchema,
   WorkflowRunEventSchema,
@@ -12,26 +13,29 @@ import type {
   WorkflowRunParentSchema,
   WorkflowRunRecordSchema,
   WorkflowRunStatusSchema,
+  WorkflowRunStreamEventSchema,
   WorkflowStepRecordSchema,
   WorkflowStepStatusSchema,
 } from "@/common/orpc/schemas";
 import { WorkflowRunStatusTransitionSchema } from "@/common/orpc/schemas";
 import assert from "@/common/utils/assert";
 
-export type WorkflowDefinitionArgSummary = z.infer<typeof WorkflowDefinitionArgSummarySchema>;
-export type WorkflowDefinitionMetadata = z.infer<typeof WorkflowDefinitionMetadataSchema>;
+export type WorkflowArgSummary = z.infer<typeof WorkflowArgSummarySchema>;
+export type WorkflowMetadata = z.infer<typeof WorkflowMetadataSchema>;
 export type WorkflowName = z.infer<typeof WorkflowNameSchema>;
-export type WorkflowDefinitionScope = z.infer<typeof WorkflowDefinitionScopeSchema>;
+export type WorkflowScriptScope = z.infer<typeof WorkflowScriptScopeSchema>;
 export type WorkflowRunId = z.infer<typeof WorkflowRunIdSchema>;
 export type WorkflowRunStatus = z.infer<typeof WorkflowRunStatusSchema>;
 export type WorkflowStepStatus = z.infer<typeof WorkflowStepStatusSchema>;
-export type WorkflowDefinitionDescriptor = z.infer<typeof WorkflowDefinitionDescriptorSchema>;
+export type WorkflowScriptDescriptor = z.infer<typeof WorkflowScriptDescriptorSchema>;
 export type WorkflowResult = z.infer<typeof WorkflowResultSchema>;
 export type StructuredTaskOutput = z.infer<typeof StructuredTaskOutputSchema>;
 export type WorkflowRunEvent = z.infer<typeof WorkflowRunEventSchema>;
 export type WorkflowStepRecord = z.infer<typeof WorkflowStepRecordSchema>;
 export type WorkflowRunParent = z.infer<typeof WorkflowRunParentSchema>;
 export type WorkflowRunRecord = z.infer<typeof WorkflowRunRecordSchema>;
+export type WorkflowRunStreamEvent = z.infer<typeof WorkflowRunStreamEventSchema>;
+export type AvailableWorkflow = z.infer<typeof AvailableWorkflowSchema>;
 
 const ACTIVE_WORKFLOW_RUN_STATUSES = new Set<WorkflowRunStatus>([
   "pending",
@@ -45,6 +49,29 @@ export function isActiveWorkflowRunStatus(status: WorkflowRunStatus): boolean {
 
 export function isTerminalWorkflowRunStatus(status: WorkflowRunStatus): boolean {
   return status === "completed" || status === "failed" || status === "interrupted";
+}
+
+/**
+ * Status of a nested-workflow ("child") run event embedded in a parent run's event stream.
+ * Distinct from {@link WorkflowRunStatus}: an in-progress child event reports "started" rather
+ * than the persisted run's "pending".
+ */
+export type WorkflowChildEventStatus = Extract<WorkflowRunEvent, { type: "workflow" }>["status"];
+
+const ACTIVE_WORKFLOW_CHILD_EVENT_STATUSES = new Set<WorkflowChildEventStatus>([
+  "started",
+  "running",
+  "backgrounded",
+]);
+
+/**
+ * Whether a nested-workflow event status represents an in-progress child run. Accepts
+ * null/undefined so callers can pass an optional projected status without their own guard.
+ */
+export function isActiveWorkflowChildEventStatus(
+  status: WorkflowChildEventStatus | null | undefined
+): boolean {
+  return status != null && ACTIVE_WORKFLOW_CHILD_EVENT_STATUSES.has(status);
 }
 
 export function isNestedWorkflowRun(run: { parentWorkflow?: WorkflowRunParent | null }): boolean {

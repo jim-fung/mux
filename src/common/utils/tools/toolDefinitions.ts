@@ -31,10 +31,6 @@ import {
   AgentIdSchema,
   AgentSkillPackageSchema,
   SkillNameSchema,
-  WorkflowDefinitionArgSummarySchema,
-  WorkflowDefinitionDescriptorSchema,
-  WorkflowDefinitionMetadataSchema,
-  WorkflowNameSchema,
   WorkflowRunRecordSchema,
   WorkflowRunStatusSchema,
   WorkflowStepStatusSchema,
@@ -324,7 +320,7 @@ export function buildTaskToolDescription(runtimeMode: RuntimeMode | undefined): 
     "Avoid telling the sub-agent to read your plan file; child workspaces do not automatically have access to it. " +
     "\n\nIf run_in_background is false, waits for the sub-agent to finish and returns the completed report. When grouped sibling tasks are requested via n or variants, the completed result includes one report per spawned task. " +
     "If the foreground wait times out, returns queued/starting/running task metadata with a note (the task continues running); use task_await to monitor progress. " +
-    "If run_in_background is true, returns immediately with queued/starting/running task metadata; use task_await to wait for completion, task_list to rediscover active tasks, and task_terminate to stop it. " +
+    "If run_in_background is true, returns immediately with queued/starting/running task metadata and the task runs non-blocking: you may end your turn without awaiting it, and Mux wakes this workspace when the task reaches a terminal state so you can integrate its result. Use task_await only when the current request depends on the output before you can answer, or to inspect progress. " +
     "Prefer run_in_background: false when spawning a single task — it is equivalent to spawning background + immediately awaiting, but saves a round-trip. " +
     "Use run_in_background: true when launching multiple tasks in parallel so you can act on each as it completes via task_await (which returns on the first completion by default); a foreground grouped spawn (run_in_background: false) instead blocks until every sibling finishes and returns all reports at once. " +
     "Do not call task_await in the same parallel tool-call batch; wait for the returned task metadata first. " +
@@ -341,6 +337,12 @@ const WorkspaceTaskTargetSchema = z
     workspaceId: z.string().trim().min(1).nullish(),
     branchName: z.string().trim().min(1).nullish(),
     trunkBranch: z.string().trim().min(1).nullish(),
+    queueDispatchMode: z
+      .enum(["tool-end", "turn-end"])
+      .nullish()
+      .describe(
+        'For kind="workspace" + workspace.mode="existing", choose when a follow-up queued while the workspace is busy should dispatch: "tool-end" after the next tool call, or "turn-end" after the current turn.'
+      ),
     disposable: z.boolean().nullish(),
   })
   .strict();
@@ -517,6 +519,7 @@ const TaskToolCompletedReportSchema = z
     reportMarkdown: z.string(),
     title: z.string().optional(),
     structuredOutput: z.unknown().optional(),
+    planFilePath: z.string().optional(),
     agentId: z.string().optional(),
     agentType: z.string().optional(),
     handleKind: TaskHandleKindSchema.optional(),
@@ -565,6 +568,7 @@ export const TaskToolCompletedResultSchema = z
     reportMarkdown: z.string().optional(),
     title: z.string().optional(),
     structuredOutput: z.unknown().optional(),
+    planFilePath: z.string().optional(),
     agentId: z.string().optional(),
     agentType: z.string().optional(),
     handleKind: TaskHandleKindSchema.optional(),
@@ -754,6 +758,31 @@ export const TaskAwaitToolCompletedResultSchema = z
   })
   .strict();
 
+export const WorkflowProgressPhaseSummarySchema = z
+  .object({
+    name: z.string().min(1),
+    at: z.string(),
+  })
+  .strict();
+
+export const WorkflowProgressStepCountsSchema = z
+  .object({
+    started: z.number().int().nonnegative(),
+    completed: z.number().int().nonnegative(),
+    failed: z.number().int().nonnegative(),
+    interrupted: z.number().int().nonnegative(),
+  })
+  .strict();
+
+export const WorkflowProgressSummarySchema = z
+  .object({
+    name: z.string().min(1),
+    latestPhase: WorkflowProgressPhaseSummarySchema.optional(),
+    lastProgressAt: z.string().optional(),
+    stepCounts: WorkflowProgressStepCountsSchema,
+  })
+  .strict();
+
 export const TaskAwaitToolActiveResultSchema = z
   .object({
     status: z.enum([
@@ -770,6 +799,7 @@ export const TaskAwaitToolActiveResultSchema = z
     output: z.string().optional(),
     elapsed_ms: z.number().optional(),
     note: z.string().optional(),
+    workflowProgress: WorkflowProgressSummarySchema.optional(),
   })
   .strict();
 
@@ -791,7 +821,7 @@ export const TaskAwaitToolInvalidScopeResultSchema = z
 
 // Failure is the one case where workflow state must reach the model: it has to decide between
 // workflow_resume (retry_from_checkpoint) and a fresh workflow_run. Surface per-step outcomes
-// compactly — never the full run record (definition source / event log).
+// compactly — never the full run record (script source / event log).
 export const TaskAwaitWorkflowFailureStateSchema = z
   .object({
     name: z.string().min(1),
@@ -860,9 +890,7 @@ export const TaskApplyGitPatchToolArgsSchema = z
     force: z
       .boolean()
       .nullish()
-      .describe(
-        "When true, allow apply even if the patch was previously applied (and skip clean-tree checks)."
-      ),
+      .describe("When true, allow apply even if the patch was previously applied."),
   })
   .strict();
 
@@ -993,6 +1021,98 @@ export const TaskTerminateToolResultSchema = z
   .strict();
 
 // -----------------------------------------------------------------------------
+// task_workspace_lifecycle (parent-owned workspace cleanup)
+// -----------------------------------------------------------------------------
+
+export const TaskWorkspaceLifecycleActionSchema = z.enum(["archive", "delete_worktree", "remove"]);
+
+export const TaskWorkspaceLifecycleTargetSchema = z
+  .object({
+    taskId: z.string().min(1).nullish(),
+    workspaceId: z.string().min(1).nullish(),
+  })
+  .strict()
+  .superRefine((target, ctx) => {
+    const hasTaskId = target.taskId != null && target.taskId.trim().length > 0;
+    const hasWorkspaceId = target.workspaceId != null && target.workspaceId.trim().length > 0;
+    if (hasTaskId === hasWorkspaceId) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Provide exactly one of taskId or workspaceId",
+        path: ["taskId"],
+      });
+    }
+  });
+
+export const TaskWorkspaceLifecycleToolArgsSchema = z
+  .object({
+    action: TaskWorkspaceLifecycleActionSchema.describe(
+      'Lifecycle action to perform: "archive" is the safe default, "delete_worktree" reclaims disk after archive, and "remove" irreversibly deletes archived workspace metadata/session state.'
+    ),
+    targets: z
+      .array(TaskWorkspaceLifecycleTargetSchema)
+      .min(1)
+      .describe(
+        "Parent-owned workspace-turn targets. Provide exactly one of taskId (wst_...) or workspaceId for each target."
+      ),
+    interrupt_active: z
+      .boolean()
+      .nullish()
+      .describe(
+        "When true, interrupt active workspace turns for the target before performing an otherwise-eligible lifecycle action. Defaults to false."
+      ),
+    force: z
+      .boolean()
+      .nullish()
+      .describe(
+        "Only applies to remove. Does not bypass ownership, active-turn, archive, or archive-confirmation safety checks."
+      ),
+    acknowledged_untracked_paths: z
+      .record(z.string(), z.array(z.string()))
+      .nullish()
+      .describe(
+        "Archive-only confirmations keyed by resolved workspaceId. Use only paths returned by a previous requires_confirmation result."
+      ),
+  })
+  .strict();
+
+const TaskWorkspaceLifecycleBaseResultSchema = z.object({
+  action: TaskWorkspaceLifecycleActionSchema,
+  taskId: z.string().optional(),
+  workspaceId: z.string().optional(),
+  displayName: z.string().optional(),
+  paths: z.array(z.string()).optional(),
+  activeTaskIds: z.array(z.string()).optional(),
+  note: z.string().optional(),
+  error: z.string().optional(),
+});
+
+export const TaskWorkspaceLifecycleToolTargetResultSchema = z.discriminatedUnion("status", [
+  TaskWorkspaceLifecycleBaseResultSchema.extend({ status: z.literal("archived") }).strict(),
+  TaskWorkspaceLifecycleBaseResultSchema.extend({ status: z.literal("already_archived") }).strict(),
+  TaskWorkspaceLifecycleBaseResultSchema.extend({ status: z.literal("deleted_worktree") }).strict(),
+  TaskWorkspaceLifecycleBaseResultSchema.extend({
+    status: z.literal("already_transcript_only"),
+  }).strict(),
+  TaskWorkspaceLifecycleBaseResultSchema.extend({ status: z.literal("removed") }).strict(),
+  TaskWorkspaceLifecycleBaseResultSchema.extend({ status: z.literal("already_removed") }).strict(),
+  TaskWorkspaceLifecycleBaseResultSchema.extend({ status: z.literal("requires_archive") }).strict(),
+  TaskWorkspaceLifecycleBaseResultSchema.extend({
+    status: z.literal("requires_confirmation"),
+  }).strict(),
+  TaskWorkspaceLifecycleBaseResultSchema.extend({ status: z.literal("active") }).strict(),
+  TaskWorkspaceLifecycleBaseResultSchema.extend({ status: z.literal("not_found") }).strict(),
+  TaskWorkspaceLifecycleBaseResultSchema.extend({ status: z.literal("invalid_scope") }).strict(),
+  TaskWorkspaceLifecycleBaseResultSchema.extend({ status: z.literal("error") }).strict(),
+]);
+
+export const TaskWorkspaceLifecycleToolResultSchema = z
+  .object({
+    results: z.array(TaskWorkspaceLifecycleToolTargetResultSchema),
+  })
+  .strict();
+
+// -----------------------------------------------------------------------------
 // task_list (list descendant sub-agent tasks)
 // -----------------------------------------------------------------------------
 
@@ -1019,8 +1139,15 @@ export const TaskListToolArgsSchema = z
       .array(TaskListStatusSchema)
       .nullish()
       .describe(
-        "Task statuses to include. Defaults to active tasks: queued, starting, running, awaiting_report, pending, backgrounded. " +
-          "Pass ['interrupted', 'failed'] to discover workflow runs that may be resumable via workflow_resume."
+        "Task statuses to include. Defaults to unfinished tasks and workflow runs: queued, starting, running, awaiting_report, pending, backgrounded. " +
+          "Omitting statuses is the safe recovery default after an uncertain workflow_run because it includes unfinished workflow runs. " +
+          "Pass ['interrupted', 'failed'] to discover workflow runs that may be resumable via workflow_resume, but do not use only terminal/resumable statuses when checking for a still-running workflow."
+      ),
+    includeArchived: z
+      .boolean()
+      .nullish()
+      .describe(
+        "Whether to include archived child workspace tasks. Defaults to false, hiding archived non-actionable child workspace work."
       ),
   })
   .strict();
@@ -1038,6 +1165,7 @@ export const TaskListToolTaskSchema = z
     workspaceId: z.string().optional(),
     modelString: z.string().optional(),
     thinkingLevel: TaskListThinkingLevelSchema.optional(),
+    workflowProgress: WorkflowProgressSummarySchema.optional(),
     depth: z.number().int().min(0),
   })
   .strict();
@@ -1052,53 +1180,22 @@ export const TaskListToolResultSchema = z
 // workflow_run (durable workflow orchestration)
 // -----------------------------------------------------------------------------
 
-export const WorkflowListToolArgsSchema = z.object({}).strict();
-
-export const WorkflowDefinitionToolDescriptorSchema = z.intersection(
-  WorkflowDefinitionDescriptorSchema,
-  z
-    .object({
-      args: z.array(WorkflowDefinitionArgSummarySchema).optional(),
-    })
-    .passthrough()
-);
-
-export const WorkflowListToolResultSchema = z
-  .object({
-    workflows: z.array(WorkflowDefinitionToolDescriptorSchema),
-  })
-  .strict();
-
-export const WorkflowReadToolViewSchema = z.enum(["metadata", "source"]);
-
-export const WorkflowReadToolArgsSchema = z
-  .object({
-    name: WorkflowNameSchema,
-    view: WorkflowReadToolViewSchema.nullish(),
-  })
-  .strict();
-
-export const WorkflowReadToolSourceStatsSchema = z
-  .object({
-    chars: z.number().int().nonnegative(),
-    lines: z.number().int().nonnegative(),
-  })
-  .strict();
-
-export const WorkflowReadToolResultSchema = z
-  .object({
-    view: WorkflowReadToolViewSchema,
-    descriptor: WorkflowDefinitionDescriptorSchema,
-    metadata: WorkflowDefinitionMetadataSchema.nullable(),
-    args: z.array(WorkflowDefinitionArgSummarySchema).optional(),
-    sourceStats: WorkflowReadToolSourceStatsSchema,
-    source: z.string().min(1).optional(),
-  })
-  .strict();
-
 export const WorkflowRunToolArgsSchema = z
   .object({
-    name: WorkflowNameSchema,
+    script_path: z
+      .string()
+      .min(1)
+      .nullish()
+      .describe(
+        'Explicit workflow script path, such as "skill://deep-research/workflow.js" or "./workflows/research.js". Use paths for reusable, reviewable, or skill-packaged workflows.'
+      ),
+    script_source: z
+      .string()
+      .min(1)
+      .nullish()
+      .describe(
+        "Inline JavaScript workflow source for compact one-off conductors. The exact source is snapshotted into the durable run for replay/resume."
+      ),
     args: z.unknown().nullish(),
     run_in_background: z
       .boolean()
@@ -1109,7 +1206,18 @@ export const WorkflowRunToolArgsSchema = z
           "Set true only when you will start another workflow/task or do independent work while it runs. If workflow_run returns status=running or status=backgrounded, await the returned runId with task_await before using the result."
       ),
   })
-  .strict();
+  .strict()
+  .superRefine((args, ctx) => {
+    const hasPath = args.script_path != null;
+    const hasSource = args.script_source != null;
+    if (hasPath === hasSource) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Provide exactly one of script_path or script_source.",
+        path: ["script_path"],
+      });
+    }
+  });
 
 export const WorkflowRunToolResultSchema = z
   .object({
@@ -1169,20 +1277,7 @@ export const AgentReportInlineToolArgsSchema = z
   })
   .strict();
 
-export const AgentReportWorkflowInlineToolArgsSchema = z
-  .object({
-    reportMarkdown: z.string().min(1),
-    structuredOutput: z
-      .unknown()
-      .refine((value) => value !== undefined, "structuredOutput is required"),
-    title: z.string().nullish(),
-  })
-  .strict();
-
-export const AgentReportToolArgsSchema = z.union([
-  AgentReportInlineToolArgsSchema,
-  AgentReportWorkflowInlineToolArgsSchema,
-]);
+export const AgentReportToolArgsSchema = AgentReportInlineToolArgsSchema;
 
 export const AgentReportSubmittedReportSchema = z
   .object({
@@ -1304,6 +1399,28 @@ function renameAliasField(
   return { ...rest, [canonical]: aliasValue };
 }
 
+const BashMonitorSchema = z
+  .object({
+    filter: z.string().min(1).describe("Regex applied to each complete output line."),
+    filter_exclude: z
+      .boolean()
+      .nullish()
+      .describe("When true, wake for complete lines that do not match filter."),
+    cooldown_ms: z
+      .number()
+      .int()
+      .min(0)
+      .nullish()
+      .describe("Milliseconds to coalesce matching lines before one wake. Defaults to 1000."),
+    max_events: z
+      .number()
+      .int()
+      .positive()
+      .nullish()
+      .describe("Stop monitoring after this many matching lines; the process keeps running."),
+  })
+  .strict();
+
 /**
  * Tool definitions: single source of truth
  * Key = tool name, Value = { description, schema }
@@ -1316,7 +1433,8 @@ export const TOOL_DEFINITIONS = {
       "Commands that exceed these limits will FAIL with an error (no partial output returned). " +
       "Be conservative: use 'head', 'tail', 'grep', or other filters to limit output before running commands. " +
       "Large outputs may be automatically filtered; when this happens, the result includes a note explaining what was kept and (if available) where the full output was saved.\n" +
-      "On Windows this runs in Git Bash; to discard output use `>/dev/null` (not `>nul`).",
+      "On Windows this runs in Git Bash; to discard output use `>/dev/null` (not `>nul`). " +
+      "Background commands can include a monitor block with a regex filter; matching complete output lines wake this workspace, so no polling is required.",
     schema: z.preprocess(
       (value) => {
         // Compatibility shims for models that emit alias fields:
@@ -1332,49 +1450,59 @@ export const TOOL_DEFINITIONS = {
         obj = renameAliasField(obj, "description", "display_name");
         return obj;
       },
-      z.object({
-        script: z.string().describe("The bash script/command to execute"),
-        model_intent: z
-          .string()
-          .nullish()
-          .describe(
-            "Optional. Short user-facing purpose for this command, shown next to the command in collapsed chat. " +
-              "Use a present-participle phrase in plain English, under 100 characters. " +
-              "Do not repeat the command or include duration, because Mux appends those. " +
-              "Examples: 'Running the unit tests', 'Checking repository state', 'Inspecting build output'."
+      z
+        .object({
+          script: z.string().describe("The bash script/command to execute"),
+          model_intent: z
+            .string()
+            .nullish()
+            .describe(
+              "Optional. Short user-facing purpose for this command, shown next to the command in collapsed chat. " +
+                "Use a present-participle phrase in plain English, under 100 characters. " +
+                "Do not repeat the command or include duration, because Mux appends those. " +
+                "Examples: 'Running the unit tests', 'Checking repository state', 'Inspecting build output'."
+            ),
+          timeout_secs: z
+            .number()
+            .positive()
+            .describe(
+              "Timeout in seconds. For foreground: max execution time before kill. " +
+                "For background: max lifetime before auto-termination. " +
+                "Start small and increase on retry; avoid large initial values to keep UX responsive"
+            ),
+          run_in_background: z
+            .boolean()
+            .default(false)
+            .describe(
+              "Run this command in the background without blocking. " +
+                "Use for processes running >5s (dev servers, builds, file watchers). " +
+                "Do NOT use for quick commands (<5s), interactive processes (no stdin support), " +
+                "or processes requiring real-time output (use foreground with larger timeout instead). " +
+                "Returns immediately with a taskId (bash:<processId>) and backgroundProcessId. " +
+                "Read output with task_await (returns only new output since last check). " +
+                "Terminate with task_terminate using the taskId. " +
+                "List active tasks with task_list. " +
+                "Process persists until timeout_secs expires, terminated, or workspace is removed." +
+                "\\n\\nFor long-running tasks like builds or compilations, prefer background mode to continue productive work in parallel. " +
+                "Without a monitor, raw background bash does not automatically wake the parent workspace when it prints output or exits. " +
+                "With monitor, matching complete output lines wake this workspace; use task_await only if you need surrounding/full output. " +
+                "Do not call task_await in the same parallel tool-call batch; wait for the returned taskId first. " +
+                "When you actually need the output, read it with task_await; do not poll task_await just because the process is still running."
+            ),
+          monitor: BashMonitorSchema.nullish().describe(
+            "Wake-on-match monitor. Valid only with run_in_background=true. Matching complete output lines wake this workspace without polling."
           ),
-        timeout_secs: z
-          .number()
-          .positive()
-          .describe(
-            "Timeout in seconds. For foreground: max execution time before kill. " +
-              "For background: max lifetime before auto-termination. " +
-              "Start small and increase on retry; avoid large initial values to keep UX responsive"
-          ),
-        run_in_background: z
-          .boolean()
-          .default(false)
-          .describe(
-            "Run this command in the background without blocking. " +
-              "Use for processes running >5s (dev servers, builds, file watchers). " +
-              "Do NOT use for quick commands (<5s), interactive processes (no stdin support), " +
-              "or processes requiring real-time output (use foreground with larger timeout instead). " +
-              "Returns immediately with a taskId (bash:<processId>) and backgroundProcessId. " +
-              "Read output with task_await (returns only new output since last check). " +
-              "Terminate with task_terminate using the taskId. " +
-              "List active tasks with task_list. " +
-              "Process persists until timeout_secs expires, terminated, or workspace is removed." +
-              "\\n\\nFor long-running tasks like builds or compilations, prefer background mode to continue productive work in parallel. " +
-              "Do not call task_await in the same parallel tool-call batch; wait for the returned taskId first. " +
-              "When you actually need the output, read it with task_await; do not poll task_await just because the process is still running."
-          ),
-        display_name: z
-          .string()
-          .describe(
-            "Human-readable name for the process (e.g., 'Dev Server', 'TypeCheck Watch'). " +
-              "Required for all bash invocations since any process can be sent to background."
-          ),
-      })
+          display_name: z
+            .string()
+            .describe(
+              "Human-readable name for the process (e.g., 'Dev Server', 'TypeCheck Watch'). " +
+                "Required for all bash invocations since any process can be sent to background."
+            ),
+        })
+        .refine((args) => args.monitor == null || args.run_in_background === true, {
+          path: ["monitor"],
+          message: "monitor requires run_in_background=true",
+        })
     ),
   },
   file_read: {
@@ -1907,6 +2035,7 @@ export const TOOL_DEFINITIONS = {
       "\n\nWHEN TO USE: only call task_await when the current user request depends on a task's output, or when synthesis/integration of a previously-spawned task is the next logical step. " +
       "Do not call task_await solely because active tasks exist; for unrelated user messages, respond directly and let tasks continue in the background. " +
       "If a synthetic/system follow-up explicitly says active background tasks or workflow runs block your turn, treat that as a dependency and await the listed IDs. " +
+      "When a terminal wake-up says a sub-agent report or failure is already injected into context, integrate it directly — do NOT call task_await for it. When a wake-up asks you to retrieve a workspace turn's terminal output, call task_await with the listed IDs and timeout_secs: 0 (a one-shot retrieval, not a wait). " +
       "\n\nIMPORTANT: Do not call task_await in the same parallel tool-call batch as task, bash, or workflow_run — " +
       "the taskId/runId is not available until the spawning tool returns. " +
       "Always wait for the task/bash/workflow_run tool result first, then call task_await in a subsequent step. " +
@@ -1921,6 +2050,7 @@ export const TOOL_DEFINITIONS = {
       "This is ideal for independent lanes (variants) or any case where per-result work exists. " +
       "Set min_completed higher (up to the number of awaited tasks) when you genuinely need more before proceeding — e.g. best-of-N synthesis that must compare every candidate should pass min_completed equal to the batch size. " +
       "The result always includes every task complete at the moment it returns, plus current status for the rest; not-yet-completed tasks keep running and stay re-awaitable on a later call. " +
+      "Active workflow-run results may include compact `workflowProgress` (latest phase, last progress timestamp, and step counts); use that to see that phased progress is still happening instead of treating elapsed time alone as a hang. " +
       "You always get per-task results (like Promise.allSettled), just possibly before every task has finished. " +
       "Possible statuses: completed, queued, starting, running, backgrounded, awaiting_report, interrupted, not_found, invalid_scope, error. " +
       "Bash task outputs may be automatically filtered; when this happens, check each result's note for details and (if available) where the full output was saved.",
@@ -1934,39 +2064,43 @@ export const TOOL_DEFINITIONS = {
       "For workflow runs (wfr_... IDs), this interrupts the run instead: durable state is preserved and the run can be resumed later with workflow_resume.",
     schema: TaskTerminateToolArgsSchema,
   },
+  task_workspace_lifecycle: {
+    description:
+      'Archive, delete the managed worktree for, or remove full workspaces that the current workspace created via task(kind="workspace"). ' +
+      "This tool is scoped by durable workspace-turn ownership records; it cannot act on arbitrary user workspaces. " +
+      'Use action="archive" as the safe default when child work is complete. Use delete_worktree only after archive to reclaim disk while preserving transcript metadata. ' +
+      "Use remove only for irreversible cleanup of already archived owned workspaces. Active workspace turns are refused unless interrupt_active is true, and force never bypasses ownership, archive, or confirmation checks.",
+    schema: TaskWorkspaceLifecycleToolArgsSchema,
+  },
   task_list: {
     description:
       "List descendant tasks for the current workspace, including status + metadata. " +
       "This includes sub-agent tasks, background bash tasks, and top-level workflow runs, but omits workflow-owned sub-agents/background bash tasks whose reports are consumed through parent workflow runs. " +
-      "Use this after compaction, interruptions, or an app restart to rediscover active tasks and resumable workflow runs (statuses interrupted/failed; resume with workflow_resume). " +
+      "Use this after compaction, interruptions, workflow_run errors/aborts, or an app restart to rediscover active tasks and resumable workflow runs (statuses interrupted/failed; resume with workflow_resume). " +
+      "When recovering an uncertain workflow_run, omit statuses first or include pending/running/backgrounded as well as interrupted/failed/completed; terminal-only filters can hide unfinished workflow runs. Pending runs may need workflow_resume because no runner may be active yet. " +
+      "Workflow rows may include compact `workflowProgress` so callers can see the latest phase before deciding whether to await, resume, or leave the run alone. " +
+      "Archived non-actionable child workspace tasks are hidden by default; pass includeArchived: true to inspect them. " +
       "This is a discovery tool, NOT a waiting mechanism. If the current request actually depends on a task's output, call task_await with the specific task IDs you need; do not await all active tasks just because they appear here.",
     schema: TaskListToolArgsSchema,
-  },
-  workflow_list: {
-    description:
-      "List durable workflow definitions available in this workspace. Use this before workflow_run when you do not already know the workflow name. Returns descriptors plus compact argument hints when a workflow declares metadata.argsSchema, so many workflows can be run without a follow-up read. Before writing or editing workflow JS, read the built-in workflow-authoring skill. Scratch workflows are workspace files at .mux/workflows/.scratch/<name>.js and should be authored with file_read/file_edit_* tools.",
-    schema: WorkflowListToolArgsSchema,
-  },
-  workflow_read: {
-    description:
-      "Read a durable workflow definition by name. Defaults to metadata view, returning descriptor, parsed metadata, compact argument hints, and source size without the implementation source to avoid context pollution. Pass view='source' only when you truly need the full workflow JavaScript. Before authoring new workflow JS, read the built-in workflow-authoring skill for available globals, schema limits, and replay rules.",
-    schema: WorkflowReadToolArgsSchema,
   },
   workflow_run: {
     // Prefer foreground workflows so callers do not waste a turn polling when no other work can proceed.
     description:
-      "Start a durable workflow run by workflow name. Workflows coordinate delegated agent tasks and preserve run state for replay/resume. " +
+      "Start a durable workflow run from exactly one launch source: script_path for a JavaScript file/skill workflow, or script_source for compact one-off inline workflow source. Workflows coordinate delegated agent tasks and preserve run state for replay/resume. " +
+      "Prefer script_path for reusable, reviewable, shared, slash/CLI-invokable, or skill-packaged workflows; use script_source only for small one-off conductors whose exact source should be snapshotted into the durable run. " +
+      "Use agent_skill_read / agent_skill_read_file to discover and inspect skill-packaged workflows; non-skill workflow files must be addressed by an explicit known path and can be inspected with normal file tools. " +
       "Prefer the default foreground mode (`run_in_background` omitted or false) so completed workflows return their result without an extra task_await round-trip. " +
       "If workflow_run returns status=running or status=backgrounded, await the returned runId with task_await before using or reporting the workflow output. " +
-      "Use background mode only when you intend to start another workflow/task or do independent work while the workflow runs. " +
-      "To create a scratch workflow, first read the built-in workflow-authoring skill, then write .mux/workflows/.scratch/<name>.js with an export const metadata description and default exported function, then run it by name.",
+      "After a previous workflow_run error, abort, timeout, or uncertain result, do not start a fresh run until you rediscover existing workflow runs: either omit task_list statuses first, or query pending/running/backgrounded/interrupted/failed/completed together. " +
+      "Use task_await for running/backgrounded runs, workflow_resume for pending/interrupted runs, workflow_resume({ mode: 'retry_from_checkpoint' }) only for eligible failed runs, and inspect/refetch completed results instead of rerunning. " +
+      "Use background mode only when you intend to start another workflow/task or do independent work while the workflow runs; a background run is non-blocking and Mux wakes this workspace with the terminal workflow result, so call task_await only when the current request depends on the output before you can answer.",
     schema: WorkflowRunToolArgsSchema,
   },
   workflow_resume: {
     description:
       "Resume an existing durable workflow run by run ID (wfr_...). Use this for runs that were interrupted (by the user, task_terminate, or an app crash/restart) — " +
       "resume replays the durable event log and continues from the last checkpoint without re-executing completed steps. " +
-      "Discover resumable runs with task_list (statuses interrupted/failed). " +
+      "Discover resumable runs with task_list (statuses pending/interrupted/failed). Pending runs left by post-create aborts and interrupted runs can be resumed in default mode; running/backgrounded workflows do not need resume, await them with task_await. " +
       "For failed runs, pass mode='retry_from_checkpoint' explicitly; it re-executes work after the last checkpoint, so only use it when that is acceptable, and start a fresh workflow_run when it is rejected as unsafe. " +
       "Calling this on a completed run returns its existing result without re-running anything. " +
       "Prefer foreground mode (run_in_background omitted or false) to get the final result directly; " +
@@ -2358,12 +2492,22 @@ const BashToolSuccessSchema = z
   })
   .extend(ToolOutputUiOnlyFieldSchema);
 
+const BashToolMonitorResultSchema = z
+  .object({
+    filter: z.string(),
+    filter_exclude: z.boolean(),
+    cooldown_ms: z.number(),
+    max_events: z.number().optional(),
+  })
+  .strict();
+
 const BashToolBackgroundSchema = z
   .object({
     success: z.literal(true),
     output: z.string(),
     exitCode: z.literal(0),
     wall_duration_ms: z.number(),
+    monitor: BashToolMonitorResultSchema.optional(),
     taskId: z.string(),
     backgroundProcessId: z.string(),
   })
@@ -2724,6 +2868,7 @@ export type BridgeableToolName =
   | "task_apply_git_patch"
   | "task_list"
   | "task_terminate"
+  | "task_workspace_lifecycle"
   | "heartbeat"
   | "memory";
 
@@ -2750,6 +2895,7 @@ export const RESULT_SCHEMAS: Record<BridgeableToolName, z.ZodType> = {
   task_apply_git_patch: TaskApplyGitPatchToolResultSchema,
   task_list: TaskListToolResultSchema,
   task_terminate: TaskTerminateToolResultSchema,
+  task_workspace_lifecycle: TaskWorkspaceLifecycleToolResultSchema,
   heartbeat: HeartbeatToolResultSchema,
   memory: MemoryToolResultSchema,
 };
@@ -2856,10 +3002,9 @@ export function getAvailableTools(
     "task_await",
     "task_apply_git_patch",
     "task_terminate",
+    "task_workspace_lifecycle",
     "task_list",
-    ...(enableDynamicWorkflows
-      ? ["workflow_list", "workflow_read", "workflow_run", "workflow_resume"]
-      : []),
+    ...(enableDynamicWorkflows ? ["workflow_run", "workflow_resume"] : []),
     ...(enableAgentReport ? ["agent_report"] : []),
     "set_goal",
     "get_goal",

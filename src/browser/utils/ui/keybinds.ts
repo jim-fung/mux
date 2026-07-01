@@ -323,6 +323,9 @@ export const KEYBINDS = {
   INTERRUPT_STREAM_VIM: { key: "c", ctrl: true, macCtrlBehavior: "control" },
   INTERRUPT_STREAM_NORMAL: { key: "Escape" },
 
+  /** Continue an interrupted stream (R = resume; transcript-focused, like Shift+G) */
+  RESUME_STREAM: { key: "R", shift: true },
+
   /** Focus chat input */
   FOCUS_INPUT_I: { key: "i" },
 
@@ -377,14 +380,6 @@ export const KEYBINDS = {
   /** Configure heartbeat settings for current workspace */
   // macOS: Cmd+Shift+H, Win/Linux: Ctrl+Shift+H
   CONFIGURE_HEARTBEAT: { key: "H", ctrl: true, shift: true },
-
-  /** Configure automations for current workspace */
-  // macOS: Cmd+Shift+K, Win/Linux: Ctrl+Shift+K
-  CONFIGURE_SCHEDULED_WORKFLOW: { key: "K", ctrl: true, shift: true },
-
-  /** Configure automations for current project */
-  // macOS: Cmd+Option+K, Win/Linux: Ctrl+Alt+K
-  CONFIGURE_PROJECT_AUTOMATIONS: { key: "K", ctrl: true, alt: true },
 
   /** Open Command Palette */
   // VS Code-style palette

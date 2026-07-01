@@ -6,10 +6,11 @@ import {
   validateJsonSchemaSubsetSchema,
   type JsonSchemaValidationError,
 } from "@/common/utils/jsonSchemaSubset";
+import { normalizeWorkflowAgentReportPayloadForHostSchema } from "@/common/utils/tools/workflowReportPayload";
+import { sanitizeWorkflowAgentReportSchemaForOpenAI } from "@/common/utils/tools/schemaSanitizer";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import {
   AgentReportInlineToolArgsSchema,
-  AgentReportWorkflowInlineToolArgsSchema,
   TOOL_DEFINITIONS,
 } from "@/common/utils/tools/toolDefinitions";
 
@@ -55,7 +56,9 @@ function getWorkflowAgentOutputSchema(
   if (outputSchema == null) {
     return undefined;
   }
-  const schemaValidation = validateJsonSchemaSubsetSchema(outputSchema);
+  const schemaValidation = validateJsonSchemaSubsetSchema(outputSchema, {
+    requireObjectSchema: true,
+  });
   if (schemaValidation.success) {
     return outputSchema as Record<string, unknown>;
   }
@@ -71,7 +74,11 @@ function validateStructuredOutput(config: ToolConfiguration, structuredOutput: u
     return null;
   }
 
-  const validation = validateJsonSchemaSubset(outputSchema, structuredOutput);
+  const normalizedOutput = normalizeWorkflowAgentReportPayloadForHostSchema(
+    outputSchema,
+    structuredOutput
+  );
+  const validation = validateJsonSchemaSubset(outputSchema, normalizedOutput);
   return validation.success
     ? null
     : validationFailure("Structured output failed schema validation.", validation.errors);
@@ -83,52 +90,47 @@ function buildInlineInputSchema(config: ToolConfiguration) {
     return AgentReportInlineToolArgsSchema;
   }
 
-  return jsonSchema(
-    {
-      type: "object",
-      properties: {
-        reportMarkdown: { type: "string", minLength: 1 },
-        structuredOutput: outputSchema as JSONSchema7,
-        title: { anyOf: [{ type: "string" }, { type: "null" }] },
-      },
-      required: ["reportMarkdown", "structuredOutput", "title"],
-      additionalProperties: false,
-    } satisfies JSONSchema7,
-    {
-      validate: (value) => {
-        const parsed = AgentReportWorkflowInlineToolArgsSchema.safeParse(value);
-        if (!parsed.success) {
-          return { success: false, error: parsed.error };
-        }
-        const validation = validateStructuredOutput(config, parsed.data.structuredOutput);
-        if (validation) {
-          return { success: false, error: new Error(validation.message) };
-        }
-        return { success: true, value: parsed.data };
-      },
-    }
-  );
+  // Expose an OpenAI-compatible schema to providers while keeping the richer
+  // Ajv schema for host-side validation in executeInlineReport.
+  const providerFacingSchema = sanitizeWorkflowAgentReportSchemaForOpenAI(
+    outputSchema
+  ) as JSONSchema7;
+  return jsonSchema(providerFacingSchema, {
+    validate: (value) => {
+      const normalizedValue = normalizeWorkflowAgentReportPayloadForHostSchema(outputSchema, value);
+      const validation = validateStructuredOutput(config, normalizedValue);
+      if (validation) {
+        return { success: false, error: new Error(validation.message) };
+      }
+      return { success: true, value: normalizedValue };
+    },
+  });
 }
 
 function executeInlineReport(config: ToolConfiguration, rawArgs: unknown): AgentReportResult {
-  const argsSchema =
-    getWorkflowAgentOutputSchema(config) == null
-      ? AgentReportInlineToolArgsSchema
-      : AgentReportWorkflowInlineToolArgsSchema;
-  const parsed = argsSchema.safeParse(rawArgs);
+  const workflowOutputSchema = getWorkflowAgentOutputSchema(config);
+  if (workflowOutputSchema != null) {
+    const normalizedArgs = normalizeWorkflowAgentReportPayloadForHostSchema(
+      workflowOutputSchema,
+      rawArgs
+    );
+    const structuredValidation = validateStructuredOutput(config, normalizedArgs);
+    if (structuredValidation) {
+      return structuredValidation;
+    }
+    // Intentionally no report payload on success. The backend orchestrator consumes inline
+    // tool-call args from persisted history once the tool call completes successfully.
+    return {
+      success: true,
+      message: "Report submitted successfully.",
+    };
+  }
+
+  const parsed = AgentReportInlineToolArgsSchema.safeParse(rawArgs);
   if (!parsed.success) {
     return zodValidationFailure("Report arguments failed validation.", parsed.error);
   }
 
-  const structuredOutput =
-    "structuredOutput" in parsed.data ? parsed.data.structuredOutput : undefined;
-  const structuredValidation = validateStructuredOutput(config, structuredOutput);
-  if (structuredValidation) {
-    return structuredValidation;
-  }
-
-  // Intentionally no report payload on success. The backend orchestrator consumes inline
-  // tool-call args from persisted history once the tool call completes successfully.
   return {
     success: true,
     message: "Report submitted successfully.",

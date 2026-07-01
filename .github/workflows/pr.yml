@@ -190,22 +190,12 @@ jobs:
             exit 0
           fi
 
-          # QuickJS-heavy workflow fixtures are isolated from coverage: Bun's coverage
-          # process can OOM or stall the asyncified QuickJS runtime in this file. Run
-          # bounded groups in fresh Bun processes so runtime state cannot accumulate until
-          # the 15m unit job timeout cancels the step without a failure.
-          built_in_workflow_definitions_test=src/node/services/workflows/builtInWorkflowDefinitions.test.ts
-          built_in_workflow_definition_filters=(
-            "built-in deep-research workflow"
-          )
-          for test_filter in "${built_in_workflow_definition_filters[@]}"; do
-            echo "::group::$built_in_workflow_definitions_test -t $test_filter"
-            bun test --max-concurrency=1 "$built_in_workflow_definitions_test" -t "$test_filter"
-            echo "::endgroup::"
-          done
 
           isolated_unit_tests=(
-            src/node/services/workflows/subAgentWorkflowDefinitions.test.ts
+            # QuickJS-heavy workflow tests can crash Bun coverage when sharing
+            # the monolithic unit-test process; keep them in the isolated pass.
+            src/node/services/workflows/WorkflowRunner.test.ts
+            src/node/orpc/router.test.ts
             src/browser/components/WorkspaceHeartbeatModal/WorkspaceHeartbeatModal.test.tsx
             src/browser/features/Messages/InlineSkillMarkdown.test.tsx
             src/browser/hooks/useChatTranscriptFullWidth.test.tsx
@@ -215,8 +205,8 @@ jobs:
 
           mapfile -d '' unit_files < <(
             find src -type f \( -name '*.test.ts' -o -name '*.test.tsx' \) \
-              ! -path 'src/node/services/workflows/builtInWorkflowDefinitions.test.ts' \
-              ! -path 'src/node/services/workflows/subAgentWorkflowDefinitions.test.ts' \
+              ! -path 'src/node/orpc/router.test.ts' \
+              ! -path 'src/node/services/workflows/WorkflowRunner.test.ts' \
               ! -path 'src/browser/components/WorkspaceHeartbeatModal/WorkspaceHeartbeatModal.test.tsx' \
               ! -path 'src/browser/features/Messages/InlineSkillMarkdown.test.tsx' \
               ! -path 'src/browser/hooks/useChatTranscriptFullWidth.test.tsx' \
@@ -293,6 +283,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup-mux
       - uses: ./.github/actions/setup-playwright
+        timeout-minutes: 10
       - run: make storybook-build
       - run: |
           bun x http-server storybook-static -p 6006 &
@@ -331,7 +322,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb
+      # Bound browser setup; Playwright downloads can stall after progress reaches 100%.
       - uses: ./.github/actions/setup-playwright
+        timeout-minutes: 10
       - name: Run tests
         if: matrix.os == 'linux'
         run: xvfb-run -a make test-e2e
