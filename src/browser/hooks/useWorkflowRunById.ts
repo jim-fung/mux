@@ -1,52 +1,29 @@
-import { useContext, useEffect, useState } from "react";
+import { useContext, useSyncExternalStore } from "react";
 
 import { APIContext } from "@/browser/contexts/API";
-import { isActiveWorkflowRunStatus, type WorkflowRunRecord } from "@/common/types/workflow";
+import type { WorkflowRunRecord } from "@/common/types/workflow";
+import {
+  subscribeWorkflowRun,
+  getWorkflowRunSnapshot,
+} from "./workflowRunCache";
 
-const WORKFLOW_RUN_REFRESH_INTERVAL_MS = 2_000;
+// Re-export helpers from the dedicated helpers module for backwards compatibility
+// with existing consumers that imported them from this module.
+export {
+  getNewestWorkflowRunSnapshot,
+  shouldContinueWorkflowRunPolling,
+} from "./workflowRunHelpers";
 
-function getWorkflowRunTimestamp(value: string): number | null {
-  const timestamp = Date.parse(value);
-  return Number.isFinite(timestamp) ? timestamp : null;
-}
-
-function getLatestWorkflowEventSequence(run: WorkflowRunRecord | null | undefined): number {
-  return run?.events.reduce((maxSequence, event) => Math.max(maxSequence, event.sequence), 0) ?? 0;
-}
-
-function compareWorkflowRunSnapshots(left: WorkflowRunRecord, right: WorkflowRunRecord): number {
-  const leftUpdatedAt = getWorkflowRunTimestamp(left.updatedAt);
-  const rightUpdatedAt = getWorkflowRunTimestamp(right.updatedAt);
-  if (leftUpdatedAt != null && rightUpdatedAt != null && leftUpdatedAt !== rightUpdatedAt) {
-    return leftUpdatedAt - rightUpdatedAt;
-  }
-  if (leftUpdatedAt != null && rightUpdatedAt == null) {
-    return 1;
-  }
-  if (leftUpdatedAt == null && rightUpdatedAt != null) {
-    return -1;
-  }
-  return getLatestWorkflowEventSequence(left) - getLatestWorkflowEventSequence(right);
-}
-
-export function getNewestWorkflowRunSnapshot(
-  current: WorkflowRunRecord | null,
-  next: WorkflowRunRecord | null
-): WorkflowRunRecord | null {
-  if (next == null) {
-    return current;
-  }
-  if (current == null || current.id !== next.id) {
-    return next;
-  }
-  return compareWorkflowRunSnapshots(current, next) > 0 ? current : next;
-}
+// Re-export the cache types and helpers for consumers that imported them from here.
+export type { WorkflowRunSnapshot } from "./workflowRunCache";
 
 export interface UseWorkflowRunByIdResult {
   run: WorkflowRunRecord | null;
   loading: boolean;
   error: string | null;
 }
+
+const IDLE_SNAPSHOT: UseWorkflowRunByIdResult = { run: null, loading: false, error: null };
 
 export function useWorkflowRunById(input: {
   workspaceId?: string;
@@ -56,71 +33,37 @@ export function useWorkflowRunById(input: {
   pollAfterTerminal?: boolean;
 }): UseWorkflowRunByIdResult {
   const apiState = useContext(APIContext);
-  const [run, setRun] = useState<WorkflowRunRecord | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const enabled = input.enabled !== false;
   const api = apiState?.api;
   const workspaceId = input.workspaceId;
   const runId = input.runId;
 
-  useEffect(() => {
-    if (!enabled || api == null || workspaceId == null || runId == null) {
-      setLoading(false);
-      setError(null);
-      return;
-    }
+  const isReady = enabled && workspaceId != null && runId != null;
 
-    let ignore = false;
-    let interval: number | null = null;
-    setLoading(true);
-
-    const refresh = async () => {
-      try {
-        const nextRun = await api.workflows.getRun({ workspaceId, runId });
-        if (ignore) {
-          return;
-        }
-        setRun((currentRun) => getNewestWorkflowRunSnapshot(currentRun, nextRun));
-        setError(null);
-        setLoading(false);
-        if (
-          input.pollWhileActive === true &&
-          input.pollAfterTerminal !== true &&
-          nextRun != null &&
-          !isActiveWorkflowRunStatus(nextRun.status) &&
-          interval != null
-        ) {
-          window.clearInterval(interval);
-          interval = null;
-        }
-      } catch (fetchError) {
-        if (ignore) {
-          return;
-        }
-        setError(fetchError instanceof Error ? fetchError.message : "Failed to load workflow run");
-        setLoading(false);
+  const snapshot = useSyncExternalStore(
+    (listener: () => void) => {
+      if (!isReady || api == null) {
+        return () => {};
       }
-    };
-
-    void refresh();
-    if (input.pollWhileActive === true) {
-      interval = window.setInterval(() => {
-        void refresh();
-      }, WORKFLOW_RUN_REFRESH_INTERVAL_MS);
-    }
-
-    return () => {
-      ignore = true;
-      if (interval != null) {
-        window.clearInterval(interval);
+      return subscribeWorkflowRun(workspaceId!, runId!, {
+        api,
+        pollWhileActive: input.pollWhileActive,
+        pollAfterTerminal: input.pollAfterTerminal,
+      }, listener);
+    },
+    () => {
+      if (!isReady) {
+        return IDLE_SNAPSHOT;
       }
-    };
-  }, [api, enabled, input.pollAfterTerminal, input.pollWhileActive, runId, workspaceId]);
+      return getWorkflowRunSnapshot(workspaceId!, runId!);
+    }
+  );
 
-  if (run != null && run.id !== runId) {
-    return { run: null, loading, error };
+  // Guard against stale snapshots from a different run (shouldn't happen with
+  // per-key cache entries, but kept for defensive parity with the old hook).
+  if (snapshot.run != null && runId != null && snapshot.run.id !== runId) {
+    return { run: null, loading: snapshot.loading, error: snapshot.error };
   }
 
-  return { run, loading, error };
+  return snapshot;
 }

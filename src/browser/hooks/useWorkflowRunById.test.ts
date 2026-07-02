@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test";
 
 import type { WorkflowRunRecord } from "@/common/types/workflow";
-import { getNewestWorkflowRunSnapshot } from "./useWorkflowRunById";
+import {
+  getNewestWorkflowRunSnapshot,
+  shouldContinueWorkflowRunPolling,
+} from "./useWorkflowRunById";
 
 function makeRun(input: {
   status: WorkflowRunRecord["status"];
@@ -64,5 +67,49 @@ describe("getNewestWorkflowRunSnapshot", () => {
     });
 
     expect(getNewestWorkflowRunSnapshot(older, newer)).toBe(newer);
+  });
+});
+
+describe("shouldContinueWorkflowRunPolling", () => {
+  test("stops polling once a run is terminal when terminal polling is disabled", () => {
+    expect(
+      shouldContinueWorkflowRunPolling({
+        pollWhileActive: true,
+        pollAfterTerminal: false,
+        run: makeRun({
+          status: "completed",
+          updatedAt: "2026-06-26T00:00:02.000Z",
+          sequence: 3,
+        }),
+      })
+    ).toBe(false);
+  });
+
+  test("keeps polling active runs when active polling is enabled", () => {
+    expect(
+      shouldContinueWorkflowRunPolling({
+        pollWhileActive: true,
+        pollAfterTerminal: false,
+        run: makeRun({
+          status: "running",
+          updatedAt: "2026-06-26T00:00:02.000Z",
+          sequence: 2,
+        }),
+      })
+    ).toBe(true);
+  });
+
+  test("keeps polling terminal runs when post-terminal polling is enabled", () => {
+    expect(
+      shouldContinueWorkflowRunPolling({
+        pollWhileActive: true,
+        pollAfterTerminal: true,
+        run: makeRun({
+          status: "completed",
+          updatedAt: "2026-06-26T00:00:02.000Z",
+          sequence: 3,
+        }),
+      })
+    ).toBe(true);
   });
 });
