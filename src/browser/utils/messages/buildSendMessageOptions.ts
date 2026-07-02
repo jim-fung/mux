@@ -10,6 +10,7 @@ export interface ExperimentValues {
   execSubagentHardRestart: boolean | undefined;
   dynamicWorkflows: boolean | undefined;
   memory: boolean | undefined;
+  astGrepOutline: boolean | undefined;
 }
 
 export interface SendMessageOptionsInput {

@@ -174,6 +174,7 @@ export const WorkspaceConfigSchema = z.object({
       advisorTool: z.boolean().optional(),
       dynamicWorkflows: z.boolean().optional(),
       execSubagentHardRestart: z.boolean().optional(),
+      astGrepOutline: z.boolean().optional(),
     })
     .optional()
     .meta({

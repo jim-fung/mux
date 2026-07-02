@@ -266,6 +266,7 @@ export interface ToolConfiguration {
     dynamicWorkflows?: boolean;
     memory?: boolean;
     workspaceHeartbeats?: boolean;
+    astGrepOutline?: boolean;
   };
   /** Available sub-agents for the task tool description (dynamic context) */
   availableSubagents?: AgentDefinitionDescriptor[];

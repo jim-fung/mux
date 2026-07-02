@@ -1375,6 +1375,9 @@ export class AIService extends EventEmitter {
       const workspaceHeartbeatsExperimentEnabled =
         experiments?.workspaceHeartbeats ??
         this.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS) === true;
+      const astGrepOutlineExperimentEnabled =
+        experiments?.astGrepOutline ??
+        this.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.AST_GREP_OUTLINE) === true;
       const memoryHotSetExperimentEnabled =
         this.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY_HOT_SET) === true;
       // Once final tool policy keeps the memory tool, upgrade the index-only
@@ -2113,6 +2116,7 @@ export class AIService extends EventEmitter {
           dynamicWorkflows: dynamicWorkflowsExperimentEnabled,
           memory: memoryExperimentEnabled,
           workspaceHeartbeats: workspaceHeartbeatsExperimentEnabled,
+          astGrepOutline: astGrepOutlineExperimentEnabled,
         },
         // Dynamic context for tool descriptions (moved from system prompt for better model attention)
         availableSubagents: agentDefinitions,

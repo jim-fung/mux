@@ -36,6 +36,7 @@ interface WorkflowTaskExperiments {
   workspaceHeartbeats?: boolean;
   subagentFileReports?: boolean;
   dynamicWorkflows?: boolean;
+  astGrepOutline?: boolean;
 }
 
 // Shared shape for agent task creation so the single-step `create` and the

@@ -227,6 +227,7 @@ function buildExperimentsObject(experimentIds: readonly string[]) {
     // experiment is enabled implicitly for this invocation (never persisted).
     dynamicWorkflows: true,
     workspaceHeartbeats: experimentIds.includes(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS),
+    astGrepOutline: experimentIds.includes(EXPERIMENT_IDS.AST_GREP_OUTLINE),
   };
 }
 

@@ -286,6 +286,7 @@ function buildExperimentsObject(experimentIds: string[]): SendMessageOptions["ex
     execSubagentHardRestart: experimentIds.includes("exec-subagent-hard-restart"),
     dynamicWorkflows: experimentIds.includes("dynamic-workflows"),
     workspaceHeartbeats: experimentIds.includes(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS),
+    astGrepOutline: experimentIds.includes(EXPERIMENT_IDS.AST_GREP_OUTLINE),
   };
 }
 

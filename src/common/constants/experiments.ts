@@ -20,6 +20,7 @@ export const EXPERIMENT_IDS = {
   MEMORY: "memory",
   MEMORY_HOT_SET: "memory-hot-set",
   MEMORY_CONSOLIDATION: "memory-consolidation",
+  AST_GREP_OUTLINE: "ast-grep-outline",
 } as const;
 
 export type ExperimentId = (typeof EXPERIMENT_IDS)[keyof typeof EXPERIMENT_IDS];
@@ -172,6 +173,15 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     name: "Memory Consolidation",
     description:
       "Background dream agent that consolidates memory files after compaction, on idle, and at archive",
+    enabledByDefault: false,
+    userOverridable: true,
+    showInSettings: true,
+  },
+  [EXPERIMENT_IDS.AST_GREP_OUTLINE]: {
+    id: EXPERIMENT_IDS.AST_GREP_OUTLINE,
+    name: "Code Outline Tool",
+    description:
+      "Enable the code_outline tool so agents can fetch structural symbol summaries via ast-grep",
     enabledByDefault: false,
     userOverridable: true,
     showInSettings: true,
