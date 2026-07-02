@@ -4,8 +4,6 @@ import type {
   DisplayedMessage,
   CompactionRequestData,
   InlineSkillSnapshotMap,
-  AgentSkillReference,
-  SideQuestionDisplayBranch,
 } from "@/common/types/message";
 import { createMuxMessage, isCompactionSummaryMetadata } from "@/common/types/message";
 
@@ -27,16 +25,8 @@ import {
   type StreamLifecycleSnapshot,
 } from "@/common/types/stream";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
-import type {
-  TodoItem,
-  StatusSetToolResult,
-  NotifyToolResult,
-  AgentSkillReadToolResult,
-} from "@/common/types/tools";
+import type { TodoItem } from "@/common/types/tools";
 import type { AssistedReviewHunk } from "@/common/types/review";
-import { formatAssistedFilter, parseAssistedFilter } from "@/common/utils/review/assistedReview";
-import { completeInProgressTodoItems } from "@/common/utils/todoList";
-import { AgentSkillReadToolResultSchema } from "@/common/utils/tools/toolDefinitions";
 import { getToolOutputUiOnly } from "@/common/utils/tools/toolOutputUiOnly";
 
 import { computePriorHistoryFingerprint } from "@/common/orpc/onChatCursorFingerprint";
@@ -46,7 +36,7 @@ import type {
   DeleteMessage,
   OnChatCursor,
 } from "@/common/orpc/types";
-import { isInitStart, isInitOutput, isInitEnd, isMuxMessage } from "@/common/orpc/types";
+import { isMuxMessage } from "@/common/orpc/types";
 import {
   buildAggregateResponseCompleteMetadata,
   buildResponseCompleteMetadata,
@@ -62,15 +52,13 @@ import {
 } from "./displayedMessageBuilder";
 import { showBrowserNotification } from "@/browser/utils/ui/showBrowserNotification";
 import type { DynamicToolPart, DynamicToolPartPending } from "@/common/types/toolParts";
-import type { AgentSkillDescriptor, AgentSkillScope } from "@/common/types/agentSkill";
-import { INIT_HOOK_MAX_LINES } from "@/common/constants/toolLimits";
+import { InitStateHandler } from "./aggregator/initStateHandler";
 import { isDynamicToolPart } from "@/common/types/toolParts";
-import { z } from "zod";
-import { createDeltaStorage, type DeltaRecordStorage } from "./StreamingTPSCalculator";
+import { TokenTracker } from "./aggregator/tokenTracker";
+import { StreamingStatsService } from "./aggregator/streamingStatsService";
 import { buildTranscriptTruncationPlan } from "./transcriptTruncationPlan";
 import { computeRecencyTimestamp } from "./recency";
 import { assert } from "@/common/utils/assert";
-import { getStatusStateKey } from "@/common/constants/storage";
 import {
   CONTEXT_BOUNDARY_KINDS,
   getContextBoundaryKind,
@@ -82,128 +70,41 @@ import {
 } from "@/common/utils/messages/sideQuestion";
 import { isWorkflowResultMessage } from "@/common/utils/workflowRunMessages";
 
+// H1: Schemas, parsers, and agent-skill-snapshot helpers extracted to dedicated modules.
+import {
+  parseLegacyNotifyRouting,
+  parseTodoWriteInput,
+  parseStatusSetSuccessResult,
+  parseNotifySuccessResult,
+  type AgentStatus,
+} from "./aggregator/schemas";
+import { MAX_DISPLAYED_MESSAGES, ALWAYS_KEEP_MESSAGE_TYPES } from "./aggregator/constants";
+import {
+  type AgentSkillSnapshotContent,
+  getAgentSkillSnapshotDisplayCacheKey,
+  getAgentSkillSnapshotKey,
+  maybeCollectAgentSkillSnapshot,
+  deriveInlineSkillSnapshotDisplayState,
+} from "./aggregator/agentSkillSnapshot";
+import { AgentStatusAdapter } from "./aggregator/agentStatusAdapter";
+import { SkillStore, type LoadedSkill, type SkillLoadError } from "./aggregator/skillStore";
+import { TodoStore } from "./aggregator/todoStore";
+import { AssistedReviewHunkStore } from "./aggregator/assistedReviewHunkStore";
+import {
+  buildSideQuestionDisplayPlan,
+  buildInterruptedMessageDisplay,
+  type SideQuestionPlannerDeps,
+} from "./aggregator/sideQuestionDisplayPlanner";
+
 // Maximum number of messages to display in the DOM for performance
 // Full history is still maintained internally for token counting and stats
-const AgentStatusSchema = z.object({
-  emoji: z.string(),
-  message: z.string(),
-  url: z.string().optional(),
-});
-
-// Synthetic agent-skill snapshot messages include metadata.agentSkillSnapshot.
-// We use this to keep the SkillIndicator in sync for /{skillName} invocations.
-const AgentSkillSnapshotMetadataSchema = z.object({
-  skillName: z.string().min(1),
-  scope: z.enum(["project", "global", "built-in"]),
-  sha256: z.string().optional(),
-  frontmatterYaml: z.string().optional(),
-});
-
-const TodoWriteInputSchema = z.object({
-  todos: z.array(
-    z.object({
-      content: z.string(),
-      status: z.enum(["pending", "in_progress", "completed"]),
-    })
-  ),
-});
-
-const StatusSetSuccessResultSchema = z.object({
-  success: z.literal(true),
-  emoji: z.string(),
-  message: z.string(),
-  url: z.string().optional(),
-}) satisfies z.ZodType<Extract<StatusSetToolResult, { success: true }>>;
-
-const ReviewPaneUpdateSuccessResultSchema = z.object({
-  success: z.literal(true),
-  operation: z.enum(["add", "replace"]),
-  hunks: z.array(
-    z.object({
-      path: z.string(),
-      comment: z.string().nullable().optional(),
-    })
-  ),
-});
-
-const NotifySuccessResultSchema = z.object({
-  success: z.literal(true),
-  title: z.string(),
-  message: z.string().optional(),
-}) satisfies z.ZodType<Extract<NotifyToolResult, { success: true }>>;
-
-const AgentSkillReadInputSchema = z.object({
-  name: z.string().optional(),
-});
-
-function parseLegacyNotifyRouting(
-  output: unknown
-): { notifiedVia?: string; workspaceId?: string } | null {
-  if (typeof output !== "object" || output === null) {
-    return null;
-  }
-  const record = output as Record<string, unknown>;
-  return {
-    notifiedVia: typeof record.notifiedVia === "string" ? record.notifiedVia : undefined,
-    workspaceId: typeof record.workspaceId === "string" ? record.workspaceId : undefined,
-  };
-}
-
-function parseAgentSkillReadToolResult(output: unknown): AgentSkillReadToolResult | null {
-  const parsed = AgentSkillReadToolResultSchema.safeParse(output);
-  return parsed.success ? parsed.data : null;
-}
-
-function parseTodoWriteInput(input: unknown): { todos: TodoItem[] } | null {
-  const parsed = TodoWriteInputSchema.safeParse(input);
-  return parsed.success ? parsed.data : null;
-}
-
-function parseStatusSetSuccessResult(
-  output: unknown
-): Extract<StatusSetToolResult, { success: true }> | null {
-  const parsed = StatusSetSuccessResultSchema.safeParse(output);
-  return parsed.success ? parsed.data : null;
-}
-
-function parseNotifySuccessResult(
-  output: unknown
-): Extract<NotifyToolResult, { success: true }> | null {
-  const parsed = NotifySuccessResultSchema.safeParse(output);
-  return parsed.success ? parsed.data : null;
-}
+// ---------------------------------------------------------------------------
+// Re-exported types (kept here for backward compatibility)
+// ---------------------------------------------------------------------------
 
 /** Re-export for consumers that need the loaded skill type */
-export type LoadedSkill = AgentSkillDescriptor;
-
-/** A runtime skill load failure (agent_skill_read returned { success: false }) */
-export interface SkillLoadError {
-  /** Skill name that was requested */
-  name: string;
-  /** Error message from the backend */
-  error: string;
-}
-
-type AgentStatus = z.infer<typeof AgentStatusSchema>;
-
-/**
- * Maximum number of DisplayedMessages to render before truncation kicks in.
- * We keep all user prompts and structural markers, while allowing older assistant
- * content to collapse behind history-hidden markers for faster initial paint.
- */
-const MAX_DISPLAYED_MESSAGES = 64;
-
-/**
- * Message types that are always preserved even in truncated history.
- * Older assistant/tool/reasoning rows may be omitted until the user clicks “Load all”.
- */
-const ALWAYS_KEEP_MESSAGE_TYPES = new Set<DisplayedMessage["type"]>([
-  "user",
-  "stream-error",
-  "compaction-boundary",
-  "plan-display",
-  "workspace-init",
-]);
+// Re-exported from skillStore for backward compatibility.
+export type { LoadedSkill, SkillLoadError };
 
 interface StreamingContext {
   /** Backend timestamp when stream started (Date.now()) */
@@ -287,170 +188,6 @@ function markRowsBeforeLatestContextBoundary(messages: DisplayedMessage[]): Disp
   return changed ? marked : messages;
 }
 
-function extractAgentSkillSnapshotBody(snapshotText: string): string | null {
-  assert(typeof snapshotText === "string", "extractAgentSkillSnapshotBody requires snapshotText");
-
-  // Expected format (backend):
-  // <agent-skill ...>\n{body}\n</agent-skill>
-  if (!snapshotText.startsWith("<agent-skill")) {
-    return null;
-  }
-
-  const openTagEnd = snapshotText.indexOf(">\n");
-  if (openTagEnd === -1) {
-    return null;
-  }
-
-  const closeTag = "\n</agent-skill>";
-  const closeTagStart = snapshotText.lastIndexOf(closeTag);
-  if (closeTagStart === -1) {
-    return null;
-  }
-
-  const bodyStart = openTagEnd + ">\n".length;
-  if (closeTagStart < bodyStart) {
-    return null;
-  }
-
-  // Be strict about trailing content: if we can't confidently extract the body,
-  // avoid showing a misleading preview.
-  const trailing = snapshotText.slice(closeTagStart + closeTag.length);
-  if (trailing.trim().length > 0) {
-    return null;
-  }
-
-  return snapshotText.slice(bodyStart, closeTagStart);
-}
-
-interface AgentSkillSnapshotContent {
-  sha256?: string;
-  frontmatterYaml?: string;
-  body?: string;
-}
-
-interface InlineSkillSnapshotDisplayState {
-  snapshots?: InlineSkillSnapshotMap;
-  cacheKey?: string;
-}
-
-function getAgentSkillSnapshotDisplayCacheKey(snapshot: AgentSkillSnapshotContent): string {
-  // Displayed skill rows render both frontmatter and body. Include all rendered
-  // fields rather than trusting optional legacy sha256, so cache reuse is safe
-  // for old histories and synthetic snapshot edits.
-  return JSON.stringify({
-    sha256: snapshot.sha256 ?? "",
-    frontmatterYaml: snapshot.frontmatterYaml ?? "",
-    body: snapshot.body ?? "",
-  });
-}
-
-function getAgentSkillSnapshotKey(scope: AgentSkillScope, skillName: string): string {
-  return `${scope}:${skillName}`;
-}
-
-function maybeCollectAgentSkillSnapshot(
-  message: MuxMessage,
-  snapshots: Map<string, AgentSkillSnapshotContent>
-): void {
-  const snapshotMeta = message.metadata?.agentSkillSnapshot;
-  if (!snapshotMeta) {
-    return;
-  }
-
-  const parsed = AgentSkillSnapshotMetadataSchema.safeParse(snapshotMeta);
-  if (!parsed.success) {
-    return;
-  }
-
-  const body = extractAgentSkillSnapshotBody(getTextPartContent(message.parts));
-  if (body === null) {
-    return;
-  }
-
-  snapshots.set(getAgentSkillSnapshotKey(parsed.data.scope, parsed.data.skillName), {
-    sha256: parsed.data.sha256,
-    frontmatterYaml: parsed.data.frontmatterYaml,
-    body,
-  });
-}
-
-function isAgentSkillReferenceArray(
-  refs: readonly AgentSkillReference[] | undefined
-): refs is readonly AgentSkillReference[] {
-  return Array.isArray(refs);
-}
-
-function deriveInlineSkillSnapshotDisplayState(
-  refs: readonly AgentSkillReference[] | undefined,
-  latestAgentSkillSnapshotByKey: ReadonlyMap<string, AgentSkillSnapshotContent>
-): InlineSkillSnapshotDisplayState {
-  if (!isAgentSkillReferenceArray(refs) || refs.length === 0) {
-    return {};
-  }
-
-  const snapshotsBySkillName: InlineSkillSnapshotMap = {};
-  const cacheEntryBySkillName = new Map<string, string>();
-
-  for (const ref of refs) {
-    if (ref.source !== "inline") {
-      continue;
-    }
-
-    const snapshot = latestAgentSkillSnapshotByKey.get(
-      getAgentSkillSnapshotKey(ref.scope, ref.skillName)
-    );
-    if (!snapshot || (snapshot.frontmatterYaml === undefined && snapshot.body === undefined)) {
-      continue;
-    }
-
-    snapshotsBySkillName[ref.skillName] = {
-      skillName: ref.skillName,
-      scope: ref.scope,
-      snapshot: {
-        frontmatterYaml: snapshot.frontmatterYaml,
-        body: snapshot.body,
-      },
-    };
-    cacheEntryBySkillName.set(
-      ref.skillName,
-      JSON.stringify({
-        scope: ref.scope,
-        skillName: ref.skillName,
-        snapshot: getAgentSkillSnapshotDisplayCacheKey(snapshot),
-      })
-    );
-  }
-
-  if (cacheEntryBySkillName.size === 0) {
-    return {};
-  }
-
-  return {
-    snapshots: snapshotsBySkillName,
-    cacheKey: Array.from(cacheEntryBySkillName.entries())
-      .sort(([leftSkillName], [rightSkillName]) => leftSkillName.localeCompare(rightSkillName))
-      .map(([, cacheEntry]) => cacheEntry)
-      .join("\n"),
-  };
-}
-
-interface MessagePartSplitCut {
-  textLength: number;
-  partIndex?: number;
-}
-
-interface SideQuestionDisplayPlan {
-  interruptionsByInterruptedId: Map<string, SideQuestionInterrupt[]>;
-  inlineSideQuestionMessageIds: Set<string>;
-}
-
-interface SideQuestionInterrupt {
-  atTextLength: number;
-  atPartIndex?: number;
-  sideQuestionUserMsg: MuxMessage;
-  sideQuestionAnswerMsg?: MuxMessage;
-}
-
 export class StreamingMessageAggregator {
   private messages = new Map<string, MuxMessage>();
   private activeStreams = new Map<string, StreamingContext>();
@@ -482,54 +219,23 @@ export class StreamingMessageAggregator {
    *  includes user-loaded older pages via loadOlderHistory). */
   private establishedOldestHistorySequence: number | null = null;
 
-  // Delta history for token counting and TPS calculation
-  private deltaHistory = new Map<string, DeltaRecordStorage>();
-
-  // Active stream usage tracking (updated on each usage-delta event)
-  // Consolidates step-level (context window) and cumulative (cost) usage by messageId
-  private activeStreamUsage = new Map<
-    string,
-    {
-      // Step-level: this step only (for context window display)
-      step: { usage: LanguageModelV2Usage; providerMetadata?: Record<string, unknown> };
-      // Cumulative: sum across all steps (for live cost display)
-      cumulative: { usage: LanguageModelV2Usage; providerMetadata?: Record<string, unknown> };
-    }
-  >();
+  // H7: Token tracking and usage extracted to TokenTracker.
+  private tokenTracker: TokenTracker = new TokenTracker();
 
   // Current TODO list (updated when todo_write succeeds)
   // Incomplete lists persist across streams and reloads; fully completed lists clear
   // once the final stream finishes so stale plans do not linger in the UI.
-  private currentTodos: TodoItem[] = [];
+  // H4: Todo + assisted-review tracking extracted to dedicated stores.
+  private todoStore: TodoStore = new TodoStore();
+  private reviewHunkStore: AssistedReviewHunkStore = new AssistedReviewHunkStore();
 
-  // Current agent status (updated when status_set is called)
-  // Unlike todos, this persists after stream completion to show last activity
-  private agentStatus: AgentStatus | undefined = undefined;
+  // Agent status lifecycle (status_set persistence + transient displayStatus)
+  private agentStatusAdapter: AgentStatusAdapter;
 
   // Agent-flagged "Assisted review" hunks (updated by review_pane_update).
   // Reconstructed from chat history on reload via processToolResult so the
-  // pinned set survives restarts; not persisted to disk.
-  //
-  // Each entry carries optional `addedAt` metadata so the UI can render a
-  // "new since last update" badge. The timestamp is populated only during
-  // live tool-call processing (not history replay); legacy paths and tests
-  // can omit it.
-  private assistedReviewHunks: AssistedReviewHunk[] = [];
-
-  // Loaded skills (updated when agent_skill_read succeeds)
-  // Persists after stream completion (like agentStatus) to show which skills were loaded
-  // Keyed by skill name to avoid duplicates
-  private loadedSkills = new Map<string, LoadedSkill>();
-  // Cached array for getLoadedSkills() to preserve reference identity for memoization
-  private loadedSkillsCache: LoadedSkill[] = [];
-
-  // Runtime skill load errors (updated when agent_skill_read fails)
-  // Keyed by skill name; cleared when the skill is later loaded successfully
-  private skillLoadErrors = new Map<string, SkillLoadError>();
-  private skillLoadErrorsCache: SkillLoadError[] = [];
-
-  // Last URL set via status_set - kept in memory to reuse when later calls omit url
-  private lastStatusUrl: string | undefined = undefined;
+  // H3: Skill tracking extracted to SkillStore.
+  private skillStore: SkillStore = new SkillStore();
 
   // Whether to disable DOM message capping for this workspace.
   // Controlled via the HistoryHiddenMessage “Load all” button.
@@ -537,31 +243,10 @@ export class StreamingMessageAggregator {
   // Workspace ID (used for status persistence)
   private readonly workspaceId: string | undefined;
 
-  // Workspace init hook state (ephemeral, not persisted to history)
-  private initState: {
-    status: "running" | "success" | "error";
-    hookPath: string;
-    lines: Array<{ line: string; isError: boolean }>;
-    exitCode: number | null;
-    startTime: number;
-    endTime: number | null;
-    truncatedLines?: number; // Lines dropped from middle when output exceeded limit
-  } | null = null;
-
-  // When reconnect replay re-emits init-start for the same running init, keep the existing row and
-  // treat replayed init-output as a continuation. Snapshot the already-visible prefix so replay can
-  // skip only those previously rendered lines without collapsing legitimate duplicates later on.
-  private replayInitVisiblePrefix: Array<{ line: string; isError: boolean }> | null = null;
-  private replayInitVisiblePrefixIndex = 0;
-
-  // Replay reconnects apply the same init events twice: once immediately before caught-up and
-  // once again from the buffered catch-up pass. Track replay event identity so the second pass can
-  // skip the exact same event object without collapsing legitimate duplicate log lines.
-  private appliedReplayInitEvents = new WeakSet<object>();
-
-  // Throttle init-output cache invalidation to avoid re-render per line during fast streaming
-  private initOutputThrottleTimer: ReturnType<typeof setTimeout> | null = null;
-  private static readonly INIT_OUTPUT_THROTTLE_MS = 100;
+  // Workspace init hook state machine (ephemeral, not persisted to history).
+  // Encapsulates init-start/output/end lifecycle, replay dedup, and throttled
+  // cache invalidation during fast init output streaming.
+  private initStateHandler: InitStateHandler;
 
   // Track when we're waiting for stream-start after user message
   // Prevents retry barrier flash during normal send flow
@@ -596,38 +281,14 @@ export class StreamingMessageAggregator {
   private optimisticPendingStreamStart = false;
   private optimisticPendingStreamStartIdleCaughtUpCount = 0;
 
-  // Last completed stream timing stats (preserved after stream ends for display)
-  // Unlike activeStreams, this persists until the next stream starts
-  private lastCompletedStreamStats: {
-    startTime: number;
-    endTime: number;
-    firstTokenTime: number | null;
-    toolExecutionMs: number;
-    model: string;
-    outputTokens: number;
-    reasoningTokens: number;
-    streamingMs: number; // Time from first token to end (for accurate tok/s)
-    mode?: string; // Mode in which this response occurred
-  } | null = null;
+  // H7: Streaming timing stats extracted to StreamingStatsService.
+  private statsService: StreamingStatsService = new StreamingStatsService();
 
   // Optimistic "interrupting" state: set before calling interruptStream
   // Shows "interrupting..." in StreamingBarrier until real stream-abort arrives
   private interruptingMessageId: string | null = null;
 
-  // Session-level timing stats: model -> stats (totals computed on-the-fly)
-  private sessionTimingStats: Record<
-    string,
-    {
-      totalDurationMs: number;
-      totalToolExecutionMs: number;
-      totalTtftMs: number;
-      ttftCount: number;
-      responseCount: number;
-      totalOutputTokens: number;
-      totalReasoningTokens: number;
-      totalStreamingMs: number; // Cumulative streaming time (for accurate tok/s)
-    }
-  > = {};
+  // H7: Session timing stats managed by StreamingStatsService.
 
   // Workspace creation timestamp (used for recency calculation)
   // REQUIRED: Backend guarantees every workspace has createdAt via config.ts
@@ -648,14 +309,17 @@ export class StreamingMessageAggregator {
     this.createdAt = createdAt;
     this.workspaceId = workspaceId;
     this.unarchivedAt = unarchivedAt;
-    // Load persisted agent status from localStorage
-    if (workspaceId) {
-      const persistedStatus = this.loadPersistedAgentStatus();
-      if (persistedStatus) {
-        this.agentStatus = persistedStatus;
-        this.lastStatusUrl = persistedStatus.url;
-      }
-    }
+    this.agentStatusAdapter = new AgentStatusAdapter(workspaceId);
+    this.initStateHandler = new InitStateHandler({
+      onInvalidate: () => this.invalidateCache(),
+      // Reset pending stream start time so the grace period starts fresh after init completes.
+      // This prevents false retry barriers for slow init (e.g., Coder workspace provisioning).
+      onResetPendingStreamStart: () => {
+        if (this.pendingStreamStartTime !== null) {
+          this.setPendingStreamStartTime(Date.now());
+        }
+      },
+    });
     this.updateRecency();
   }
 
@@ -678,46 +342,9 @@ export class StreamingMessageAggregator {
     this.invalidateCache();
   }
 
-  /** Load persisted agent status from localStorage */
-  private loadPersistedAgentStatus(): AgentStatus | undefined {
-    if (!this.workspaceId) return undefined;
-    try {
-      const stored = localStorage.getItem(getStatusStateKey(this.workspaceId));
-      if (!stored) return undefined;
-      const parsed = AgentStatusSchema.safeParse(JSON.parse(stored));
-      return parsed.success ? parsed.data : undefined;
-    } catch {
-      // Ignore localStorage errors or JSON parse failures
-    }
-    return undefined;
-  }
-
-  /** Persist agent status to localStorage */
-  private savePersistedAgentStatus(status: AgentStatus): void {
-    if (!this.workspaceId) return;
-    const parsed = AgentStatusSchema.safeParse(status);
-    if (!parsed.success) return;
-    try {
-      localStorage.setItem(getStatusStateKey(this.workspaceId), JSON.stringify(parsed.data));
-    } catch {
-      // Ignore localStorage errors
-    }
-  }
-
-  /** Remove persisted agent status from localStorage */
-  private clearPersistedAgentStatus(): void {
-    if (!this.workspaceId) return;
-    try {
-      localStorage.removeItem(getStatusStateKey(this.workspaceId));
-    } catch {
-      // Ignore localStorage errors
-    }
-  }
-
   /** Clear all session timing stats (in-memory only). */
   clearSessionTimingStats(): void {
-    this.sessionTimingStats = {};
-    this.lastCompletedStreamStats = null;
+    this.statsService.clearSessionTimingStats();
   }
 
   private updateStreamClock(context: StreamingContext, serverTimestamp: number): void {
@@ -783,8 +410,7 @@ export class StreamingMessageAggregator {
       this.displayedMessageCache.delete(messageId);
       this.messageVersions.delete(messageId);
       // Clean up token tracking state to prevent memory leaks
-      this.deltaHistory.delete(messageId);
-      this.activeStreamUsage.delete(messageId);
+      this.tokenTracker.clearTokenState(messageId);
     }
     return didDelete;
   }
@@ -815,23 +441,11 @@ export class StreamingMessageAggregator {
   }
 
   /**
-   * Check if two TODO lists are equal (deep comparison).
-   * Prevents unnecessary re-renders when todo_write is called with identical content.
-   */
-  private todosEqual(a: TodoItem[], b: TodoItem[]): boolean {
-    if (a.length !== b.length) return false;
-    return a.every((todoA, i) => {
-      const todoB = b[i];
-      return todoA.content === todoB.content && todoA.status === todoB.status;
-    });
-  }
-
-  /**
    * Get the current TODO list.
    * Updated whenever todo_write succeeds.
    */
   getCurrentTodos(): TodoItem[] {
-    return this.currentTodos;
+    return this.todoStore.get();
   }
 
   /**
@@ -839,7 +453,7 @@ export class StreamingMessageAggregator {
    * Updated whenever `review_pane_update` succeeds.
    */
   getAssistedReviewHunks(): AssistedReviewHunk[] {
-    return this.assistedReviewHunks;
+    return this.reviewHunkStore.get();
   }
 
   /**
@@ -848,7 +462,7 @@ export class StreamingMessageAggregator {
    * Persists after stream completion (unlike todos).
    */
   getAgentStatus(): AgentStatus | undefined {
-    return this.agentStatus;
+    return this.agentStatusAdapter.get();
   }
 
   /**
@@ -858,7 +472,7 @@ export class StreamingMessageAggregator {
    * Returns a stable array reference for memoization (only changes when skills change).
    */
   getLoadedSkills(): LoadedSkill[] {
-    return this.loadedSkillsCache;
+    return this.skillStore.getLoadedSkills();
   }
 
   /**
@@ -867,7 +481,7 @@ export class StreamingMessageAggregator {
    * Returns a stable array reference for memoization.
    */
   getSkillLoadErrors(): SkillLoadError[] {
-    return this.skillLoadErrorsCache;
+    return this.skillStore.getSkillLoadErrors();
   }
 
   /**
@@ -929,93 +543,26 @@ export class StreamingMessageAggregator {
       const endTime = Date.now();
       const message = this.messages.get(messageId);
 
-      // Prefer backend-provided duration (computed in the same clock domain as tool/delta timestamps).
-      // Fall back to renderer-based timing translated into the renderer clock.
-      const durationMsFromMetadata = message?.metadata?.duration;
-      const fallbackStartTime = this.translateServerTime(context, context.serverStartTime);
-      const fallbackDurationMs = Math.max(0, endTime - fallbackStartTime);
-      const durationMs =
-        typeof durationMsFromMetadata === "number" && Number.isFinite(durationMsFromMetadata)
-          ? durationMsFromMetadata
-          : fallbackDurationMs;
+      const cumulativeUsage = this.tokenTracker.getActiveStreamCumulativeUsage(messageId);
 
-      const ttftMs =
-        context.serverFirstTokenTime !== null
-          ? Math.max(0, context.serverFirstTokenTime - context.serverStartTime)
-          : null;
-
-      // Get output tokens from cumulative usage (if available).
-      // Fall back to message metadata for abort/error cases where clearTokenState was
-      // called before cleanupStreamState (e.g., stream abort event handler ordering).
-      const cumulativeUsage = this.activeStreamUsage.get(messageId)?.cumulative.usage;
-      const metadataUsage = message?.metadata?.usage;
-      const outputTokens = cumulativeUsage?.outputTokens ?? metadataUsage?.outputTokens ?? 0;
-      const reasoningTokens =
-        cumulativeUsage?.reasoningTokens ?? metadataUsage?.reasoningTokens ?? 0;
-
-      // Account for in-progress tool calls (can happen on abort/error)
-      let totalToolExecutionMs = context.toolExecutionMs;
-      if (context.pendingToolStarts.size > 0) {
-        const serverEndTime = context.serverStartTime + durationMs;
-        for (const toolStartTime of context.pendingToolStarts.values()) {
-          const toolMs = serverEndTime - toolStartTime;
-          if (toolMs > 0) {
-            totalToolExecutionMs += toolMs;
-          }
-        }
-      }
-
-      // Streaming duration excludes TTFT and tool execution - used for avg tok/s
-      const streamingMs = Math.max(0, durationMs - (ttftMs ?? 0) - totalToolExecutionMs);
-
-      const mode = message?.metadata?.mode ?? context.mode;
-
-      // Store last completed stream stats (include durations anchored in the renderer clock)
-      const startTime = endTime - durationMs;
-      const firstTokenTime = ttftMs !== null ? startTime + ttftMs : null;
-      this.lastCompletedStreamStats = {
-        startTime,
+      this.statsService.recordCompletedStream({
         endTime,
-        firstTokenTime,
-        toolExecutionMs: totalToolExecutionMs,
+        serverStartTime: context.serverStartTime,
+        serverFirstTokenTime: context.serverFirstTokenTime,
+        toolExecutionMs: context.toolExecutionMs,
+        pendingToolStarts: context.pendingToolStarts.values(),
         model: context.model,
-        outputTokens,
-        reasoningTokens,
-        streamingMs,
-        mode,
-      };
-
-      // Use composite key model:mode for per-model+mode stats
-      // Old data (no mode) will just use model as key, maintaining backward compat
-      const statsKey = mode ? `${context.model}:${mode}` : context.model;
-
-      // Accumulate into per-model stats (totals computed on-the-fly in getSessionTimingStats)
-      const modelStats = this.sessionTimingStats[statsKey] ?? {
-        totalDurationMs: 0,
-        totalToolExecutionMs: 0,
-        totalTtftMs: 0,
-        ttftCount: 0,
-        responseCount: 0,
-        totalOutputTokens: 0,
-        totalReasoningTokens: 0,
-        totalStreamingMs: 0,
-      };
-      modelStats.totalDurationMs += durationMs;
-      modelStats.totalToolExecutionMs += totalToolExecutionMs;
-      modelStats.responseCount += 1;
-      modelStats.totalOutputTokens += outputTokens;
-      modelStats.totalReasoningTokens += reasoningTokens;
-      modelStats.totalStreamingMs += streamingMs;
-      if (ttftMs !== null) {
-        modelStats.totalTtftMs += ttftMs;
-        modelStats.ttftCount += 1;
-      }
-      this.sessionTimingStats[statsKey] = modelStats;
+        mode: message?.metadata?.mode ?? context.mode,
+        durationMsFromMetadata: message?.metadata?.duration,
+        cumulativeUsage,
+        metadataUsage: message?.metadata?.usage,
+        translateServerTime: (serverTime) => this.translateServerTime(context, serverTime),
+      });
     }
 
     this.activeStreams.delete(messageId);
     // Restore persisted status - clears transient displayStatus, preserves status_set values
-    this.agentStatus = this.loadPersistedAgentStatus();
+    this.agentStatusAdapter.restorePersisted();
   }
 
   /**
@@ -1092,12 +639,8 @@ export class StreamingMessageAggregator {
       this.messages.clear();
       this.displayedMessageCache.clear();
       this.messageVersions.clear();
-      this.deltaHistory.clear();
-      this.activeStreamUsage.clear();
-      this.loadedSkills.clear();
-      this.loadedSkillsCache = [];
-      this.skillLoadErrors.clear();
-      this.skillLoadErrorsCache = [];
+      this.tokenTracker.clearAll();
+      this.skillStore.clear();
       this.lastResponseCompletedAt = null;
 
       // Track the replay window's oldest sequence for reconnect cursors.
@@ -1157,12 +700,12 @@ export class StreamingMessageAggregator {
     if (!opts?.skipDerivedState) {
       // Replay historical messages in order to reconstruct derived state
       for (const message of chronologicalMessages) {
-        this.maybeTrackLoadedSkillFromAgentSkillSnapshot(message.metadata?.agentSkillSnapshot);
+        this.skillStore.maybeTrackLoadedSkillFromAgentSkillSnapshot(message.metadata?.agentSkillSnapshot);
 
         if (message.role === "user") {
           // Mirror live behavior for status: clear transient status on new user turn
           // but keep persisted status for fallback on reload.
-          this.agentStatus = undefined;
+          this.agentStatusAdapter.clearTransient();
           continue;
         }
 
@@ -1192,13 +735,7 @@ export class StreamingMessageAggregator {
     }
 
     // If history was compacted away from the last status_set, fall back to persisted status
-    if (!this.agentStatus) {
-      const persistedStatus = this.loadPersistedAgentStatus();
-      if (persistedStatus) {
-        this.agentStatus = persistedStatus;
-        this.lastStatusUrl = persistedStatus.url;
-      }
-    }
+    this.agentStatusAdapter.restorePersistedIfEmpty();
 
     // Mirror live stream-end cleanup for idle reloads: a completed plan should not reappear
     // just because we reconstructed it from historical tool output after a successful final stream.
@@ -1206,11 +743,9 @@ export class StreamingMessageAggregator {
       !opts?.skipDerivedState &&
       !hasActiveStream &&
       this.activeStreams.size === 0 &&
-      shouldClearCompletedTodosOnIdleReplay &&
-      this.currentTodos.length > 0 &&
-      this.currentTodos.every((todo) => todo.status === "completed")
+      shouldClearCompletedTodosOnIdleReplay
     ) {
-      this.currentTodos = [];
+      this.todoStore.clearIfAllCompleted();
     }
 
     this.invalidateCache();
@@ -1556,8 +1091,8 @@ export class StreamingMessageAggregator {
       firstTokenTime,
       toolExecutionMs: totalToolMs,
       model: context.model,
-      liveTokenCount: this.getStreamingTokenCount(messageId),
-      liveTPS: this.getStreamingTPS(messageId),
+      liveTokenCount: this.tokenTracker.getStreamingTokenCount(messageId),
+      liveTPS: this.tokenTracker.getStreamingTPS(messageId),
       mode: context.mode,
     };
   }
@@ -1578,7 +1113,7 @@ export class StreamingMessageAggregator {
     streamingMs: number;
     mode?: string;
   } | null {
-    return this.lastCompletedStreamStats;
+    return this.statsService.getLastCompletedStreamStats();
   }
 
   /**
@@ -1613,78 +1148,7 @@ export class StreamingMessageAggregator {
       }
     >;
   } | null {
-    const modelEntries = Object.entries(this.sessionTimingStats);
-    if (modelEntries.length === 0) return null;
-
-    // Aggregate totals from per-model stats
-    let totalDurationMs = 0;
-    let totalToolExecutionMs = 0;
-    let totalStreamingMs = 0;
-    let totalTtftMs = 0;
-    let ttftCount = 0;
-    let responseCount = 0;
-    let totalOutputTokens = 0;
-    let totalReasoningTokens = 0;
-
-    const byModel: Record<
-      string,
-      {
-        totalDurationMs: number;
-        totalToolExecutionMs: number;
-        totalStreamingMs: number;
-        averageTtftMs: number | null;
-        responseCount: number;
-        totalOutputTokens: number;
-        totalReasoningTokens: number;
-        mode?: string;
-      }
-    > = {};
-
-    for (const [key, stats] of modelEntries) {
-      // Parse composite key: "model" or "model:mode"
-      // Model names can contain colons (e.g., "mux-gateway:provider/model")
-      // so we look for ":plan" or ":exec" suffix specifically
-      let mode: string | undefined;
-      if (key.endsWith(":plan")) {
-        mode = "plan";
-      } else if (key.endsWith(":exec")) {
-        mode = "exec";
-      }
-
-      // Accumulate totals
-      totalDurationMs += stats.totalDurationMs;
-      totalToolExecutionMs += stats.totalToolExecutionMs;
-      totalStreamingMs += stats.totalStreamingMs ?? 0;
-      totalTtftMs += stats.totalTtftMs;
-      ttftCount += stats.ttftCount;
-      responseCount += stats.responseCount;
-      totalOutputTokens += stats.totalOutputTokens;
-      totalReasoningTokens += stats.totalReasoningTokens;
-
-      // Convert to display format (with computed average)
-      // Keep composite key as-is - StatsTab will parse/aggregate as needed
-      byModel[key] = {
-        totalDurationMs: stats.totalDurationMs,
-        totalToolExecutionMs: stats.totalToolExecutionMs,
-        totalStreamingMs: stats.totalStreamingMs ?? 0,
-        averageTtftMs: stats.ttftCount > 0 ? stats.totalTtftMs / stats.ttftCount : null,
-        responseCount: stats.responseCount,
-        totalOutputTokens: stats.totalOutputTokens,
-        totalReasoningTokens: stats.totalReasoningTokens,
-        mode,
-      };
-    }
-
-    return {
-      totalDurationMs,
-      totalToolExecutionMs,
-      totalStreamingMs,
-      averageTtftMs: ttftCount > 0 ? totalTtftMs / ttftCount : null,
-      responseCount,
-      totalOutputTokens,
-      totalReasoningTokens,
-      byModel,
-    };
+    return this.statsService.getSessionTimingStats();
   }
 
   getActiveStreams(): StreamingContext[] {
@@ -1872,12 +1336,7 @@ export class StreamingMessageAggregator {
    * reconnects that would otherwise leave the newest line hidden until caught-up.
    */
   flushPendingInitOutput(): void {
-    if (this.initOutputThrottleTimer) {
-      clearTimeout(this.initOutputThrottleTimer);
-      this.initOutputThrottleTimer = null;
-    }
-
-    this.invalidateCache();
+    this.initStateHandler.flushPendingOutput();
   }
 
   clearPendingStreamStart(): void {
@@ -2226,12 +1685,8 @@ export class StreamingMessageAggregator {
     }
     // Keep incomplete plans available across stream boundaries, but clear a fully completed
     // plan once the workspace has no active streams so finished work does not linger.
-    if (
-      this.activeStreams.size === 0 &&
-      this.currentTodos.length > 0 &&
-      this.currentTodos.every((todo) => todo.status === "completed")
-    ) {
-      this.currentTodos = [];
+    if (this.activeStreams.size === 0) {
+      this.todoStore.clearIfAllCompleted();
     }
 
     // Assistant message is now stable (completed or reconnected) - invalidate all caches.
@@ -2401,83 +1856,6 @@ export class StreamingMessageAggregator {
     // Tool deltas are for display - args are in dynamic-tool part
   }
 
-  private trackLoadedSkill(skill: LoadedSkill): void {
-    const existing = this.loadedSkills.get(skill.name);
-    if (
-      existing?.name === skill.name &&
-      existing.description === skill.description &&
-      existing.scope === skill.scope
-    ) {
-      return;
-    }
-
-    this.loadedSkills.set(skill.name, skill);
-    // Preserve a stable array reference for getLoadedSkills(): only replace when it changes.
-    this.loadedSkillsCache = Array.from(this.loadedSkills.values());
-
-    // A successful load supersedes any previous error for this skill
-    if (this.skillLoadErrors.delete(skill.name)) {
-      this.skillLoadErrorsCache = Array.from(this.skillLoadErrors.values());
-    }
-  }
-
-  private trackSkillLoadError(name: string, error: string): void {
-    const existing = this.skillLoadErrors.get(name);
-    if (existing?.error === error) return;
-
-    this.skillLoadErrors.set(name, { name, error });
-    this.skillLoadErrorsCache = Array.from(this.skillLoadErrors.values());
-
-    // A failed load supersedes any earlier success (skill may have been
-    // edited/deleted since the previous successful read)
-    if (this.loadedSkills.delete(name)) {
-      this.loadedSkillsCache = Array.from(this.loadedSkills.values());
-    }
-  }
-
-  private maybeTrackLoadedSkillFromAgentSkillSnapshot(snapshot: unknown): void {
-    const parsed = AgentSkillSnapshotMetadataSchema.safeParse(snapshot);
-    if (!parsed.success) {
-      return;
-    }
-
-    const { skillName, scope } = parsed.data;
-
-    // Don't override an existing entry (e.g. from agent_skill_read) with a placeholder description.
-    if (this.loadedSkills.has(skillName)) {
-      return;
-    }
-
-    this.trackLoadedSkill({
-      name: skillName,
-      description: `(loaded via /${skillName})`,
-      scope,
-    });
-  }
-
-  private handleAgentSkillReadResult(input: unknown, output: unknown): void {
-    const result = parseAgentSkillReadToolResult(output);
-    if (!result) {
-      return;
-    }
-
-    if (result.success) {
-      const skill = result.skill;
-      this.trackLoadedSkill({
-        name: skill.frontmatter.name,
-        description: skill.frontmatter.description,
-        scope: skill.scope,
-      });
-      return;
-    }
-
-    const parsedInput = AgentSkillReadInputSchema.safeParse(input);
-    const skillName = parsedInput.success ? parsedInput.data.name : undefined;
-    if (skillName) {
-      this.trackSkillLoadError(skillName, result.error);
-    }
-  }
-
   /**
    * Process a completed tool call's result to update derived state.
    * Called for both live tool-call-end events and historical tool parts.
@@ -2503,12 +1881,7 @@ export class StreamingMessageAggregator {
     // We still reconstruct from history so interrupted/incomplete plans survive reloads;
     // final completed plans are cleared later when the last active stream ends.
     if (toolName === "todo_write" && hasSuccessResult(output)) {
-      const args = parseTodoWriteInput(input);
-      if (args && !this.todosEqual(this.currentTodos, args.todos)) {
-        // Guard against malformed historical data and update only on real changes
-        // to prevent flicker from equivalent-but-new todo array references.
-        this.currentTodos = args.todos;
-      }
+      this.todoStore.updateFromToolResult(input, output);
     }
 
     // Update Assisted Review state when review_pane_update succeeds.
@@ -2530,50 +1903,11 @@ export class StreamingMessageAggregator {
     //     same key reappearing is an explicit re-flag, not a refinement),
     //     so the UI can re-highlight the snapshot.
     if (toolName === "review_pane_update") {
-      const parsed = ReviewPaneUpdateSuccessResultSchema.safeParse(output);
-      if (parsed.success) {
-        const previousByKey = new Map<string, AssistedReviewHunk>();
-        for (const prev of this.assistedReviewHunks) {
-          previousByKey.set(formatAssistedFilter(prev), prev);
-        }
-
-        const isAdd = parsed.data.operation === "add";
-
-        const next: AssistedReviewHunk[] = [];
-        for (const entry of parsed.data.hunks) {
-          const filter = parseAssistedFilter(entry.path);
-          if (!filter) continue;
-          const candidate: AssistedReviewHunk = {
-            path: filter.path,
-            range: filter.range,
-            comment: entry.comment ?? undefined,
-          };
-          const key = formatAssistedFilter(candidate);
-          const previous = previousByKey.get(key);
-          if (isAdd && previous) {
-            // Carry forward addedAt for `add` ops only so a refined
-            // comment doesn't reset the "new" badge.
-            candidate.addedAt = previous.addedAt;
-          } else if (messageContext?.timestamp !== undefined) {
-            // `replace` op (or first time we've seen this key under any op):
-            // stamp with the current message's timestamp. `replace` is an
-            // explicit republish, so reuse of an old key should still
-            // re-arm the "new" badge. Replay deliberately omits the
-            // timestamp so historical pins don't all light up as "new"
-            // on initial load.
-            candidate.addedAt = messageContext.timestamp;
-          }
-          next.push(candidate);
-        }
-        this.assistedReviewHunks = next;
-      }
+      this.reviewHunkStore.updateFromToolResult(output, messageContext);
     }
 
-    if (toolName === "propose_plan" && hasSuccessResult(output) && this.currentTodos.length > 0) {
-      const completedTodos = completeInProgressTodoItems(this.currentTodos);
-      if (completedTodos !== this.currentTodos) {
-        this.currentTodos = completedTodos;
-      }
+    if (toolName === "propose_plan" && hasSuccessResult(output)) {
+      this.todoStore.completeInProgress();
     }
 
     // Update agent status if this was a successful status_set
@@ -2582,18 +1916,7 @@ export class StreamingMessageAggregator {
     if (toolName === "status_set") {
       const result = parseStatusSetSuccessResult(output);
       if (result) {
-        // Use the provided URL, or fall back to the last URL ever set.
-        const url = result.url ?? this.lastStatusUrl;
-        if (url) {
-          this.lastStatusUrl = url;
-        }
-
-        this.agentStatus = {
-          emoji: result.emoji,
-          message: result.message,
-          url,
-        };
-        this.savePersistedAgentStatus(this.agentStatus);
+        this.agentStatusAdapter.setStatusFromResult(result.emoji, result.message, result.url);
       }
     }
 
@@ -2615,7 +1938,7 @@ export class StreamingMessageAggregator {
     if (toolName === "agent_skill_read") {
       // Keep agent_skill_read parsing separate so this router only decides *which*
       // derived-state handler should run for a tool result.
-      this.handleAgentSkillReadResult(input, output);
+      this.skillStore.handleAgentSkillReadResult(input, output);
     }
 
     // Link extraction is derived from message history (see computeLinksFromMessages()).
@@ -2751,148 +2074,18 @@ export class StreamingMessageAggregator {
     this.invalidateCache();
   }
 
-  private clearReplayInitVisiblePrefix(): void {
-    this.replayInitVisiblePrefix = null;
-    this.replayInitVisiblePrefixIndex = 0;
-  }
-
-  private shouldSkipVisibleReplayInitOutput(line: string, isError: boolean): boolean {
-    const prefix = this.replayInitVisiblePrefix;
-    if (!prefix) {
-      return false;
-    }
-
-    const nextVisibleLine = prefix[this.replayInitVisiblePrefixIndex];
-    if (nextVisibleLine?.line !== line || nextVisibleLine?.isError !== isError) {
-      this.clearReplayInitVisiblePrefix();
-      return false;
-    }
-
-    this.replayInitVisiblePrefixIndex += 1;
-    if (this.replayInitVisiblePrefixIndex >= prefix.length) {
-      this.clearReplayInitVisiblePrefix();
-    }
-
-    return true;
-  }
-
-  private shouldSkipReplayInitEvent(data: WorkspaceChatMessage): boolean {
-    if (
-      (data as { replay?: boolean }).replay !== true ||
-      (!isInitStart(data) && !isInitOutput(data) && !isInitEnd(data))
-    ) {
-      return false;
-    }
-
-    if (this.appliedReplayInitEvents.has(data as object)) {
-      return true;
-    }
-
-    this.appliedReplayInitEvents.add(data as object);
-    return false;
-  }
-
   handleMessage(data: WorkspaceChatMessage): void {
-    if (this.shouldSkipReplayInitEvent(data)) {
+    if (this.initStateHandler.shouldSkipReplayEvent(data)) {
       return;
     }
 
-    if (this.handleInitMessage(data)) {
+    if (this.initStateHandler.handleMessage(data)) {
       return;
     }
 
     if (isMuxMessage(data)) {
       this.handleMuxMessage(data);
     }
-  }
-
-  private handleInitMessage(data: WorkspaceChatMessage): boolean {
-    if (isInitStart(data)) {
-      const isReplay = (data as { replay?: boolean }).replay === true;
-      if (
-        isReplay &&
-        this.initState?.status === "running" &&
-        this.initState.hookPath === data.hookPath &&
-        this.initState.startTime === data.timestamp
-      ) {
-        // Reconnect replay re-emits init-start before replayed lines. Treat the same running init
-        // as a no-op so switching back never clears the visible SSH/setup output mid-replay.
-        this.replayInitVisiblePrefix = [...this.initState.lines];
-        this.replayInitVisiblePrefixIndex = 0;
-        return true;
-      }
-
-      this.clearReplayInitVisiblePrefix();
-      this.initState = {
-        status: "running",
-        hookPath: data.hookPath,
-        lines: [],
-        exitCode: null,
-        startTime: data.timestamp,
-        endTime: null,
-      };
-      this.invalidateCache();
-      return true;
-    }
-
-    if (isInitOutput(data)) {
-      if (!this.initState) {
-        console.error("Received init-output without init-start", { data });
-        return true;
-      }
-      if (!data.line) {
-        console.error("Received init-output with missing line field", { data });
-        return true;
-      }
-      const line = data.line.trimEnd();
-      const isError = data.isError === true;
-      const isReplay = (data as { replay?: boolean }).replay === true;
-      if (isReplay && this.shouldSkipVisibleReplayInitOutput(line, isError)) {
-        return true;
-      }
-
-      // Truncation: keep only the most recent MAX_LINES (matches backend).
-      if (this.initState.lines.length >= INIT_HOOK_MAX_LINES) {
-        this.initState.lines.shift();
-        this.initState.truncatedLines = (this.initState.truncatedLines ?? 0) + 1;
-      }
-      this.initState.lines.push({ line, isError });
-
-      // Throttle cache invalidation during fast streaming to avoid re-render per line.
-      this.initOutputThrottleTimer ??= setTimeout(() => {
-        this.initOutputThrottleTimer = null;
-        this.invalidateCache();
-      }, StreamingMessageAggregator.INIT_OUTPUT_THROTTLE_MS);
-      return true;
-    }
-
-    if (isInitEnd(data)) {
-      this.clearReplayInitVisiblePrefix();
-      if (!this.initState) {
-        console.error("Received init-end without init-start", { data });
-        return true;
-      }
-      this.initState.exitCode = data.exitCode;
-      this.initState.status = data.exitCode === 0 ? "success" : "error";
-      this.initState.endTime = data.timestamp;
-      // Use backend truncation count if larger (covers replay of old data).
-      if (data.truncatedLines && data.truncatedLines > (this.initState.truncatedLines ?? 0)) {
-        this.initState.truncatedLines = data.truncatedLines;
-      }
-      if (this.initOutputThrottleTimer) {
-        clearTimeout(this.initOutputThrottleTimer);
-        this.initOutputThrottleTimer = null;
-      }
-      // Reset pending stream start time so the grace period starts fresh after init completes.
-      // This prevents false retry barriers for slow init (e.g., Coder workspace provisioning).
-      if (this.pendingStreamStartTime !== null) {
-        this.setPendingStreamStartTime(Date.now());
-      }
-      this.invalidateCache();
-      return true;
-    }
-
-    return false;
   }
 
   private handleMuxMessage(data: MuxMessage): void {
@@ -2928,7 +2121,7 @@ export class StreamingMessageAggregator {
     }
 
     this.addMessage(incomingMessage);
-    this.maybeTrackLoadedSkillFromAgentSkillSnapshot(incomingMessage.metadata?.agentSkillSnapshot);
+    this.skillStore.maybeTrackLoadedSkillFromAgentSkillSnapshot(incomingMessage.metadata?.agentSkillSnapshot);
 
     if (incomingMessage.role !== "user" || isSideQuestionUserMuxMessage(incomingMessage)) {
       return;
@@ -2955,10 +2148,9 @@ export class StreamingMessageAggregator {
     this.pendingStreamModel = muxMetadata?.requestedModel ?? null;
 
     if (muxMeta?.displayStatus) {
-      this.agentStatus = muxMeta.displayStatus;
+      this.agentStatusAdapter.setTransient(muxMeta.displayStatus);
     } else {
-      this.agentStatus = undefined;
-      this.clearPersistedAgentStatus();
+      this.agentStatusAdapter.clearAll();
     }
 
     this.lastAbortReason = null;
@@ -3037,352 +2229,6 @@ export class StreamingMessageAggregator {
     });
   }
 
-  private isRenderableSideQuestionAnswer(answer: MuxMessage): boolean {
-    return this.activeStreams.has(answer.id) || answer.parts.length > 0;
-  }
-
-  private compareSideQuestionInterrupts(
-    left: SideQuestionInterrupt,
-    right: SideQuestionInterrupt
-  ): number {
-    const leftHistorySequence = left.sideQuestionUserMsg.metadata?.historySequence ?? Infinity;
-    const rightHistorySequence = right.sideQuestionUserMsg.metadata?.historySequence ?? Infinity;
-    return (
-      left.atTextLength - right.atTextLength ||
-      (left.atPartIndex ?? Infinity) - (right.atPartIndex ?? Infinity) ||
-      leftHistorySequence - rightHistorySequence ||
-      left.sideQuestionUserMsg.id.localeCompare(right.sideQuestionUserMsg.id)
-    );
-  }
-
-  private buildSideQuestionDisplayPlan(
-    allMessages: readonly MuxMessage[],
-    shouldHideMessageFromTranscript: (message: MuxMessage) => boolean
-  ): SideQuestionDisplayPlan {
-    const messagesById = new Map<string, MuxMessage>();
-    const linkedSideAnswerByQuestionId = new Map<string, MuxMessage>();
-    for (const message of allMessages) {
-      messagesById.set(message.id, message);
-      if (!isSideQuestionAnswerMuxMessage(message)) {
-        continue;
-      }
-
-      const questionMessageId = message.metadata.muxMetadata.questionMessageId;
-      if (typeof questionMessageId === "string") {
-        linkedSideAnswerByQuestionId.set(questionMessageId, message);
-      }
-    }
-
-    const interruptionsByInterruptedId = new Map<string, SideQuestionInterrupt[]>();
-    const inlineSideQuestionMessageIds = new Set<string>();
-
-    for (let i = 0; i < allMessages.length; i++) {
-      const msg = allMessages[i];
-      if (!isSideQuestionUserMuxMessage(msg)) {
-        continue;
-      }
-
-      const muxMeta = msg.metadata.muxMetadata;
-      if (
-        typeof muxMeta.interruptedMessageId !== "string" ||
-        typeof muxMeta.interruptedTextLength !== "number" ||
-        !Number.isFinite(muxMeta.interruptedTextLength)
-      ) {
-        continue;
-      }
-
-      const interruptedMessage = messagesById.get(muxMeta.interruptedMessageId);
-      if (
-        interruptedMessage?.role !== "assistant" ||
-        isSideQuestionAnswerMuxMessage(interruptedMessage) ||
-        shouldHideMessageFromTranscript(interruptedMessage)
-      ) {
-        continue;
-      }
-
-      // Use the persisted sequence as part of the anchor identity so a stale
-      // /btw snapshot cannot split an unrelated assistant message that happens
-      // to reuse the same id after history repair or compaction-edge replay.
-      if (
-        typeof muxMeta.interruptedHistorySequence === "number" &&
-        interruptedMessage.metadata?.historySequence !== muxMeta.interruptedHistorySequence
-      ) {
-        continue;
-      }
-
-      const linkedAnswer = linkedSideAnswerByQuestionId.get(msg.id);
-      const next = allMessages[i + 1];
-      const adjacentAnswer =
-        next !== undefined && isSideQuestionAnswerMuxMessage(next) ? next : undefined;
-      const adjacentAnswerQuestionId = adjacentAnswer?.metadata.muxMetadata.questionMessageId;
-      const legacyAdjacentAnswer =
-        adjacentAnswer !== undefined && adjacentAnswerQuestionId === undefined
-          ? adjacentAnswer
-          : undefined;
-      const answer = linkedAnswer ?? legacyAdjacentAnswer;
-      const answerIsRenderable =
-        answer !== undefined && this.isRenderableSideQuestionAnswer(answer);
-      const entry: SideQuestionInterrupt = {
-        atTextLength: Math.max(0, muxMeta.interruptedTextLength),
-        atPartIndex:
-          typeof muxMeta.interruptedPartIndex === "number"
-            ? muxMeta.interruptedPartIndex
-            : undefined,
-        sideQuestionUserMsg: msg,
-        sideQuestionAnswerMsg: answerIsRenderable ? answer : undefined,
-      };
-      const existing = interruptionsByInterruptedId.get(muxMeta.interruptedMessageId);
-      if (existing) {
-        existing.push(entry);
-      } else {
-        interruptionsByInterruptedId.set(muxMeta.interruptedMessageId, [entry]);
-      }
-
-      // Decide split ownership before the display walk starts. This keeps
-      // anchored /btw rows from ever rendering once at their chronological tail
-      // and again inside the interrupted assistant split.
-      inlineSideQuestionMessageIds.add(msg.id);
-      if (answerIsRenderable && answer) {
-        inlineSideQuestionMessageIds.add(answer.id);
-      }
-    }
-
-    for (const interruptions of interruptionsByInterruptedId.values()) {
-      interruptions.sort((left, right) => this.compareSideQuestionInterrupts(left, right));
-    }
-
-    return { interruptionsByInterruptedId, inlineSideQuestionMessageIds };
-  }
-
-  private getInterruptedSideQuestionBranch(
-    interruptedMessage: MuxMessage,
-    interrupt: SideQuestionInterrupt
-  ): SideQuestionDisplayBranch {
-    return {
-      branchId: interrupt.sideQuestionUserMsg.id,
-      placement: "interrupted",
-      interruptedMessageId: interruptedMessage.id,
-      interruptedHistorySequence: interruptedMessage.metadata?.historySequence,
-    };
-  }
-
-  private applySideQuestionBranch(
-    rows: DisplayedMessage[],
-    branch: SideQuestionDisplayBranch
-  ): DisplayedMessage[] {
-    let didChange = false;
-    const markedRows = rows.map((row) => {
-      if (row.type === "user" && row.isSideQuestion === true) {
-        didChange = true;
-        return { ...row, sideQuestionBranch: branch };
-      }
-      if (row.type === "assistant" && row.isSideAnswer === true) {
-        didChange = true;
-        return { ...row, sideQuestionBranch: branch };
-      }
-      return row;
-    });
-    return didChange ? markedRows : rows;
-  }
-
-  /**
-   * Split a list of message parts at one or more cumulative-text-length
-   * boundaries.
-   *
-   * Only `text` parts contribute to the cumulative length — reasoning and
-   * tool parts pass through to whichever segment is currently being filled.
-   * Non-text parts always land in the segment that owns the cumulative
-   * text position immediately before they appear in `parts`, which keeps
-   * "the reasoning that happened before the user fired /btw" anchored on
-   * the pre-aside side of the split.
-   *
-   * Returns `cutPoints.length + 1` segments. Each segment may be empty
-   * (no parts) if the boundaries coincide or the message has no content
-   * before/after a boundary.
-   */
-  private splitMessagePartsAtTextLengths(
-    parts: MuxMessage["parts"],
-    cutPoints: readonly MessagePartSplitCut[]
-  ): Array<MuxMessage["parts"]> {
-    const sortedCuts = [...cutPoints].sort(
-      (a, b) => a.textLength - b.textLength || (a.partIndex ?? Infinity) - (b.partIndex ?? Infinity)
-    );
-    const segments: Array<MuxMessage["parts"]> = sortedCuts.map(() => []);
-    segments.push([]);
-
-    let cumulativeText = 0;
-    let currentSegment = 0;
-
-    const advanceThroughCuts = (newCumulative: number, nextPartIndex: number): void => {
-      while (currentSegment < sortedCuts.length) {
-        const cut = sortedCuts[currentSegment];
-        if (newCumulative < cut.textLength) {
-          return;
-        }
-        if (cut.partIndex !== undefined && nextPartIndex < cut.partIndex) {
-          return;
-        }
-        currentSegment++;
-      }
-    };
-
-    for (let partIndex = 0; partIndex < parts.length; partIndex++) {
-      const part = parts[partIndex];
-      advanceThroughCuts(cumulativeText, partIndex);
-      if (part.type !== "text") {
-        // Reasoning / tool / file parts ride with the current segment.
-        // interruptedPartIndex keeps non-text parts already visible at the
-        // same cumulative text offset on the pre-aside side after reload.
-        segments[currentSegment].push(part);
-        advanceThroughCuts(cumulativeText, partIndex + 1);
-        continue;
-      }
-
-      // Walk this text part across as many boundaries as it crosses. Each
-      // boundary peels off a prefix into the current segment, advances
-      // currentSegment, and leaves the remainder to be considered against
-      // the next boundary.
-      let remaining = part.text;
-      while (currentSegment < sortedCuts.length) {
-        const cut = sortedCuts[currentSegment];
-        if (cut.partIndex !== undefined && partIndex + 1 < cut.partIndex) {
-          // This split point is after a later non-text part at the same text
-          // offset; keep this whole text part in the current segment for now.
-          break;
-        }
-        const charsLeftInCurrentSegment = cut.textLength - cumulativeText;
-        if (charsLeftInCurrentSegment >= remaining.length) {
-          // This part fits entirely inside the current segment.
-          break;
-        }
-        if (charsLeftInCurrentSegment <= 0) {
-          advanceThroughCuts(cumulativeText, partIndex + 1);
-          continue;
-        }
-        const prefix = remaining.slice(0, charsLeftInCurrentSegment);
-        if (prefix.length > 0) {
-          // Preserve part metadata (e.g. timestamp) on each half.
-          segments[currentSegment].push({ ...part, text: prefix });
-        }
-        cumulativeText = cut.textLength;
-        remaining = remaining.slice(charsLeftInCurrentSegment);
-        advanceThroughCuts(cumulativeText, partIndex + 1);
-      }
-
-      if (remaining.length > 0) {
-        segments[currentSegment].push({ ...part, text: remaining });
-        cumulativeText += remaining.length;
-        advanceThroughCuts(cumulativeText, partIndex + 1);
-      }
-    }
-
-    return segments;
-  }
-
-  /**
-   * Build displayed rows for a main-agent assistant message that was
-   * interrupted by one or more /btw side questions.
-   *
-   * The interrupted message is split at each captured text-length
-   * boundary; the side-question Q+A pair for each interrupt is inserted
-   * between the surrounding segments. The result is a continuous run of
-   * displayed rows that reads:
-   *
-   *   [M1 pre-aside]
-   *   [Q1]
-   *   [A1]
-   *   [M1 middle (if multiple /btw interrupted the same turn)]
-   *   ...
-   *   [M1 post-aside]
-   *
-   * The LAST segment keeps M1's original message id so an active stream
-   * lookup (`activeStreams.has(M1.id)`) still surfaces the streaming
-   * indicator on the right row. Earlier segments use `${M1.id}#seg<i>`
-   * suffixes for React key stability; their `historyId` is rewritten
-   * back to `M1.id` so action handlers (Copy / Start Here / etc.) still
-   * target the persisted message.
-   */
-  private buildInterruptedMessageDisplay(
-    message: MuxMessage,
-    interrupts: readonly SideQuestionInterrupt[],
-    agentSkillSnapshot?: { frontmatterYaml?: string; body?: string },
-    inlineSkillSnapshots?: InlineSkillSnapshotMap
-  ): DisplayedMessage[] {
-    const sorted = [...interrupts].sort((left, right) =>
-      this.compareSideQuestionInterrupts(left, right)
-    );
-    const segments = this.splitMessagePartsAtTextLengths(
-      message.parts,
-      sorted.map((interrupt) => ({
-        textLength: interrupt.atTextLength,
-        partIndex: interrupt.atPartIndex,
-      }))
-    );
-
-    const result: DisplayedMessage[] = [];
-
-    for (let i = 0; i < segments.length; i++) {
-      const isLastSegment = i === segments.length - 1;
-      const segParts = segments[i];
-
-      // Always render the last segment even if empty — it owns the
-      // streaming-indicator anchor and the meta row. Earlier segments
-      // skip when empty to avoid emitting hollow blocks.
-      if (segParts.length > 0 || isLastSegment) {
-        // Last segment keeps the original id so activeStreams lookup hits;
-        // earlier segments get a suffixed id for React key uniqueness.
-        const segMessageId = isLastSegment ? message.id : `${message.id}#seg${i}`;
-        const segMessage: MuxMessage = {
-          ...message,
-          id: segMessageId,
-          parts: segParts,
-        };
-
-        const segRows = this.buildDisplayedMessagesForMessage(
-          segMessage,
-          agentSkillSnapshot,
-          inlineSkillSnapshots
-        );
-
-        // Rewrite `historyId` on each emitted row back to the original
-        // message id. Without this rewrite, action handlers that resolve
-        // a row to its backend message (Start Here, Fork, etc.) would
-        // hit "message not found" because no real history row exists
-        // under the suffixed segment id.
-        if (!isLastSegment) {
-          for (const row of segRows) {
-            if ("historyId" in row && row.historyId === segMessageId) {
-              (row as { historyId: string }).historyId = message.id;
-            }
-          }
-        }
-
-        result.push(...segRows);
-      }
-
-      if (i < sorted.length) {
-        const interrupt = sorted[i];
-        const branch = this.getInterruptedSideQuestionBranch(message, interrupt);
-        result.push(
-          ...this.applySideQuestionBranch(
-            this.buildDisplayedMessagesForMessage(interrupt.sideQuestionUserMsg),
-            branch
-          )
-        );
-        if (interrupt.sideQuestionAnswerMsg) {
-          result.push(
-            ...this.applySideQuestionBranch(
-              this.buildDisplayedMessagesForMessage(interrupt.sideQuestionAnswerMsg),
-              branch
-            )
-          );
-        }
-      }
-    }
-
-    return result;
-  }
-
   /**
    * After filtering older tool/reasoning parts, recompute which part is the
    * last visible block for each assistant message. This keeps meta rows and
@@ -3455,9 +2301,16 @@ export class StreamingMessageAggregator {
       // standalone /btw rows render chronologically and cannot become split
       // children later in the same pass.
       // ---------------------------------------------------------------
-      const sideQuestionDisplayPlan = this.buildSideQuestionDisplayPlan(
+      const sideQuestionPlannerDeps: SideQuestionPlannerDeps = {
+        isRenderableSideQuestionAnswer: (answer) =>
+          this.activeStreams.has(answer.id) || answer.parts.length > 0,
+        buildDisplayedMessagesForMessage: (msg, snapshot, snapshots) =>
+          this.buildDisplayedMessagesForMessage(msg, snapshot, snapshots),
+      };
+      const sideQuestionDisplayPlan = buildSideQuestionDisplayPlan(
         allMessages,
-        shouldHideMessageFromTranscript
+        shouldHideMessageFromTranscript,
+        sideQuestionPlannerDeps
       );
 
       for (const message of allMessages) {
@@ -3511,9 +2364,10 @@ export class StreamingMessageAggregator {
           // displayedMessageCache here because the split output is a
           // function of *multiple* messages' state — caching it under
           // one message id would miss invalidations on the children.
-          const splitRows = this.buildInterruptedMessageDisplay(
+          const splitRows = buildInterruptedMessageDisplay(
             message,
             interrupts,
+            sideQuestionPlannerDeps,
             agentSkillSnapshotForDisplay,
             inlineSkillSnapshotState?.snapshots
           );
@@ -3574,22 +2428,23 @@ export class StreamingMessageAggregator {
       resultMessages = markRowsBeforeLatestContextBoundary(resultMessages);
 
       // Add init state if present (ephemeral, appears at top)
-      if (this.initState) {
+      const initSnapshot = this.initStateHandler.getSnapshot();
+      if (initSnapshot) {
         const durationMs =
-          this.initState.endTime !== null
-            ? this.initState.endTime - this.initState.startTime
+          initSnapshot.endTime !== null
+            ? initSnapshot.endTime - initSnapshot.startTime
             : null;
         const initMessage: DisplayedMessage = {
           type: "workspace-init",
           id: "workspace-init",
           historySequence: -1, // Appears before all history
-          status: this.initState.status,
-          hookPath: this.initState.hookPath,
-          lines: [...this.initState.lines], // Shallow copy for React.memo change detection
-          exitCode: this.initState.exitCode,
-          timestamp: this.initState.startTime,
+          status: initSnapshot.status,
+          hookPath: initSnapshot.hookPath,
+          lines: [...initSnapshot.lines], // Shallow copy for React.memo change detection
+          exitCode: initSnapshot.exitCode,
+          timestamp: initSnapshot.startTime,
           durationMs,
-          truncatedLines: this.initState.truncatedLines,
+          truncatedLines: initSnapshot.truncatedLines,
         };
         resultMessages = [initMessage, ...resultMessages];
       }
@@ -3609,70 +2464,56 @@ export class StreamingMessageAggregator {
     timestamp: number,
     type: "text" | "reasoning" | "tool-args"
   ): void {
-    let storage = this.deltaHistory.get(messageId);
-    if (!storage) {
-      storage = createDeltaStorage();
-      this.deltaHistory.set(messageId, storage);
-    }
-    storage.addDelta({ tokens, timestamp, type });
+    this.tokenTracker.trackDelta(messageId, tokens, timestamp, type);
   }
 
   /**
    * Get streaming token count (sum of all deltas)
    */
   getStreamingTokenCount(messageId: string): number {
-    const storage = this.deltaHistory.get(messageId);
-    return storage ? storage.getTokenCount() : 0;
+    return this.tokenTracker.getStreamingTokenCount(messageId);
   }
 
   /**
    * Get tokens-per-second rate (10-second trailing window)
    */
   getStreamingTPS(messageId: string): number {
-    const storage = this.deltaHistory.get(messageId);
-    return storage ? storage.calculateTPS(Date.now()) : 0;
+    return this.tokenTracker.getStreamingTPS(messageId);
   }
 
   /**
    * Clear delta history for a message
    */
   clearTokenState(messageId: string): void {
-    this.deltaHistory.delete(messageId);
-    this.activeStreamUsage.delete(messageId);
+    this.tokenTracker.clearTokenState(messageId);
   }
 
   /**
    * Handle usage-delta event: update usage tracking for active stream
    */
   handleUsageDelta(data: UsageDeltaEvent): void {
-    this.activeStreamUsage.set(data.messageId, {
-      step: { usage: data.usage, providerMetadata: data.providerMetadata },
-      cumulative: {
-        usage: data.cumulativeUsage,
-        providerMetadata: data.cumulativeProviderMetadata,
-      },
-    });
+    this.tokenTracker.handleUsageDelta(data);
   }
 
   /**
    * Get active stream usage for context window display (last step's inputTokens = context size)
    */
   getActiveStreamUsage(messageId: string): LanguageModelV2Usage | undefined {
-    return this.activeStreamUsage.get(messageId)?.step.usage;
+    return this.tokenTracker.getActiveStreamUsage(messageId);
   }
 
   /**
    * Get step provider metadata for context window cache display
    */
   getActiveStreamStepProviderMetadata(messageId: string): Record<string, unknown> | undefined {
-    return this.activeStreamUsage.get(messageId)?.step.providerMetadata;
+    return this.tokenTracker.getActiveStreamStepProviderMetadata(messageId);
   }
 
   /**
    * Get active stream cumulative usage for cost display (sum of all steps)
    */
   getActiveStreamCumulativeUsage(messageId: string): LanguageModelV2Usage | undefined {
-    return this.activeStreamUsage.get(messageId)?.cumulative.usage;
+    return this.tokenTracker.getActiveStreamCumulativeUsage(messageId);
   }
 
   /**
@@ -3681,6 +2522,6 @@ export class StreamingMessageAggregator {
   getActiveStreamCumulativeProviderMetadata(
     messageId: string
   ): Record<string, unknown> | undefined {
-    return this.activeStreamUsage.get(messageId)?.cumulative.providerMetadata;
+    return this.tokenTracker.getActiveStreamCumulativeProviderMetadata(messageId);
   }
 }
