@@ -102,8 +102,11 @@ import { findNextHunkId, findNextHunkIdAfterFileRemoval } from "@/browser/utils/
 import { cn } from "@/common/lib/utils";
 import { useTheme } from "@/browser/contexts/ThemeContext";
 import { useAPI, type APIClient } from "@/browser/contexts/API";
-import { useWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
-import { workspaceStore, useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
+import {
+  workspaceStore,
+  useWorkspaceMetadataEntry,
+  useWorkspaceStoreRaw,
+} from "@/browser/stores/WorkspaceStore";
 import { invalidateGitStatus } from "@/browser/stores/GitStatusStore";
 import { getErrorMessage } from "@/common/utils/errors";
 
@@ -365,8 +368,7 @@ async function executeWorkspaceBashAndCache<T extends ReviewPanelCacheValue>(par
 
 function parseReviewDiffCacheValue(params: {
   result: ExecuteBashSuccess;
-  workspaceMetadata: ReturnType<typeof useWorkspaceMetadata>["workspaceMetadata"];
-  workspaceId: string;
+  workspaceMetadata: FrontendWorkspaceMetadata | null;
   repoRootProjectPath?: string | null;
   diffCommand: string;
   selectedFilePath?: string | null;
@@ -382,13 +384,13 @@ function parseReviewDiffCacheValue(params: {
   const fileDiffs = parseDiff(diffOutput).map((fileDiff) => ({
     ...fileDiff,
     filePath: reprojectRepoRootFilePath(
-      params.workspaceMetadata.get(params.workspaceId),
+      params.workspaceMetadata,
       fileDiff.filePath,
       params.repoRootProjectPath
     ),
     oldPath: fileDiff.oldPath
       ? reprojectRepoRootFilePath(
-          params.workspaceMetadata.get(params.workspaceId),
+          params.workspaceMetadata,
           fileDiff.oldPath,
           params.repoRootProjectPath
         )
@@ -396,13 +398,13 @@ function parseReviewDiffCacheValue(params: {
     hunks: fileDiff.hunks.map((hunk) => ({
       ...hunk,
       filePath: reprojectRepoRootFilePath(
-        params.workspaceMetadata.get(params.workspaceId),
+        params.workspaceMetadata,
         hunk.filePath,
         params.repoRootProjectPath
       ),
       oldPath: hunk.oldPath
         ? reprojectRepoRootFilePath(
-            params.workspaceMetadata.get(params.workspaceId),
+            params.workspaceMetadata,
             hunk.oldPath,
             params.repoRootProjectPath
           )
@@ -634,6 +636,7 @@ interface ReviewAssistedStatsReporterProps {
   projectPath: string;
   isCreating?: boolean;
   onUnreadAssistedChange: (count: number) => void;
+  onRender?: () => void;
 }
 
 export const ReviewAssistedStatsReporter: React.FC<ReviewAssistedStatsReporterProps> = ({
@@ -642,9 +645,11 @@ export const ReviewAssistedStatsReporter: React.FC<ReviewAssistedStatsReporterPr
   projectPath,
   isCreating = false,
   onUnreadAssistedChange,
+  onRender,
 }) => {
+  onRender?.();
   const { api } = useAPI();
-  const { workspaceMetadata } = useWorkspaceMetadata();
+  const workspaceMetadata = useWorkspaceMetadataEntry(workspaceId);
   const originFetchRef = useRef<OriginFetchState | null>(null);
   const { isRead } = useReviewState(workspaceId);
 
@@ -656,10 +661,9 @@ export const ReviewAssistedStatsReporter: React.FC<ReviewAssistedStatsReporterPr
   const assistedHunks = useSyncExternalStore(subscribeAssistedHunks, () =>
     rawWorkspaceStore.getAssistedReviewHunks(workspaceId)
   );
-  const workspaceReviewMetadata = workspaceMetadata.get(workspaceId);
   const reviewPathContext = useMemo(
-    () => getReviewPanelPathContext({ workspaceMetadata: workspaceReviewMetadata, projectPath }),
-    [projectPath, workspaceReviewMetadata]
+    () => getReviewPanelPathContext({ workspaceMetadata, projectPath }),
+    [projectPath, workspaceMetadata]
   );
   const normalizedAssistedHunks = useMemo(
     () => normalizeAssistedReviewHunks(assistedHunks, reviewPathContext),
@@ -696,7 +700,7 @@ export const ReviewAssistedStatsReporter: React.FC<ReviewAssistedStatsReporterPr
       assistedHunks: normalizedAssistedHunks,
       selectedFilePath: null,
       selectedDiffPath: "",
-      workspaceMetadata: workspaceMetadata.get(workspaceId),
+      workspaceMetadata,
       projectPath,
       pathContext: reviewPathContext,
     }).map((spec) => ({
@@ -738,7 +742,6 @@ export const ReviewAssistedStatsReporter: React.FC<ReviewAssistedStatsReporterPr
             return parseReviewDiffCacheValue({
               result,
               workspaceMetadata,
-              workspaceId,
               repoRootProjectPath: request.repoRootProjectPath,
               diffCommand: request.diffCommand,
               selectedFilePath: request.selectedFilePath,
@@ -766,7 +769,6 @@ export const ReviewAssistedStatsReporter: React.FC<ReviewAssistedStatsReporterPr
     workspaceId,
     workspacePath,
     projectPath,
-    workspaceMetadata,
     diffBase,
     includeUncommitted,
     normalizedAssistedHunks,
@@ -793,7 +795,7 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
   const originFetchRef = useRef<OriginFetchState | null>(null);
   const { api } = useAPI();
   const { theme } = useTheme();
-  const { workspaceMetadata } = useWorkspaceMetadata();
+  const workspaceMetadata = useWorkspaceMetadataEntry(workspaceId);
   const panelRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
@@ -856,12 +858,12 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
   );
 
   const selectedRepoRootProjectPath = resolveRepoRootProjectPath(
-    workspaceMetadata.get(workspaceId),
+    workspaceMetadata,
     selectedFilePath
   );
 
   const selectedDiffPath = normalizeRepoRootFilePath(
-    workspaceMetadata.get(workspaceId),
+    workspaceMetadata,
     selectedFilePath ? extractNewPath(selectedFilePath) : null,
     selectedRepoRootProjectPath
   );
@@ -911,7 +913,7 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
     const shouldInitializeWorkspaceBase = !workspaceBaseIsPersisted;
 
     const metadataTrunkBase = toMetadataDiffBase(
-      workspaceMetadata.get(workspaceId)?.taskTrunkBranch
+      workspaceMetadata?.taskTrunkBranch
     );
     const initializedWorkspaceFromMetadata =
       shouldInitializeWorkspaceBase && metadataTrunkBase != null;
@@ -1128,10 +1130,9 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
     rawWorkspaceStore.getAssistedReviewHunks(workspaceId)
   );
 
-  const workspaceReviewMetadata = workspaceMetadata.get(workspaceId);
   const reviewPathContext = useMemo(
-    () => getReviewPanelPathContext({ workspaceMetadata: workspaceReviewMetadata, projectPath }),
-    [projectPath, workspaceReviewMetadata]
+    () => getReviewPanelPathContext({ workspaceMetadata, projectPath }),
+    [projectPath, workspaceMetadata]
   );
   const normalizedAssistedHunks = useMemo(
     () => normalizeAssistedReviewHunks(assistedHunks, reviewPathContext),
@@ -1446,7 +1447,7 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
             const fileStats = parseNumstat(numstatOutput).map((stat) => ({
               ...stat,
               filePath: reprojectRepoRootFilePath(
-                workspaceMetadata.get(workspaceId),
+                workspaceMetadata,
                 stat.filePath,
                 fileTreeRepoRootProjectPath
               ),
@@ -1454,13 +1455,13 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
             const nameStatus = parseNameStatus(nameStatusOutput).map((entry) => ({
               ...entry,
               filePath: reprojectRepoRootFilePath(
-                workspaceMetadata.get(workspaceId),
+                workspaceMetadata,
                 entry.filePath,
                 fileTreeRepoRootProjectPath
               ),
               oldPath: entry.oldPath
                 ? reprojectRepoRootFilePath(
-                    workspaceMetadata.get(workspaceId),
+                    workspaceMetadata,
                     entry.oldPath,
                     fileTreeRepoRootProjectPath
                   )
@@ -1501,14 +1502,13 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
       cancelled = true;
     };
   }, [
-    api,
-    workspaceId,
-    workspacePath,
-    projectPath,
-    workspaceMetadata,
-    filters.diffBase,
-    filters.includeUncommitted,
-    refreshTrigger,
+      api,
+      workspaceId,
+      workspacePath,
+      projectPath,
+      filters.diffBase,
+      filters.includeUncommitted,
+      refreshTrigger,
     isCreating,
   ]);
 
@@ -1534,7 +1534,7 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
       selectedFilePath,
       selectedDiffPath,
       selectedRepoRootProjectPath,
-      workspaceMetadata: workspaceMetadata.get(workspaceId),
+      workspaceMetadata,
       projectPath,
       pathContext: reviewPathContext,
     }).map((spec) => {
@@ -1638,7 +1638,6 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
                 parseReviewDiffCacheValue({
                   result,
                   workspaceMetadata,
-                  workspaceId,
                   repoRootProjectPath: request.repoRootProjectPath,
                   diffCommand: request.diffCommand,
                   selectedFilePath: request.selectedFilePath,

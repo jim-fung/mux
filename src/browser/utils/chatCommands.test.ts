@@ -2,6 +2,8 @@ import { describe, expect, test, beforeEach, mock, spyOn } from "bun:test";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
 import {
+  createNewWorkspace,
+  forkWorkspace,
   parseRuntimeString,
   prepareCompactionMessage,
   handlePlanShowCommand,
@@ -14,6 +16,7 @@ import { parseCommand } from "./slashCommands/parser";
 import type { CommandHandlerContext, SlashCommandContext } from "./chatCommands";
 import type { ReviewNoteData } from "@/common/types/review";
 import { HEARTBEAT_DEFAULT_INTERVAL_MS } from "@/constants/heartbeat";
+import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 
 // Simple mock for localStorage to satisfy resolveCompactionModel and experiment gating.
 // Note: command helpers read from window.localStorage, so we set both globalThis.localStorage
@@ -103,6 +106,141 @@ describe("parseRuntimeString", () => {
     ],
   ])("throws for invalid runtime %p", (runtime, message) => {
     expect(() => parseRuntimeString(runtime)).toThrow(message);
+  });
+});
+
+describe("workspace start-message readiness", () => {
+  const sendMessageOptions: SendMessageOptions = {
+    model: "anthropic:claude-sonnet-4-6",
+    thinkingLevel: "off",
+    toolPolicy: [],
+    agentId: "exec",
+  };
+
+  test("createNewWorkspace waits for the active onChat target before sending the start message", async () => {
+    let releaseReady!: (ready: boolean) => void;
+    const waitForReady = new Promise<boolean>((resolve) => {
+      releaseReady = resolve;
+    });
+
+    const waitSpy = spyOn(workspaceStore, "waitForActiveOnChatWorkspace").mockImplementation(
+      () => waitForReady
+    );
+    const sendMessage = mock(() => Promise.resolve({ success: true }));
+    const client = {
+      projects: {
+        listBranches: mock(() => Promise.resolve({ recommendedTrunk: "main" })),
+      },
+      workspace: {
+        create: mock(() =>
+          Promise.resolve({
+            success: true,
+            metadata: {
+              id: "created-ws",
+              projectPath: "/tmp/project",
+              projectName: "project",
+              name: "created-ws",
+            },
+          })
+        ),
+        getInfo: mock(() =>
+          Promise.resolve({
+            id: "created-ws",
+            projectPath: "/tmp/project",
+            projectName: "project",
+            name: "created-ws",
+          })
+        ),
+        sendMessage,
+      },
+    } as const;
+
+    try {
+      await createNewWorkspace({
+        client: client as never,
+        projectPath: "/tmp/project",
+        workspaceName: "created-ws",
+        startMessage: "hello",
+        sendMessageOptions,
+        pendingAutoTitle: false,
+      });
+
+      expect(waitSpy).toHaveBeenCalledWith("created-ws", 1500);
+      expect(sendMessage).not.toHaveBeenCalled();
+
+      releaseReady(true);
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(sendMessage).toHaveBeenCalledWith({
+        workspaceId: "created-ws",
+        message: "hello",
+        options: sendMessageOptions,
+      });
+    } finally {
+      waitSpy.mockRestore();
+    }
+  });
+
+  test("forkWorkspace waits for the active onChat target before sending the start message", async () => {
+    let releaseReady!: (ready: boolean) => void;
+    const waitForReady = new Promise<boolean>((resolve) => {
+      releaseReady = resolve;
+    });
+
+    const waitSpy = spyOn(workspaceStore, "waitForActiveOnChatWorkspace").mockImplementation(
+      () => waitForReady
+    );
+    const sendMessage = mock(() => Promise.resolve({ success: true }));
+    const client = {
+      workspace: {
+        fork: mock(() =>
+          Promise.resolve({
+            success: true,
+            metadata: {
+              id: "forked-ws",
+              projectPath: "/tmp/project",
+              projectName: "project",
+              name: "forked-ws",
+            },
+          })
+        ),
+        getInfo: mock(() =>
+          Promise.resolve({
+            id: "forked-ws",
+            projectPath: "/tmp/project",
+            projectName: "project",
+            name: "forked-ws",
+          })
+        ),
+        sendMessage,
+      },
+    } as const;
+
+    try {
+      await forkWorkspace({
+        client: client as never,
+        sourceWorkspaceId: "source-ws",
+        newName: "forked-ws",
+        startMessage: "fork hello",
+        sendMessageOptions,
+      });
+
+      expect(waitSpy).toHaveBeenCalledWith("forked-ws", 1500);
+      expect(sendMessage).not.toHaveBeenCalled();
+
+      releaseReady(true);
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(sendMessage).toHaveBeenCalledWith({
+        workspaceId: "forked-ws",
+        message: "fork hello",
+        options: sendMessageOptions,
+      });
+    } finally {
+      waitSpy.mockRestore();
+    }
   });
 });
 

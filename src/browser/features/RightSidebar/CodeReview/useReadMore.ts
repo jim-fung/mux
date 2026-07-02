@@ -8,7 +8,7 @@ import type { DiffHunk } from "@/common/types/review";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { getReviewReadMoreKey } from "@/common/constants/storage";
 import { useAPI } from "@/browser/contexts/API";
-import { useWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
+import { useWorkspaceMetadataEntry } from "@/browser/stores/WorkspaceStore";
 import {
   readFileLines,
   formatAsContextLines,
@@ -53,11 +53,8 @@ interface UseReadMoreResult {
 export function useReadMore(options: UseReadMoreOptions): UseReadMoreResult {
   const { hunk, hunkId, workspaceId, diffBase, includeUncommitted } = options;
   const { api } = useAPI();
-  const { workspaceMetadata } = useWorkspaceMetadata();
-  const repoRootProjectPath = resolveRepoRootProjectPath(
-    workspaceMetadata.get(workspaceId),
-    hunk.filePath
-  );
+  const workspaceMetadata = useWorkspaceMetadataEntry(workspaceId);
+  const repoRootProjectPath = resolveRepoRootProjectPath(workspaceMetadata, hunk.filePath);
 
   // Persisted state: how many lines expanded up/down per hunk
   const [readMoreMap, setReadMoreMap] = usePersistedState<Record<string, ReadMoreState>>(
@@ -102,7 +99,7 @@ export function useReadMore(options: UseReadMoreOptions): UseReadMoreResult {
     void readFileLines(
       api,
       workspaceId,
-      workspaceMetadata.get(workspaceId),
+      workspaceMetadata,
       hunk.filePath,
       startLine,
       endLine,
@@ -148,7 +145,7 @@ export function useReadMore(options: UseReadMoreOptions): UseReadMoreResult {
     void readFileLines(
       api,
       workspaceId,
-      workspaceMetadata.get(workspaceId),
+      workspaceMetadata,
       hunk.filePath,
       startLine,
       endLine,

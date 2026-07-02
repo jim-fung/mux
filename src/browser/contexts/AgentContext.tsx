@@ -12,8 +12,8 @@ import {
 } from "react";
 
 import { useAPI } from "@/browser/contexts/API";
-import { useWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import { useWorkspaceMetadataEntry } from "@/browser/stores/WorkspaceStore";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { matchesKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import {
@@ -81,8 +81,7 @@ function AgentProviderWithState(props: {
   children: ReactNode;
 }) {
   const { api } = useAPI();
-  const { workspaceMetadata } = useWorkspaceMetadata();
-  const currentMeta = props.workspaceId ? workspaceMetadata.get(props.workspaceId) : undefined;
+  const currentMeta = useWorkspaceMetadataEntry(props.workspaceId) ?? undefined;
 
   const scopeId = getScopeId(props.workspaceId, props.projectPath);
   const isProjectScope = !props.workspaceId && Boolean(props.projectPath);

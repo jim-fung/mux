@@ -57,6 +57,7 @@ import { useOpenInEditor } from "@/browser/hooks/useOpenInEditor";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   useWorkspaceAggregator,
+  useWorkspaceMetadataEntry,
   useWorkspaceState,
   useWorkspaceUsage,
   useWorkspaceStoreRaw,
@@ -89,7 +90,6 @@ import { useTranscriptDensity } from "@/browser/hooks/useTranscriptDensity";
 import { useReviews } from "@/browser/hooks/useReviews";
 import { ReviewsBanner } from "../ReviewsBanner/ReviewsBanner";
 import type { ReviewNoteData } from "@/common/types/review";
-import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import {
   useBackgroundBashActions,
   useBackgroundBashError,
@@ -224,7 +224,7 @@ function findTranscriptMessageElement(
 export const ChatPane: React.FC<ChatPaneProps> = (props) => {
   const workspaceId = props.workspaceId;
   const immersiveHidden = props.immersiveHidden ?? false;
-  const { workspaceMetadata } = useWorkspaceContext();
+  const workspaceMetadata = useWorkspaceMetadataEntry(workspaceId);
   const chatAreaRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -244,8 +244,7 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
     };
   }, [immersiveHidden, workspaceId]);
 
-  const meta = workspaceMetadata.get(workspaceId);
-  const workspaceTitle = meta?.title ?? meta?.name ?? props.workspaceName;
+  const workspaceTitle = workspaceMetadata?.title ?? workspaceMetadata?.name ?? props.workspaceName;
 
   return (
     <PerfRenderMarker id="chat-pane">
@@ -304,7 +303,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   const chatTranscriptFullWidth = useChatTranscriptFullWidth();
   const [transcriptDensity] = useTranscriptDensity();
   const { api } = useAPI();
-  const { workspaceMetadata } = useWorkspaceContext();
+  const workspaceMetadata = useWorkspaceMetadataEntry(workspaceId);
   const storeRaw = useWorkspaceStoreRaw();
   const aggregator = useWorkspaceAggregator(workspaceId);
   const workspaceUsage = useWorkspaceUsage(workspaceId);
@@ -314,16 +313,16 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
 
   // Transcript-only workspaces preserve historical chat and usage after the worktree is deleted,
   // so the transcript stays readable while new sends remain disabled.
-  const meta = workspaceMetadata.get(workspaceId);
-  const transcriptOnly = meta?.transcriptOnly ?? false;
+  const transcriptOnly = workspaceMetadata?.transcriptOnly ?? false;
   const isPreStreamAgentTask =
-    Boolean(meta?.parentWorkspaceId) && isBlockedPreStreamTaskStatus(meta?.taskStatus);
-  const preStreamAgentTaskLabel = meta?.taskStatus === "starting" ? "Starting" : "Queued";
+    Boolean(workspaceMetadata?.parentWorkspaceId) &&
+    isBlockedPreStreamTaskStatus(workspaceMetadata?.taskStatus);
+  const preStreamAgentTaskLabel = workspaceMetadata?.taskStatus === "starting" ? "Starting" : "Queued";
   const queuedAgentTaskPrompt =
     isPreStreamAgentTask &&
-    typeof meta?.taskPrompt === "string" &&
-    meta.taskPrompt.trim().length > 0
-      ? meta.taskPrompt
+    typeof workspaceMetadata?.taskPrompt === "string" &&
+    workspaceMetadata.taskPrompt.trim().length > 0
+      ? workspaceMetadata.taskPrompt
       : null;
   const shouldShowQueuedAgentTaskPrompt =
     Boolean(queuedAgentTaskPrompt) && (workspaceState?.messages.length ?? 0) === 0;
@@ -1617,7 +1616,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                     runtimeConfig={runtimeConfig}
                     isPreStreamAgentTask={isPreStreamAgentTask}
                     preStreamAgentTaskStatus={
-                      meta?.taskStatus === "starting" ? "starting" : "queued"
+                      workspaceMetadata?.taskStatus === "starting" ? "starting" : "queued"
                     }
                     isCompacting={isCompacting}
                     shouldShowPinnedTodoList={shouldShowPinnedTodoList}

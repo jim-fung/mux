@@ -73,17 +73,39 @@ import {
   getStagedAttachments,
 } from "@/browser/features/ChatInput/stagedAttachments";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
-
-// ============================================================================
-// Workspace Creation
-// ============================================================================
-
+import { readPersistedString } from "@/browser/hooks/usePersistedState";
+import { addEphemeralMessage, workspaceStore } from "@/browser/stores/WorkspaceStore";
 import {
   createCommandToast,
   createInvalidCompactModelToast,
 } from "@/browser/features/ChatInput/ChatInputToasts";
 import { trackCommandUsed } from "@/common/telemetry";
-import { addEphemeralMessage } from "@/browser/stores/WorkspaceStore";
+
+// ============================================================================
+// Workspace Creation
+// ============================================================================
+
+const INITIAL_SEND_READINESS_TIMEOUT_MS = 1500;
+
+async function sendStartMessageWhenWorkspaceReady(input: {
+  client: RouterClient<AppRouter>;
+  workspaceId: string;
+  message: string;
+  options: SendMessageOptions;
+}): Promise<void> {
+  // Wait for the routed workspace to become the active onChat target so the
+  // initial send is coupled to an explicit store transition instead of paint timing.
+  await workspaceStore.waitForActiveOnChatWorkspace(
+    input.workspaceId,
+    INITIAL_SEND_READINESS_TIMEOUT_MS
+  );
+
+  await input.client.workspace.sendMessage({
+    workspaceId: input.workspaceId,
+    message: input.message,
+    options: input.options,
+  });
+}
 import { setGoalWithConflictRetry } from "@/browser/utils/goals/setGoalWithConflictRetry";
 import { loadGoalDefaults, resolveGoalSetIntent } from "@/browser/utils/goals/resolveGoalSetIntent";
 import { SIDE_QUESTION_COMMAND } from "@/common/utils/messages/sideQuestion";
@@ -148,16 +170,13 @@ export async function forkWorkspace(options: ForkOptions): Promise<ForkResult> {
   const startMessage = options.startMessage;
   const sendMessageOptions = options.sendMessageOptions;
   if (startMessage && sendMessageOptions) {
-    requestAnimationFrame(() => {
-      client.workspace
-        .sendMessage({
-          workspaceId: result.metadata.id,
-          message: startMessage,
-          options: sendMessageOptions,
-        })
-        .catch(() => {
-          // Best-effort: the user can send the message manually if this fails.
-        });
+    void sendStartMessageWhenWorkspaceReady({
+      client,
+      workspaceId: result.metadata.id,
+      message: startMessage,
+      options: sendMessageOptions,
+    }).catch(() => {
+      // Best-effort: the user can send the message manually if this fails.
     });
   }
 
@@ -1431,7 +1450,7 @@ export async function createNewWorkspace(
   let effectiveRuntime = options.runtime;
   if (effectiveRuntime === undefined) {
     const runtimeKey = getRuntimeKey(options.projectPath);
-    const savedRuntime = localStorage.getItem(runtimeKey);
+    const savedRuntime = readPersistedString(runtimeKey);
     if (savedRuntime) {
       effectiveRuntime = savedRuntime;
     }
@@ -1466,16 +1485,13 @@ export async function createNewWorkspace(
   const sendMessageOptions = options.sendMessageOptions;
   const client = options.client;
   if (startMessage && sendMessageOptions) {
-    requestAnimationFrame(() => {
-      client.workspace
-        .sendMessage({
-          workspaceId: result.metadata.id,
-          message: startMessage,
-          options: sendMessageOptions,
-        })
-        .catch(() => {
-          // Best-effort: the user can send the message manually if this fails.
-        });
+    void sendStartMessageWhenWorkspaceReady({
+      client,
+      workspaceId: result.metadata.id,
+      message: startMessage,
+      options: sendMessageOptions,
+    }).catch(() => {
+      // Best-effort: the user can send the message manually if this fails.
     });
   }
 

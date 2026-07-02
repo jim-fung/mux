@@ -11,7 +11,7 @@ import type { SendMessageOptions } from "@/common/orpc/types";
 import { useProviderOptions } from "./useProviderOptions";
 import { useExperimentOverrideValue } from "./useExperiments";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
+import { useWorkspaceMetadataEntry } from "@/browser/stores/WorkspaceStore";
 import { getWorkspaceAiSettingsFromMetadata } from "@/browser/utils/workspaceAiSettingsSync";
 
 /**
@@ -30,7 +30,7 @@ export interface SendMessageOptionsWithBase extends SendMessageOptions {
 export function useSendMessageOptions(workspaceId: string): SendMessageOptionsWithBase {
   const [thinkingLevel] = useThinkingLevel();
   const { agentId, disableWorkspaceAgents } = useAgent();
-  const { workspaceMetadata } = useWorkspaceContext();
+  const workspaceMetadata = useWorkspaceMetadataEntry(workspaceId);
   const { options: providerOptions } = useProviderOptions();
 
   // Subscribe to the global default model preference so backend-seeded values apply
@@ -66,7 +66,7 @@ export function useSendMessageOptions(workspaceId: string): SendMessageOptionsWi
 
   // Prefer metadata over the global default until workspace localStorage seeding catches up.
   const metadataSettings = getWorkspaceAiSettingsFromMetadata(
-    workspaceMetadata.get(workspaceId),
+    workspaceMetadata ?? undefined,
     agentId
   );
   const baseModel = normalizeModelPreference(

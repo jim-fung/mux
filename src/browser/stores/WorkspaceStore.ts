@@ -658,6 +658,10 @@ export class WorkspaceStore {
   // Workspace currently owning the live onChat subscription.
   private activeOnChatWorkspaceId: string | null = null;
 
+  // Imperative listeners for code paths that need to wait until a workspace
+  // becomes the active onChat target without going through React render timing.
+  private activeOnChatWorkspaceListeners = new Set<() => void>();
+
   // Lightweight activity snapshots from workspace.activity.list/subscribe.
   private workspaceActivity = new Map<string, WorkspaceActivitySnapshot>();
   // Recency timestamp observed when a workspace transitions into streaming=true.
@@ -689,6 +693,10 @@ export class WorkspaceStore {
 
   private activeGoalCount = 0;
   private activeGoalCountStore = new MapStore<string, void>();
+
+  // Per-workspace metadata selectors for hot UI leaves that only care about the
+  // current workspace's entry, not wholesale Map replacement.
+  private workspaceMetadataStore = new MapStore<string, FrontendWorkspaceMetadata | null>();
 
   // Per-workspace terminal activity aggregates (from terminal.activity.subscribe).
   private workspaceTerminalActivity = new Map<
@@ -1375,6 +1383,61 @@ export class WorkspaceStore {
     );
   }
 
+  private subscribeActiveOnChatWorkspace(listener: () => void): () => void {
+    this.activeOnChatWorkspaceListeners.add(listener);
+    return () => {
+      this.activeOnChatWorkspaceListeners.delete(listener);
+    };
+  }
+
+  private notifyActiveOnChatWorkspaceListeners(): void {
+    for (const listener of this.activeOnChatWorkspaceListeners) {
+      listener();
+    }
+  }
+
+  private setActiveOnChatWorkspaceId(workspaceId: string | null): void {
+    if (this.activeOnChatWorkspaceId === workspaceId) {
+      return;
+    }
+
+    this.activeOnChatWorkspaceId = workspaceId;
+    this.notifyActiveOnChatWorkspaceListeners();
+  }
+
+  async waitForActiveOnChatWorkspace(workspaceId: string, timeoutMs = 1500): Promise<boolean> {
+    if (this.activeOnChatWorkspaceId === workspaceId) {
+      return true;
+    }
+
+    return await new Promise<boolean>((resolve) => {
+      let settled = false;
+      const cleanupCallbacks: Array<() => void> = [];
+
+      const finish = (ready: boolean) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        for (const cleanup of cleanupCallbacks) {
+          cleanup();
+        }
+        resolve(ready);
+      };
+
+      const checkReady = () => {
+        if (this.activeOnChatWorkspaceId === workspaceId) {
+          finish(true);
+        }
+      };
+
+      const timeout = setTimeout(() => finish(false), timeoutMs);
+      cleanupCallbacks.push(() => clearTimeout(timeout));
+      cleanupCallbacks.push(this.subscribeActiveOnChatWorkspace(checkReady));
+      checkReady();
+    });
+  }
+
   private clearReplayBuffers(workspaceId: string): void {
     const transient = this.chatTransientState.get(workspaceId);
     if (!transient) {
@@ -1417,7 +1480,7 @@ export class WorkspaceStore {
         unsubscribe();
       }
       this.ipcUnsubscribers.delete(previousActiveWorkspaceId);
-      this.activeOnChatWorkspaceId = null;
+      this.setActiveOnChatWorkspaceId(null);
     }
 
     if (targetWorkspaceId) {
@@ -1431,7 +1494,7 @@ export class WorkspaceStore {
 
       const controller = new AbortController();
       this.ipcUnsubscribers.set(targetWorkspaceId, () => controller.abort());
-      this.activeOnChatWorkspaceId = targetWorkspaceId;
+      this.setActiveOnChatWorkspaceId(targetWorkspaceId);
       void this.runOnChatSubscription(targetWorkspaceId, controller.signal);
     }
 
@@ -1760,6 +1823,10 @@ export class WorkspaceStore {
    */
   subscribeKey = (workspaceId: string, listener: () => void) => {
     return this.states.subscribeKey(workspaceId, listener);
+  };
+
+  subscribeWorkspaceMetadata = (workspaceId: string, listener: () => void) => {
+    return this.workspaceMetadataStore.subscribeKey(workspaceId, listener);
   };
 
   getBashToolLiveOutput(workspaceId: string, toolCallId: string): LiveBashOutputView | null {
@@ -3695,6 +3762,10 @@ export class WorkspaceStore {
     return this.workspaceMetadata.get(workspaceId);
   }
 
+  getWorkspaceMetadataSnapshot(workspaceId: string): FrontendWorkspaceMetadata | null {
+    return this.workspaceMetadata.get(workspaceId) ?? null;
+  }
+
   addWorkspace(metadata: FrontendWorkspaceMetadata): void {
     const workspaceId = metadata.id;
 
@@ -3705,6 +3776,7 @@ export class WorkspaceStore {
 
     // Store metadata for name lookup
     this.workspaceMetadata.set(workspaceId, metadata);
+    this.workspaceMetadataStore.bump(workspaceId);
     this.derived.bump("workspaces");
 
     // Backend guarantees createdAt via config.ts - this should never be undefined
@@ -3800,7 +3872,7 @@ export class WorkspaceStore {
       this.ipcUnsubscribers.delete(workspaceId);
     }
     if (this.activeOnChatWorkspaceId === workspaceId) {
-      this.activeOnChatWorkspaceId = null;
+      this.setActiveOnChatWorkspaceId(null);
     }
 
     this.pendingReplayReset.delete(workspaceId);
@@ -3812,6 +3884,7 @@ export class WorkspaceStore {
     this.aggregators.delete(workspaceId);
     this.chatTransientState.delete(workspaceId);
     this.workspaceMetadata.delete(workspaceId);
+    this.workspaceMetadataStore.delete(workspaceId);
     this.derived.bump("workspaces");
     this.workspaceActivity.delete(workspaceId);
     this.refreshActiveGoalCount();
@@ -3845,6 +3918,12 @@ export class WorkspaceStore {
     for (const metadata of workspaceMetadata.values()) {
       if (!currentIds.has(metadata.id)) {
         this.addWorkspace(metadata);
+        continue;
+      }
+
+      if (this.workspaceMetadata.get(metadata.id) !== metadata) {
+        this.workspaceMetadata.set(metadata.id, metadata);
+        this.workspaceMetadataStore.bump(metadata.id);
       }
     }
 
@@ -3896,7 +3975,7 @@ export class WorkspaceStore {
     this.clientChangeController.abort();
 
     this.activeWorkspaceId = null;
-    this.activeOnChatWorkspaceId = null;
+    this.setActiveOnChatWorkspaceId(null);
     this.pendingReplayReset.clear();
     this.states.clear();
     this.derived.clear();
@@ -4493,6 +4572,8 @@ export const workspaceStore = {
    */
   setActiveWorkspaceId: (workspaceId: string | null) =>
     getStoreInstance().setActiveWorkspaceId(workspaceId),
+  waitForActiveOnChatWorkspace: (workspaceId: string, timeoutMs?: number) =>
+    getStoreInstance().waitForActiveOnChatWorkspace(workspaceId, timeoutMs),
 };
 
 /**
@@ -4523,6 +4604,22 @@ export function useWorkspaceShellStatus(workspaceId: string): WorkspaceShellStat
   return useSyncExternalStore(
     (listener) => store.subscribeKey(workspaceId, listener),
     () => store.getWorkspaceShellStatus(workspaceId)
+  );
+}
+
+/**
+ * Hook to get metadata for a specific workspace.
+ * Only re-renders when THAT workspace's metadata entry changes.
+ */
+export function useWorkspaceMetadataEntry(
+  workspaceId: string | null | undefined
+): FrontendWorkspaceMetadata | null {
+  const store = getStoreInstance();
+
+  return useSyncExternalStore(
+    (listener) =>
+      workspaceId ? store.subscribeWorkspaceMetadata(workspaceId, listener) : () => undefined,
+    () => (workspaceId ? store.getWorkspaceMetadataSnapshot(workspaceId) : null)
   );
 }
 

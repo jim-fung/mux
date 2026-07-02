@@ -1,6 +1,6 @@
 import React from "react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { copyFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -69,9 +69,10 @@ async function importIsolatedAgentModules() {
   await writeFile(isolatedWorkspacePath, isolatedWorkspaceContextSource);
 
   const agentContextSource = await readFile(join(contextsDir, "AgentContext.tsx"), "utf8");
-  const isolatedAgentContextSource = agentContextSource
-    .replace('from "@/browser/contexts/API";', 'from "./API.real.tsx";')
-    .replace('from "@/browser/contexts/WorkspaceContext";', 'from "./WorkspaceContext.real.tsx";');
+  const isolatedAgentContextSource = agentContextSource.replace(
+    'from "@/browser/contexts/API";',
+    'from "./API.real.tsx";'
+  );
 
   if (isolatedAgentContextSource === agentContextSource) {
     throw new Error("Failed to rewrite AgentContext imports for the isolated test copy");
@@ -141,9 +142,11 @@ const LOCKED_AGENT: AgentDefinitionDescriptor = {
 
 interface HarnessProps {
   onChange: (value: AgentContextValue) => void;
+  onRender?: () => void;
 }
 
 function Harness(props: HarnessProps) {
+  props.onRender?.();
   const value = useAgent();
 
   React.useEffect(() => {
@@ -211,6 +214,10 @@ function createApiClient(): APIClient {
     server: {
       getLaunchProject: () => Promise.resolve(null),
     },
+    config: {
+      getConfig: () => Promise.resolve({ muxHomeKind: null }),
+      onConfigChanged: () => Promise.resolve(createEmptyAsyncIterable()),
+    },
     terminal: {
       openWindow: () => Promise.resolve(),
     },
@@ -221,16 +228,17 @@ function renderAgentHarness(props: {
   projectPath: string;
   workspaceId?: string;
   onChange: (value: AgentContextValue) => void;
+  onRender?: () => void;
 }) {
   return render(
     <APIProvider client={createApiClient()}>
       <RouterProvider>
         <ProjectProvider>
-          <WorkspaceProvider>
-            <AgentProvider workspaceId={props.workspaceId} projectPath={props.projectPath}>
-              <Harness onChange={props.onChange} />
-            </AgentProvider>
-          </WorkspaceProvider>
+            <WorkspaceProvider>
+              <AgentProvider workspaceId={props.workspaceId} projectPath={props.projectPath}>
+                <Harness onChange={props.onChange} onRender={props.onRender} />
+              </AgentProvider>
+            </WorkspaceProvider>
         </ProjectProvider>
       </RouterProvider>
     </APIProvider>
@@ -424,6 +432,71 @@ describe("AgentContext", () => {
         handleOpenPicker as EventListener
       );
     }
+  });
+
+  test("does not rerender for unrelated workspace metadata updates", async () => {
+    const projectPath = "/tmp/project";
+    const activeWorkspaceId = "active-workspace";
+    const unrelatedWorkspaceId = "other-workspace";
+    mockAgentDefinitions = [EXEC_AGENT, PLAN_AGENT];
+    mockWorkspaceMetadata.set(activeWorkspaceId, {});
+    mockWorkspaceMetadata.set(unrelatedWorkspaceId, {});
+
+    let contextValue: AgentContextValue | undefined;
+    let renderCount = 0;
+
+    renderAgentHarness({
+      workspaceId: activeWorkspaceId,
+      projectPath,
+      onChange: (value) => (contextValue = value),
+      onRender: () => {
+        renderCount += 1;
+      },
+    });
+
+    await waitFor(() => {
+      expect(contextValue?.agentId).toBe("exec");
+      expect(contextValue?.isAgentSelectionLocked).toBe(false);
+    });
+
+    const baselineRenderCount = renderCount;
+
+    act(() => {
+      getWorkspaceStoreRaw().syncWorkspaces(
+        new Map([
+          [activeWorkspaceId, createWorkspaceMetadata(activeWorkspaceId)],
+          [
+            unrelatedWorkspaceId,
+            createWorkspaceMetadata(unrelatedWorkspaceId, { agentId: "plan" }),
+          ],
+        ])
+      );
+    });
+    expect(renderCount).toBe(baselineRenderCount);
+
+    act(() => {
+      getWorkspaceStoreRaw().syncWorkspaces(
+        new Map([
+          [
+            activeWorkspaceId,
+            createWorkspaceMetadata(activeWorkspaceId, {
+              parentWorkspaceId: "parent-workspace",
+              agentId: "exec",
+            }),
+          ],
+          [
+            unrelatedWorkspaceId,
+            createWorkspaceMetadata(unrelatedWorkspaceId, { agentId: "plan" }),
+          ],
+        ])
+      );
+    });
+
+    await waitFor(() => {
+      expect(renderCount).toBeGreaterThan(baselineRenderCount);
+      expect(contextValue?.isAgentSelectionLocked).toBe(true);
+      expect(contextValue?.agentId).toBe("exec");
+    });
   });
 
   test("removed non-selectable agent in mutable workspace remaps and does not block shortcut actions", async () => {

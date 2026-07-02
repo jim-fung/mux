@@ -23,7 +23,7 @@ import { formatKeybind, KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keyb
 import { getDevcontainerStatusChip } from "@/browser/utils/runtimeUi";
 import { useGitStatus } from "@/browser/stores/GitStatusStore";
 import { useRuntimeStatus, useRuntimeStatusStoreRaw } from "@/browser/stores/RuntimeStatusStore";
-import { useWorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
+import { useWorkspaceMetadataEntry, useWorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
 import { Button } from "@/browser/components/Button/Button";
 import { isDevcontainerRuntime, type RuntimeConfig } from "@/common/types/runtime";
 import { useTutorial } from "@/browser/contexts/TutorialContext";
@@ -46,7 +46,7 @@ import { SkillIndicator } from "../SkillIndicator/SkillIndicator";
 import { useAPI } from "@/browser/contexts/API";
 import { useAgent } from "@/browser/contexts/AgentContext";
 
-import { useWorkspaceActions, useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
+import { useWorkspaceActions } from "@/browser/contexts/WorkspaceContext";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { formatProjectHierarchyLabel } from "@/common/utils/subProjects";
 import { isMultiProject } from "@/common/utils/multiProject";
@@ -92,13 +92,12 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const { api } = useAPI();
   const { disableWorkspaceAgents } = useAgent();
   const { preflightArchiveWorkspace, archiveWorkspace } = useWorkspaceActions();
-  const { workspaceMetadata } = useWorkspaceContext();
+  const workspaceEntry = useWorkspaceMetadataEntry(workspaceId);
   const workspaceHeartbeatsEnabled = useExperimentValue(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS);
   const openTerminalPopout = useOpenTerminal();
   const openInEditor = useOpenInEditor();
   const gitStatus = useGitStatus(workspaceId);
   const runtimeStatus = useRuntimeStatus(workspaceId);
-  const workspaceEntry = workspaceMetadata.get(workspaceId);
   const showMultiProjectStatus = workspaceEntry != null && isMultiProject(workspaceEntry);
   // The workspace's metadata.projectName is the parent project (since worktrees
   // are owned by the top-most parent). When the workspace is scoped to a

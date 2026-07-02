@@ -1293,6 +1293,21 @@ describe("WorkspaceStore", () => {
       expect(subscribedWorkspaceIds).toEqual(["workspace-1", "workspace-2"]);
     });
 
+    it("waits for a workspace to become the active onChat target", async () => {
+      createAndAddWorkspace(store, "workspace-1", {}, false);
+
+      const readyPromise = store.waitForActiveOnChatWorkspace("workspace-1", 1000);
+      store.setActiveWorkspaceId("workspace-1");
+
+      await expect(readyPromise).resolves.toBe(true);
+    });
+
+    it("times out when a workspace never becomes the active onChat target", async () => {
+      await expect(store.waitForActiveOnChatWorkspace("workspace-never-active", 1)).resolves.toBe(
+        false
+      );
+    });
+
     it("clears replay buffers before aborting the previous active workspace subscription", async () => {
       mockChatScript([], { keepOpen: true });
 
@@ -1711,6 +1726,55 @@ describe("WorkspaceStore", () => {
       // Should verify that the controller was aborted, but since we mock the implementation
       // we just check that the workspace was removed from internal state
       expect(store.getAggregator("workspace-1")).toBeUndefined();
+    });
+
+    it("only notifies metadata subscribers for the workspace that changed", () => {
+      const metadata1 = makeWorkspaceMetadata("workspace-1", { name: "workspace-1" });
+      const metadata2 = makeWorkspaceMetadata("workspace-2", { name: "workspace-2" });
+
+      store.syncWorkspaces(
+        new Map([
+          [metadata1.id, metadata1],
+          [metadata2.id, metadata2],
+        ])
+      );
+
+      const listener1 = mock(() => undefined);
+      const listener2 = mock(() => undefined);
+      store.subscribeWorkspaceMetadata(metadata1.id, listener1);
+      store.subscribeWorkspaceMetadata(metadata2.id, listener2);
+
+      const updatedMetadata1 = makeWorkspaceMetadata("workspace-1", {
+        name: "workspace-1-renamed",
+      });
+      store.syncWorkspaces(
+        new Map([
+          [updatedMetadata1.id, updatedMetadata1],
+          [metadata2.id, metadata2],
+        ])
+      );
+
+      expect(listener1).toHaveBeenCalledTimes(1);
+      expect(listener2).not.toHaveBeenCalled();
+      expect(store.getWorkspaceMetadataSnapshot(metadata1.id)?.name).toBe("workspace-1-renamed");
+      expect(store.getWorkspaceMetadataSnapshot(metadata2.id)?.name).toBe("workspace-2");
+    });
+
+    it("notifies only the removed workspace metadata subscribers on deletion", () => {
+      const metadata1 = createAndAddWorkspace(store, "workspace-1", { name: "workspace-1" }, false);
+      const metadata2 = createAndAddWorkspace(store, "workspace-2", { name: "workspace-2" }, false);
+
+      const listener1 = mock(() => undefined);
+      const listener2 = mock(() => undefined);
+      store.subscribeWorkspaceMetadata(metadata1.id, listener1);
+      store.subscribeWorkspaceMetadata(metadata2.id, listener2);
+
+      store.syncWorkspaces(new Map([[metadata2.id, metadata2]]));
+
+      expect(listener1).toHaveBeenCalledTimes(1);
+      expect(listener2).not.toHaveBeenCalled();
+      expect(store.getWorkspaceMetadataSnapshot(metadata1.id)).toBeNull();
+      expect(store.getWorkspaceMetadataSnapshot(metadata2.id)?.name).toBe("workspace-2");
     });
   });
 
