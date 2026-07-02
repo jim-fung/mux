@@ -71,7 +71,7 @@ void mock.module("@/browser/hooks/useOpenTerminal", () => ({
 }));
 
 void mock.module("@/browser/hooks/useReviews", () => ({
-  useReviews: () => ({
+  useReviewActions: () => ({
     addReview: addReviewMock,
   }),
 }));

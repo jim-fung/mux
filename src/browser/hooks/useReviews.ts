@@ -4,7 +4,7 @@
  */
 
 import { useCallback, useMemo } from "react";
-import { usePersistedState } from "./usePersistedState";
+import { updatePersistedState, usePersistedState } from "./usePersistedState";
 import { getReviewsKey } from "@/common/constants/storage";
 import type { Review, ReviewsState, ReviewNoteData } from "@/common/types/review";
 
@@ -52,42 +52,32 @@ export interface UseReviewsReturn {
   getReview: (reviewId: string) => Review | undefined;
 }
 
-/**
- * Hook for managing reviews for a workspace
- * Persists reviews to localStorage
- */
-export function useReviews(workspaceId: string): UseReviewsReturn {
-  const [state, setState] = usePersistedState<ReviewsState>(
-    getReviewsKey(workspaceId),
-    {
-      workspaceId,
-      reviews: {},
-      lastUpdated: Date.now(),
-    },
-    { listener: true } // Enable cross-component sync so banner updates when AIView adds reviews
-  );
+type ReviewActionKey =
+  | "addReview"
+  | "attachReview"
+  | "detachReview"
+  | "attachAllPending"
+  | "detachAllAttached"
+  | "checkReview"
+  | "uncheckReview"
+  | "removeReview"
+  | "updateReviewNote"
+  | "clearChecked"
+  | "clearAll";
 
-  // Convert reviews object to sorted array (oldest first - newest at end)
-  const reviews = useMemo(() => {
-    return Object.values(state.reviews).sort((a, b) => a.createdAt - b.createdAt);
-  }, [state.reviews]);
+export type ReviewActions = Pick<UseReviewsReturn, ReviewActionKey>;
 
-  // Filter reviews by status
-  const attachedReviews = useMemo(() => {
-    return reviews.filter((r) => r.status === "attached");
-  }, [reviews]);
+type SetReviewsState = (value: ReviewsState | ((prev: ReviewsState) => ReviewsState)) => void;
 
-  // Count reviews by status
-  const pendingCount = useMemo(() => {
-    return reviews.filter((r) => r.status === "pending").length;
-  }, [reviews]);
+function getInitialReviewsState(workspaceId: string): ReviewsState {
+  return {
+    workspaceId,
+    reviews: {},
+    lastUpdated: Date.now(),
+  };
+}
 
-  const attachedCount = attachedReviews.length;
-
-  const checkedCount = useMemo(() => {
-    return reviews.filter((r) => r.status === "checked").length;
-  }, [reviews]);
-
+function useReviewActionCallbacks(setState: SetReviewsState): ReviewActions {
   const addReview = useCallback(
     (data: ReviewNoteData): Review => {
       const review: Review = {
@@ -299,6 +289,82 @@ export function useReviews(workspaceId: string): UseReviewsReturn {
     }));
   }, [setState]);
 
+  return useMemo(
+    () => ({
+      addReview,
+      attachReview,
+      detachReview,
+      attachAllPending,
+      detachAllAttached,
+      checkReview,
+      uncheckReview,
+      removeReview,
+      updateReviewNote,
+      clearChecked,
+      clearAll,
+    }),
+    [
+      addReview,
+      attachReview,
+      detachReview,
+      attachAllPending,
+      detachAllAttached,
+      checkReview,
+      uncheckReview,
+      removeReview,
+      updateReviewNote,
+      clearChecked,
+      clearAll,
+    ]
+  );
+}
+
+export function useReviewActions(workspaceId: string): ReviewActions {
+  const reviewsKey = getReviewsKey(workspaceId);
+  const initialState = useMemo(() => getInitialReviewsState(workspaceId), [workspaceId]);
+  const setState = useCallback<SetReviewsState>(
+    (value) => {
+      updatePersistedState(reviewsKey, value, initialState);
+    },
+    [initialState, reviewsKey]
+  );
+
+  return useReviewActionCallbacks(setState);
+}
+
+/**
+ * Hook for managing reviews for a workspace
+ * Persists reviews to localStorage
+ */
+export function useReviews(workspaceId: string): UseReviewsReturn {
+  const [state, setState] = usePersistedState<ReviewsState>(
+    getReviewsKey(workspaceId),
+    getInitialReviewsState(workspaceId),
+    { listener: true } // Enable cross-component sync so banner updates when AIView adds reviews
+  );
+  const actions = useReviewActionCallbacks(setState);
+
+  // Convert reviews object to sorted array (oldest first - newest at end)
+  const reviews = useMemo(() => {
+    return Object.values(state.reviews).sort((a, b) => a.createdAt - b.createdAt);
+  }, [state.reviews]);
+
+  // Filter reviews by status
+  const attachedReviews = useMemo(() => {
+    return reviews.filter((r) => r.status === "attached");
+  }, [reviews]);
+
+  // Count reviews by status
+  const pendingCount = useMemo(() => {
+    return reviews.filter((r) => r.status === "pending").length;
+  }, [reviews]);
+
+  const attachedCount = attachedReviews.length;
+
+  const checkedCount = useMemo(() => {
+    return reviews.filter((r) => r.status === "checked").length;
+  }, [reviews]);
+
   const getReview = useCallback(
     (reviewId: string): Review | undefined => {
       return state.reviews[reviewId];
@@ -313,17 +379,7 @@ export function useReviews(workspaceId: string): UseReviewsReturn {
       attachedCount,
       checkedCount,
       attachedReviews,
-      addReview,
-      attachReview,
-      detachReview,
-      attachAllPending,
-      detachAllAttached,
-      checkReview,
-      uncheckReview,
-      removeReview,
-      updateReviewNote,
-      clearChecked,
-      clearAll,
+      ...actions,
       getReview,
     }),
     [
@@ -332,17 +388,7 @@ export function useReviews(workspaceId: string): UseReviewsReturn {
       attachedCount,
       checkedCount,
       attachedReviews,
-      addReview,
-      attachReview,
-      detachReview,
-      attachAllPending,
-      detachAllAttached,
-      checkReview,
-      uncheckReview,
-      removeReview,
-      updateReviewNote,
-      clearChecked,
-      clearAll,
+      actions,
       getReview,
     ]
   );

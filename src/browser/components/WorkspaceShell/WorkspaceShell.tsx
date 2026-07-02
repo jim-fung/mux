@@ -16,7 +16,7 @@ import { PopoverError } from "../PopoverError/PopoverError";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { useBackgroundBashError } from "@/browser/contexts/BackgroundBashContext";
 import { useWorkspaceShellStatus } from "@/browser/stores/WorkspaceStore";
-import { useReviews } from "@/browser/hooks/useReviews";
+import { useReviewActions } from "@/browser/hooks/useReviews";
 import type { ReviewNoteData } from "@/common/types/review";
 import { ConnectionStatusToast } from "../ConnectionStatusToast/ConnectionStatusToast";
 import {
@@ -167,8 +167,7 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
     [openTerminalPopout, props.workspaceId, props.runtimeConfig]
   );
 
-  const reviews = useReviews(props.workspaceId);
-  const { addReview } = reviews;
+  const { addReview } = useReviewActions(props.workspaceId);
   const handleReviewNote = useCallback(
     (data: ReviewNoteData) => {
       addReview(data);
