@@ -1,5 +1,7 @@
 import React, { createContext, useCallback, useContext, useMemo, useState } from "react";
 
+import { usePersistedState } from "@/browser/hooks/usePersistedState";
+
 export interface CommandAction {
   id: string;
   title: string;
@@ -73,37 +75,38 @@ export function useCommandRegistry(): CommandRegistryContextValue {
 }
 
 const RECENT_STORAGE_KEY = "commandPalette:recent";
+const MAX_RECENT_ACTIONS = 20;
+
+function normalizeRecentActionIds(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.filter((id): id is string => typeof id === "string").slice(0, MAX_RECENT_ACTIONS);
+}
 
 export const CommandRegistryProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [isOpen, setIsOpen] = useState(false);
   const [initialQuery, setInitialQuery] = useState("");
   const [sources, setSources] = useState<Set<CommandSource>>(new Set());
-  const [recent, setRecent] = useState<string[]>(() => {
-    try {
-      const raw = localStorage.getItem(RECENT_STORAGE_KEY);
-      const parsed = raw ? (JSON.parse(raw) as string[]) : [];
-      return Array.isArray(parsed) ? parsed.slice(0, 20) : [];
-    } catch {
-      return [];
-    }
+  const [storedRecent, setStoredRecent] = usePersistedState<string[]>(RECENT_STORAGE_KEY, [], {
+    listener: true,
   });
-
-  const persistRecent = useCallback((next: string[]) => {
-    setRecent(next);
-    try {
-      localStorage.setItem(RECENT_STORAGE_KEY, JSON.stringify(next.slice(0, 20)));
-    } catch {
-      /* ignore persistence errors */
-    }
-  }, []);
+  const recent = useMemo(() => normalizeRecentActionIds(storedRecent), [storedRecent]);
 
   const addRecent = useCallback(
     (actionId: string) => {
-      // Move to front, dedupe
-      const next = [actionId, ...recent.filter((id) => id !== actionId)].slice(0, 20);
-      persistRecent(next);
+      // Use a functional persisted update so back-to-back command runs cannot
+      // clobber each other by closing over stale recent state.
+      setStoredRecent((prev) => {
+        const normalizedPrev = normalizeRecentActionIds(prev);
+        return normalizeRecentActionIds([
+          actionId,
+          ...normalizedPrev.filter((id) => id !== actionId),
+        ]);
+      });
     },
-    [recent, persistRecent]
+    [setStoredRecent]
   );
 
   const open = useCallback((query?: string) => {
