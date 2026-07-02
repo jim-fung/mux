@@ -1531,6 +1531,62 @@ export const TOOL_DEFINITIONS = {
       })
     ),
   },
+  code_outline: {
+    description:
+      "Get a read-only structural outline of a source file or directory using ast-grep, " +
+      "filling the gap between text search (grep) and full file reads (file_read). " +
+      "Use this for structural BREADTH before reading file contents: to discover the " +
+      "symbols (interfaces, classes, functions, exports) in a file or directory, their " +
+      "signatures, and their 1-based source ranges, without pulling whole files into context. " +
+      "Returns symbols with name, symbolType (e.g. interface/class/function/constant/field), " +
+      "signature, export/public flags, and a 1-based line/column range. " +
+      "File mode (default) returns the full nested structure; directory mode (default) " +
+      "returns exported symbols per file. " +
+      "This tool is read-only and cwd-restricted. Non-code files (e.g. markdown) return an " +
+      "empty result, not an error.",
+    schema: z.preprocess(
+      normalizeFilePath,
+      z.object({
+        path: z
+          .string()
+          .describe("The path to outline: a file or directory (absolute or relative)."),
+        items: z
+          .enum(["structure", "exports"])
+          .nullish()
+          .describe(
+            "What to extract. 'structure': full nested symbol tree (default for files). " +
+              "'exports': only exported symbols (default for directories). " +
+              "Omit to get the per-kind default."
+          ),
+        maxFiles: z
+          .number()
+          .int()
+          .positive()
+          .nullish()
+          .describe(
+            "Directory mode only: cap on the number of file-results returned " +
+              "(default 50). When exceeded, results are truncated and 'truncated' is set."
+          ),
+        maxSymbols: z
+          .number()
+          .int()
+          .positive()
+          .nullish()
+          .describe(
+            "Per-file cap on the number of top-level entries returned (default 200). " +
+              "When exceeded, that file's entries are truncated and 'truncated' is set."
+          ),
+        symbolTypes: z
+          .array(z.string())
+          .nullish()
+          .describe(
+            "Optional filter: keep only top-level entries whose symbolType matches " +
+              "one of these strings (e.g. ['interface','function']). Applied to top-level " +
+              "entries only; a filtered-out entry's children are dropped too."
+          ),
+      })
+    ),
+  },
   memory: {
     description:
       "Manage your persistent memory directory (experiment). " +
@@ -2682,6 +2738,72 @@ export const FileReadToolResultSchema = z.union([
   }),
 ]);
 
+/**
+ * A single structural symbol entry from ast-grep outline.
+ * Ranges are normalized to 1-based (ast-grep emits 0-based).
+ *
+ * Self-referential via `children`: top-level items (e.g. a class) may contain
+ * nested members (e.g. methods/fields). We use z.lazy so the schema can recurse.
+ * An explicit type annotation is required by zod for recursive z.lazy schemas.
+ */
+export interface CodeOutlineEntry {
+  name: string;
+  symbolType: string;
+  signature: string;
+  exported?: boolean;
+  public?: boolean;
+  range: {
+    start: { line: number; column: number };
+    end: { line: number; column: number };
+  };
+  children?: CodeOutlineEntry[];
+}
+
+export const CodeOutlineEntrySchema: z.ZodType<CodeOutlineEntry> = z.lazy(() =>
+  z.object({
+    name: z.string(),
+    symbolType: z.string(),
+    signature: z.string(),
+    exported: z.boolean().optional(),
+    public: z.boolean().optional(),
+    range: z.object({
+      start: z.object({ line: z.number(), column: z.number() }),
+      end: z.object({ line: z.number(), column: z.number() }),
+    }),
+    children: z.array(CodeOutlineEntrySchema).optional(),
+  })
+);
+
+/**
+ * One file's outline result: its detected language and the symbol entries.
+ */
+export const CodeOutlineFileSchema = z.object({
+  path: z.string(),
+  language: z.string(),
+  entries: z.array(CodeOutlineEntrySchema),
+});
+
+/**
+ * code_outline tool result - structural outline or error.
+ * `kind` echoes whether the input path was resolved to a file or a directory,
+ * which determines the default items mode and JSON parsing strategy.
+ */
+export const CodeOutlineToolResultSchema = z.union([
+  z.object({
+    success: z.literal(true),
+    path: z.string(),
+    kind: z.enum(["file", "directory"]),
+    files: z.array(CodeOutlineFileSchema),
+    truncated: z.boolean().optional(),
+  }),
+  z.object({
+    success: z.literal(false),
+    path: z.string().optional(),
+    kind: z.enum(["file", "directory"]).optional(),
+    error: z.string(),
+  }),
+]);
+
 const AttachFileToolTextPartSchema = z
   .object({
     type: z.literal("text"),
@@ -2855,6 +2977,7 @@ export type BridgeableToolName =
   | "bash_background_terminate"
   | "file_read"
   | "attach_file"
+  | "code_outline"
   | "agent_skill_read"
   | "agent_skill_read_file"
   | "file_edit_insert"
@@ -2885,6 +3008,7 @@ export const RESULT_SCHEMAS: Record<BridgeableToolName, z.ZodType> = {
   bash_background_terminate: BashBackgroundTerminateResultSchema,
   file_read: FileReadToolResultSchema,
   attach_file: AttachFileToolResultSchema,
+  code_outline: CodeOutlineToolResultSchema,
   agent_skill_read: AgentSkillReadToolResultSchema,
   agent_skill_read_file: AgentSkillReadFileToolResultSchema,
   file_edit_insert: FileEditInsertToolResultSchema,
@@ -2948,6 +3072,12 @@ export function getAvailableTools(
     /** Whether the agent memory tool is available (memory experiment enabled). */
     enableMemory?: boolean;
     /**
+     * Whether the code_outline tool is available (ast-grep-outline experiment
+     * enabled). Off => no tool, no context cost; the tool is read-only and
+     * depends only on the external ast-grep binary being on PATH.
+     */
+    enableAstGrepOutline?: boolean;
+    /**
      * Whether the Review pane tools (review_pane_update/review_pane_get) are
      * available. The Review pane belongs to the user-facing parent workspace,
      * so sub-agents (child task workspaces) pass false to keep them from
@@ -2964,6 +3094,7 @@ export function getAvailableTools(
   const enableAdvisor = options?.enableAdvisor ?? false;
   const enableDynamicWorkflows = options?.enableDynamicWorkflows ?? false;
   const enableMemory = options?.enableMemory ?? false;
+  const enableAstGrepOutline = options?.enableAstGrepOutline ?? false;
   const enableReviewPane = options?.enableReviewPane ?? true;
 
   // Base tools available for all models
@@ -2994,6 +3125,7 @@ export function getAvailableTools(
     // "file_edit_replace_lines", // DISABLED: causes models to break repo state
     "file_edit_insert",
     ...(enableMemory ? ["memory"] : []),
+    ...(enableAstGrepOutline ? ["code_outline"] : []),
     ...(enableAdvisor ? ["advisor"] : []),
     "ask_user_question",
     "propose_plan",

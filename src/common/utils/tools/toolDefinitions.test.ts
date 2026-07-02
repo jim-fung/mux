@@ -746,6 +746,18 @@ describe("TOOL_DEFINITIONS", () => {
     expect(enabledTools).toContain("workflow_resume");
   });
 
+  it("only includes code_outline when astGrepOutline experiment is enabled", () => {
+    // Default + explicitly-disabled: tool absent (gated off experiment).
+    expect(getAvailableTools("openai:gpt-4o")).not.toContain("code_outline");
+    expect(getAvailableTools("openai:gpt-4o", { enableAstGrepOutline: false })).not.toContain(
+      "code_outline"
+    );
+    // Enabled: tool present.
+    expect(getAvailableTools("openai:gpt-4o", { enableAstGrepOutline: true })).toContain(
+      "code_outline"
+    );
+  });
+
   it("gates native Google tools to Gemini 3 models", () => {
     expect(getAvailableTools("google:gemini-2.5-pro")).not.toContain("google_search");
     expect(getAvailableTools("google:gemini-2.5-pro")).not.toContain("url_context");

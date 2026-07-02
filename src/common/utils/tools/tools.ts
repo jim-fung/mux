@@ -3,6 +3,7 @@ import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import type { BackgroundWorkAttentionPolicy } from "@/common/types/backgroundWorkAttention";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
 import { createFileReadTool } from "@/node/services/tools/file_read";
+import { createCodeOutlineTool } from "@/node/services/tools/code_outline";
 import { createAttachFileTool } from "@/node/services/tools/attach_file";
 import { createBashTool } from "@/node/services/tools/bash";
 import { createBashOutputTool } from "@/node/services/tools/bash_output";
@@ -565,6 +566,12 @@ export async function getToolsForModel(
     ...(config.memoryService && config.experiments?.memory
       ? { memory: wrap(createMemoryTool(config)) }
       : {}),
+    // ast-grep structural outline (experiment-gated, read-only; off => no
+    // tool, no context cost). No service dependency — ast-grep is an external
+    // binary invoked via execBuffered.
+    ...(config.experiments?.astGrepOutline
+      ? { code_outline: wrap(createCodeOutlineTool(config)) }
+      : {}),
   };
 
   // HeartbeatService intentionally skips child task workspaces, and the
@@ -729,6 +736,7 @@ export async function getToolsForModel(
       ),
       enableAdvisor: Boolean(config.advisorRuntime),
       enableMemory: Boolean(config.memoryService && config.experiments?.memory),
+      enableAstGrepOutline: Boolean(config.experiments?.astGrepOutline),
       // The Review pane belongs to the user-facing parent workspace. config
       // .enableAgentReport is the canonical "is sub-agent" signal (set true iff
       // the workspace has a parentWorkspaceId), so withhold the review_pane_*

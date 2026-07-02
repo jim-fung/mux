@@ -22,6 +22,7 @@ import type {
   MuxAgentsReadToolResultSchema,
   MuxAgentsWriteToolResultSchema,
   FileReadToolResultSchema,
+  CodeOutlineToolResultSchema,
   HeartbeatToolResultSchema,
   MemoryToolResultSchema,
   AttachFileToolResultSchema,
@@ -132,6 +133,11 @@ export interface ToolOutputUiOnlyFields {
 
 // FileReadToolResult derived from Zod schema (single source of truth)
 export type FileReadToolResult = z.infer<typeof FileReadToolResultSchema>;
+
+// CodeOutlineToolResult derived from Zod schema (single source of truth)
+export type CodeOutlineToolResult = z.infer<typeof CodeOutlineToolResultSchema>;
+// Recursive entry type backing CodeOutlineToolResultSchema (defined in toolDefinitions).
+export type { CodeOutlineEntry } from "@/common/utils/tools/toolDefinitions";
 
 // Heartbeat tool types, derived from schema (avoid drift)
 export type HeartbeatToolArgs = z.infer<typeof TOOL_DEFINITIONS.heartbeat.schema>;

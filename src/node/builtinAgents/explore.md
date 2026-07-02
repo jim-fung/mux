@@ -39,3 +39,4 @@ You are in Explore mode (read-only).
   - After running verification, check `git status --porcelain` and report if it is non-empty.
 - Prefer `file_read` for reading file contents (supports offset/limit paging).
 - Use bash for read-only operations (rg, ls, git diff/show/log, etc.) and verification commands.
+- When you need structural breadth — "what's in this directory?", "what does this file export?", "where is symbol X defined?" — prefer `code_outline` over reading whole files. It returns symbol names, signatures, and 1-based ranges via ast-grep, filling the gap between `grep` and `file_read`. (Experiment-gated: if unavailable, fall back to `file_read`.)
