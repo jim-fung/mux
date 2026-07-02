@@ -130,6 +130,9 @@ import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { HexColorPicker } from "react-colorful";
 import { resolveSectionColor, SECTION_COLOR_PALETTE } from "@/common/constants/ui";
+import type { WorkspaceDraft } from "@/browser/contexts/WorkspaceContext";
+import type { ProjectConfig } from "@/common/types/project";
+import type { Result } from "@/common/types/result";
 
 interface SectionConfig {
   id: string;
@@ -192,6 +195,43 @@ function didWorkspaceAttentionSignalChange(
     prev.awaitingUserQuestion !== next.awaitingUserQuestion ||
     prev.hasSystemError !== next.hasSystemError
   );
+}
+
+function checkWorkspaceHasAttention(
+  workspaceId: string,
+  workspaceStore: WorkspaceStore,
+  workspaceRecency: Record<string, number>,
+  selectedWorkspaceId: string | undefined,
+  archivingWorkspaceIds: Set<string>
+): boolean {
+  const attentionSignal = getWorkspaceAttentionSignal(workspaceStore, workspaceId);
+  if (
+    attentionSignal?.isWorking === true ||
+    attentionSignal?.awaitingUserQuestion === true ||
+    attentionSignal?.hasSystemError === true
+  ) {
+    return true;
+  }
+
+  const metadata = workspaceStore.getWorkspaceMetadata(workspaceId);
+  if (metadata?.isRemoving === true || metadata?.isInitializing === true) {
+    return true;
+  }
+
+  if (archivingWorkspaceIds.has(workspaceId)) {
+    return true;
+  }
+
+  const recencyTimestamp = workspaceRecency[workspaceId] ?? null;
+  if (recencyTimestamp === null || selectedWorkspaceId === workspaceId) {
+    return false;
+  }
+  const lastReadTimestamp = readPersistedState<number | null>(
+    getWorkspaceLastReadKey(workspaceId),
+    null
+  );
+
+  return lastReadTimestamp !== null && recencyTimestamp > lastReadTimestamp;
 }
 
 function useWorkspaceAttentionSubscription(
@@ -691,1429 +731,150 @@ function usePreserveSubagentsUntilArchiveSetting(api: ReturnType<typeof useAPI>[
   return preserveSubagentsUntilArchive;
 }
 
-const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
-  collapsed,
-  onToggleCollapsed,
-  sortedWorkspacesByProject,
-  workspaceRecency,
-}) => {
-  // Use the narrow actions context — does NOT subscribe to workspaceMetadata
-  // changes, preventing the entire sidebar tree from re-rendering on every
-  // workspace create/archive/rename.
-  const {
-    selectedWorkspace,
-    setSelectedWorkspace: onSelectWorkspace,
-    preflightArchiveWorkspace,
-    archiveWorkspace: onArchiveWorkspace,
-    removeWorkspace,
-    updateWorkspaceTitle: onUpdateTitle,
-    refreshWorkspaceMetadata,
-    pendingNewWorkspaceProject,
-    pendingNewWorkspaceDraftId,
-    workspaceDraftsByProject,
-    workspaceDraftPromotionsByProject,
-    createWorkspaceDraft,
-    openWorkspaceDraft,
-    deleteWorkspaceDraft,
-  } = useWorkspaceActions();
-  const workspaceStore = useWorkspaceStoreRaw();
-  useWorkspaceAttentionSubscription(sortedWorkspacesByProject, workspaceStore);
-  const runtimeStatusStore = useRuntimeStatusStoreRaw();
-  const { navigateToProject } = useRouter();
-  const { api } = useAPI();
-  const preserveSubagentsUntilArchive = usePreserveSubagentsUntilArchiveSetting(api);
-  const { confirm: confirmDialog } = useConfirmDialog();
-  const settings = useSettings();
 
-  // Get project state and operations from context
-  const {
-    userProjects,
-    muxHomeKind,
-    openProjectCreateModal: onAddProject,
-    removeProject: onRemoveProject,
-    updateDisplayName,
-    updateColor: updateProjectColor,
-    assignWorkspaceToSubProject,
-  } = useProjectContext();
-
-  // Theme for logo variant
-  const { theme } = useTheme();
-  const MuxLogo = theme === "dark" || theme.endsWith("-dark") ? MuxLogoDark : MuxLogoLight;
-  const multiProjectWorkspacesEnabled = useExperimentValue(EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES);
-
-  // Mobile breakpoint for auto-closing sidebar
-  const MOBILE_BREAKPOINT = 768;
-  const projectListScrollRef = useRef<HTMLDivElement | null>(null);
-  const mobileScrollTopRef = useRef(0);
-  const wasCollapsedRef = useRef(collapsed);
-
-  const normalizeMobileScrollTop = useCallback((scrollTop: number): number => {
-    return Number.isFinite(scrollTop) ? Math.max(0, Math.round(scrollTop)) : 0;
-  }, []);
-
-  const persistMobileSidebarScrollTop = useCallback(
-    (scrollTop: number) => {
-      if (window.innerWidth > MOBILE_BREAKPOINT) {
-        return;
-      }
-
-      // Keep the last viewed list position so reopening the touch sidebar returns
-      // users to where they were browsing instead of jumping back to the top.
-      const normalizedScrollTop = normalizeMobileScrollTop(scrollTop);
-      updatePersistedState<number>(MOBILE_LEFT_SIDEBAR_SCROLL_TOP_KEY, normalizedScrollTop, 0);
-    },
-    [MOBILE_BREAKPOINT, normalizeMobileScrollTop]
-  );
-
-  useEffect(() => {
-    if (collapsed || window.innerWidth > MOBILE_BREAKPOINT) {
-      return;
-    }
-
-    const persistedScrollTop = readPersistedState<unknown>(MOBILE_LEFT_SIDEBAR_SCROLL_TOP_KEY, 0);
-    const normalizedScrollTop =
-      typeof persistedScrollTop === "number" ? normalizeMobileScrollTop(persistedScrollTop) : 0;
-    mobileScrollTopRef.current = normalizedScrollTop;
-
-    if (projectListScrollRef.current) {
-      projectListScrollRef.current.scrollTop = normalizedScrollTop;
-    }
-  }, [collapsed, MOBILE_BREAKPOINT, normalizeMobileScrollTop]);
-
-  useEffect(() => {
-    const wasCollapsed = wasCollapsedRef.current;
-
-    if (!wasCollapsed && collapsed) {
-      persistMobileSidebarScrollTop(mobileScrollTopRef.current);
-    }
-
-    wasCollapsedRef.current = collapsed;
-  }, [collapsed, persistMobileSidebarScrollTop]);
-
-  const handleProjectListScroll = useCallback(
-    (event: React.UIEvent<HTMLDivElement>) => {
-      mobileScrollTopRef.current = normalizeMobileScrollTop(event.currentTarget.scrollTop);
-    },
-    [normalizeMobileScrollTop]
-  );
-
-  // Wrapper to close sidebar on mobile after workspace selection
-  const handleSelectWorkspace = useCallback(
-    (selection: WorkspaceSelection) => {
-      onSelectWorkspace(selection);
-      if (window.innerWidth <= MOBILE_BREAKPOINT && !collapsed) {
-        persistMobileSidebarScrollTop(mobileScrollTopRef.current);
-        onToggleCollapsed();
-      }
-    },
-    [onSelectWorkspace, collapsed, onToggleCollapsed, persistMobileSidebarScrollTop]
-  );
-
-  // Wrapper to close sidebar on mobile after adding workspace
-  const handleAddWorkspace = useCallback(
-    (projectPath: string, subProjectPath?: string) => {
-      createWorkspaceDraft(projectPath, subProjectPath);
-      if (window.innerWidth <= MOBILE_BREAKPOINT && !collapsed) {
-        persistMobileSidebarScrollTop(mobileScrollTopRef.current);
-        onToggleCollapsed();
-      }
-    },
-    [createWorkspaceDraft, collapsed, onToggleCollapsed, persistMobileSidebarScrollTop]
-  );
-
-  // Wrapper to close sidebar on mobile after opening an existing draft
-  const handleOpenWorkspaceDraft = useCallback(
-    (projectPath: string, draftId: string) => {
-      openWorkspaceDraft(projectPath, draftId);
-      if (window.innerWidth <= MOBILE_BREAKPOINT && !collapsed) {
-        persistMobileSidebarScrollTop(mobileScrollTopRef.current);
-        onToggleCollapsed();
-      }
-    },
-    [openWorkspaceDraft, collapsed, onToggleCollapsed, persistMobileSidebarScrollTop]
-  );
-
-  const handleGoHome = useCallback(() => {
-    // Selecting null delegates to WorkspaceContext's home-navigation + selection reset flow.
-    onSelectWorkspace(null);
-    // Close sidebar on mobile
-    if (window.innerWidth <= MOBILE_BREAKPOINT && !collapsed) {
-      persistMobileSidebarScrollTop(mobileScrollTopRef.current);
-      onToggleCollapsed();
-    }
-  }, [onSelectWorkspace, collapsed, onToggleCollapsed, persistMobileSidebarScrollTop]);
-  // Workspace-specific subscriptions moved to AgentListItem component
-
-  // Store as array in localStorage, convert to Set for usage
-  const [expandedProjectsArray, setExpandedProjectsArray] = usePersistedState<string[]>(
-    EXPANDED_PROJECTS_KEY,
-    []
-  );
-  // Handle corrupted localStorage data (old Set stored as {}).
-  // Use a plain array with .includes() instead of new Set() on every render —
-  // the React Compiler cannot stabilize Set allocations (see AGENTS.md).
-  // For typical sidebar sizes (< 20 projects) .includes() is equivalent perf.
-  const expandedProjectsList = Array.isArray(expandedProjectsArray) ? expandedProjectsArray : [];
-
-  // Track which projects have old workspaces expanded (per-project, per-tier)
-  // Key format: getTierKey(projectPath, tierIndex) where tierIndex is 0, 1, 2 for 1/7/30 days
-  const [expandedOldWorkspaces, setExpandedOldWorkspaces] = usePersistedState<
-    Record<string, boolean>
-  >("expandedOldWorkspaces", {});
-
-  // Track which sections are expanded
-  const [expandedSections, setExpandedSections] = usePersistedState<Record<string, boolean>>(
-    "expandedSections",
-    {}
-  );
-
-  // Track parent workspaces whose reported child tasks are expanded.
-  const [expandedCompletedSubAgents, setExpandedCompletedSubAgents] = usePersistedState<
-    Record<string, boolean>
-  >("expandedCompletedSubAgents", {});
-  const toggleCompletedChildrenExpansion = useCallback(
-    (workspaceId: string) => {
-      setExpandedCompletedSubAgents((prev) => {
-        const current = prev[workspaceId] ?? preserveSubagentsUntilArchive;
-        const next = !current;
-        const updated = { ...prev };
-        if (next === preserveSubagentsUntilArchive) {
-          delete updated[workspaceId];
-        } else {
-          updated[workspaceId] = next;
-        }
-        return updated;
-      });
-    },
-    [preserveSubagentsUntilArchive, setExpandedCompletedSubAgents]
-  );
-  const expandedCompletedParentIds = new Set<string>();
-  for (const workspaces of sortedWorkspacesByProject.values()) {
-    for (const workspace of workspaces) {
-      if (expandedCompletedSubAgents[workspace.id] ?? preserveSubagentsUntilArchive) {
-        expandedCompletedParentIds.add(workspace.id);
-      }
-    }
-  }
-
-  // Task-group expansion survives reloads (D7). Keys are namespaced per group
-  // kind: task:<parentWorkspaceId>:<groupId> / workflow:<parentWorkspaceId>:<runId>.
-  const [expandedTaskGroups, setExpandedTaskGroups] = usePersistedState<Record<string, boolean>>(
-    "expandedTaskGroups",
-    {}
-  );
-  // D6: a workflow group that is (or was, this session) active defaults to
-  // expanded and must not auto-collapse when its members finish mid-session.
-  // The render-time ref keeps that default sticky; an explicit toggle wins.
-  const sessionActiveTaskGroupKeysRef = useRef<Set<string>>(new Set());
-  const toggleTaskGroupExpansion = (storageKey: string, isCurrentlyExpanded: boolean) => {
-    setExpandedTaskGroups((prev) => ({
-      ...prev,
-      [storageKey]: !isCurrentlyExpanded,
-    }));
-  };
-
-  const [archivingWorkspaceIds, setArchivingWorkspaceIds] = useState<Set<string>>(new Set());
-  const [removingWorkspaceIds, setRemovingWorkspaceIds] = useState<Set<string>>(new Set());
-  const [draftVisibilityByProject, setDraftVisibilityByProject] = useState<
-    Record<string, Record<string, boolean>>
-  >({});
-  const workspaceArchiveError = usePopoverError();
-  const workspaceForkError = usePopoverError();
-  const workspaceStopRuntimeError = usePopoverError();
-  const workspaceRemoveError = usePopoverError();
-  const [archiveConfirmation, setArchiveConfirmation] = useState<{
-    workspaceId: string;
-    displayTitle: string;
-    buttonElement?: HTMLElement;
-    /** When set, the confirmation warns about permanent deletion of untracked files. */
-    untrackedPaths?: string[];
-    /** Whether the workspace has an active stream that will be interrupted. */
-    isStreaming?: boolean;
-  } | null>(null);
-  const [deleteConfirmation, setDeleteConfirmation] = useState<{
-    projectPath: string;
-    projectName: string;
-    activeCount: number;
-    archivedCount: number;
-  } | null>(null);
-  const projectRemoveError = usePopoverError();
-  const sectionRemoveError = usePopoverError();
-
-  const handleDraftVisibilityChange = useCallback(
-    (projectPath: string, draftId: string, isVisible: boolean) => {
-      setDraftVisibilityByProject((prev) => {
-        const existing = prev[projectPath] ?? {};
-        if (existing[draftId] === isVisible) {
-          return prev;
-        }
-
-        return {
-          ...prev,
-          [projectPath]: {
-            ...existing,
-            [draftId]: isVisible,
-          },
-        };
-      });
-    },
-    []
-  );
-
-  const projectContextMenu = useContextMenuPosition({ longPress: true });
-  const [projectMenuTargetPath, setProjectMenuTargetPath] = useState<string | null>(null);
-  const [editingProjectPath, setEditingProjectPath] = useState<string | null>(null);
-  const [editingProjectDisplayName, setEditingProjectDisplayName] = useState("");
-  const [autoEditingSection, setAutoEditingSection] = useState<{
-    projectPath: string;
-    sectionId: string;
-  } | null>(null);
-  const [showProjectColorPicker, setShowProjectColorPicker] = useState(false);
-  const [projectColorHexInput, setProjectColorHexInput] = useState("");
-  const [projectColorPickerValue, setProjectColorPickerValue] = useState("#000000");
-  const [projectColorPickerDirty, setProjectColorPickerDirty] = useState(false);
-  const skipNextProjectNameBlurCommitRef = useRef(false);
-
-  // Use functional update to avoid stale closure issues when clicking rapidly
-  const toggleProject = useCallback(
-    (projectPath: string) => {
-      setExpandedProjectsArray((prev) => {
-        const prevSet = new Set(Array.isArray(prev) ? prev : []);
-        if (prevSet.has(projectPath)) {
-          prevSet.delete(projectPath);
-        } else {
-          prevSet.add(projectPath);
-        }
-        return Array.from(prevSet);
-      });
-    },
-    [setExpandedProjectsArray]
-  );
-
-  const toggleSection = (projectPath: string, sectionId: string) => {
-    const key = getSectionExpandedKey(projectPath, sectionId);
-    setExpandedSections((prev) => ({
-      ...prev,
-      [key]: !prev[key],
-    }));
-  };
-
-  const handleForkWorkspace = useCallback(
-    async (workspaceId: string, buttonElement?: HTMLElement) => {
-      if (!api) {
-        workspaceForkError.showError(workspaceId, "Not connected to server");
-        return;
-      }
-
-      let anchor: { top: number; left: number } | undefined;
-      if (buttonElement) {
-        const rect = buttonElement.getBoundingClientRect();
-        anchor = {
-          top: rect.top + window.scrollY,
-          left: rect.right + 10,
-        };
-      }
-
-      try {
-        const result = await forkWorkspace({
-          client: api,
-          sourceWorkspaceId: workspaceId,
-        });
-        if (result.success) {
-          return;
-        }
-        workspaceForkError.showError(workspaceId, result.error ?? "Failed to fork chat", anchor);
-      } catch (error) {
-        // IPC/transport failures throw instead of returning { success: false }
-        const message = getErrorMessage(error);
-        workspaceForkError.showError(workspaceId, message, anchor);
-      }
-    },
-    [api, workspaceForkError]
-  );
-
-  const handleStopRuntime = useCallback(
-    async (workspaceId: string, buttonElement?: HTMLElement) => {
-      let anchor: { top: number; left: number } | undefined;
-      if (buttonElement) {
-        const rect = buttonElement.getBoundingClientRect();
-        anchor = {
-          top: rect.top + window.scrollY,
-          left: rect.right + 10,
-        };
-      }
-
-      if (!api) {
-        workspaceStopRuntimeError.showError(workspaceId, "Not connected to server", anchor);
-        return;
-      }
-
-      try {
-        const result = await api.workspace.stopRuntime({ workspaceId });
-        if (!result.success) {
-          workspaceStopRuntimeError.showError(
-            workspaceId,
-            result.error ?? "Failed to stop container",
-            anchor
-          );
-          return;
-        }
-
-        // A successful stop should hide the running indicator and menu action without
-        // forcing rows to own their own optimistic runtime state.
-        runtimeStatusStore.invalidateWorkspace(workspaceId);
-      } catch (error) {
-        workspaceStopRuntimeError.showError(workspaceId, getErrorMessage(error), anchor);
-      }
-    },
-    [api, runtimeStatusStore, workspaceStopRuntimeError]
-  );
-
-  const performArchiveWorkspace = useCallback(
-    async (
-      workspaceId: string,
-      buttonElement?: HTMLElement,
-      acknowledgedUntrackedPaths?: string[]
-    ) => {
-      // Mark workspace as being archived for UI feedback
-      setArchivingWorkspaceIds((prev) => new Set(prev).add(workspaceId));
-
-      try {
-        const result = await onArchiveWorkspace(
-          workspaceId,
-          acknowledgedUntrackedPaths ? { acknowledgedUntrackedPaths } : undefined
-        );
-        if (result.success && result.data?.kind === "confirm-lossy-untracked-files") {
-          const metadata = workspaceStore.getWorkspaceMetadata(workspaceId);
-          const displayTitle = metadata?.title ?? metadata?.name ?? workspaceId;
-          const aggregator = workspaceStore.getAggregator(workspaceId);
-          const hasActiveStreams = aggregator?.hasInterruptibleActiveStream() ?? false;
-          const pendingStreamStartTime = aggregator?.getPendingStreamStartTime();
-          const isStarting = pendingStreamStartTime != null && !hasActiveStreams;
-          const awaitingUserQuestion = aggregator?.hasAwaitingUserQuestion() ?? false;
-          const isStreaming = (hasActiveStreams || isStarting) && !awaitingUserQuestion;
-          setArchiveConfirmation({
-            workspaceId,
-            displayTitle,
-            buttonElement,
-            untrackedPaths: result.data.paths,
-            // The retry path already handled any earlier streaming warning. Only surface the
-            // interruption warning again when the archive attempt has not yet been confirmed.
-            isStreaming: acknowledgedUntrackedPaths == null ? isStreaming : false,
-          });
-          return;
-        }
-        if (!result.success) {
-          if (acknowledgedUntrackedPaths != null) {
-            // Archive may fail if new untracked files appear between confirmation and capture.
-            // Re-run preflight so we can reopen the modal with the latest paths.
-            const preflight = await preflightArchiveWorkspace(workspaceId);
-            if (preflight.success && preflight.data?.kind === "confirm-lossy-untracked-files") {
-              const pathsChanged = didUntrackedPathSetChange(
-                acknowledgedUntrackedPaths,
-                preflight.data.paths
-              );
-              if (pathsChanged) {
-                const metadata = workspaceStore.getWorkspaceMetadata(workspaceId);
-                const displayTitle = metadata?.title ?? metadata?.name ?? workspaceId;
-                setArchiveConfirmation({
-                  workspaceId,
-                  displayTitle,
-                  buttonElement,
-                  untrackedPaths: preflight.data.paths,
-                  isStreaming: (() => {
-                    const aggregator = workspaceStore.getAggregator(workspaceId);
-                    if (!aggregator) return false;
-                    const hasActiveStreams = aggregator.hasInterruptibleActiveStream();
-                    const isStarting =
-                      aggregator.getPendingStreamStartTime() !== null && !hasActiveStreams;
-                    const awaitingUserQuestion = aggregator.hasAwaitingUserQuestion();
-                    return (hasActiveStreams || isStarting) && !awaitingUserQuestion;
-                  })(),
-                });
-                return;
-              }
-            }
-          }
-
-          const error = result.error ?? "Failed to archive chat";
-          // Archive failures can be long-lived workflow errors (for example, untracked-file safety
-          // checks) that users should notice near the active workspace content, not pinned beside a
-          // left-sidebar row that may be far from their current focus. Use the shared toast fallback
-          // position so archive errors match other top-right UI error surfaces.
-          workspaceArchiveError.showError(workspaceId, error);
-        }
-      } finally {
-        // Clear archiving state
-        setArchivingWorkspaceIds((prev) => {
-          const next = new Set(prev);
-          next.delete(workspaceId);
-          return next;
-        });
-      }
-    },
-    [onArchiveWorkspace, preflightArchiveWorkspace, workspaceArchiveError, workspaceStore]
-  );
-
-  const hasActiveStream = useCallback(
-    (workspaceId: string) => {
-      const aggregator = workspaceStore.getAggregator(workspaceId);
-      if (!aggregator) return false;
-      const hasActiveStreams = aggregator.hasInterruptibleActiveStream();
-      const isStarting = aggregator.getPendingStreamStartTime() !== null && !hasActiveStreams;
-      const awaitingUserQuestion = aggregator.hasAwaitingUserQuestion();
-      return (hasActiveStreams || isStarting) && !awaitingUserQuestion;
-    },
-    [workspaceStore]
-  );
-
-  const workspaceHasAttention = useCallback(
-    (workspace: FrontendWorkspaceMetadata) => {
-      const workspaceId = workspace.id;
-      const attentionSignal = getWorkspaceAttentionSignal(workspaceStore, workspaceId);
-      const isWorking = attentionSignal?.isWorking === true;
-      const awaitingUserQuestion = attentionSignal?.awaitingUserQuestion === true;
-      const hasError = attentionSignal?.hasSystemError === true;
-      const isRemoving = workspace.isRemoving === true;
-      const isArchiving = archivingWorkspaceIds.has(workspaceId);
-      const isInitializing = workspace.isInitializing === true;
-      const isSelected = selectedWorkspace?.workspaceId === workspaceId;
-      const recencyTimestamp = workspaceRecency[workspaceId] ?? null;
-      const lastReadTimestamp = readPersistedState<number | null>(
-        getWorkspaceLastReadKey(workspaceId),
-        null
-      );
-      const isUnread =
-        !isSelected &&
-        recencyTimestamp !== null &&
-        lastReadTimestamp !== null &&
-        recencyTimestamp > lastReadTimestamp;
-
-      return (
-        isWorking ||
-        awaitingUserQuestion ||
-        hasError ||
-        isInitializing ||
-        isRemoving ||
-        isArchiving ||
-        isUnread
-      );
-    },
-    [archivingWorkspaceIds, selectedWorkspace?.workspaceId, workspaceRecency, workspaceStore]
-  );
-
-  const handleArchiveWorkspace = useCallback(
-    async (workspaceId: string, buttonElement?: HTMLElement) => {
-      const metadata = workspaceStore.getWorkspaceMetadata(workspaceId);
-      const displayTitle = metadata?.title ?? metadata?.name ?? workspaceId;
-      const isStreaming = hasActiveStream(workspaceId);
-
-      // Run preflight to check for untracked files that can't be preserved.
-      const preflight = await preflightArchiveWorkspace(workspaceId);
-      if (!preflight.success) {
-        workspaceArchiveError.showError(
-          workspaceId,
-          preflight.error ?? "Failed to check archive readiness"
-        );
-        return;
-      }
-
-      const untrackedPaths =
-        preflight.data?.kind === "confirm-lossy-untracked-files" ? preflight.data.paths : undefined;
-
-      if (isStreaming || untrackedPaths) {
-        // Show a single combined confirmation dialog for streaming + untracked-file warnings.
-        setArchiveConfirmation({
-          workspaceId,
-          displayTitle,
-          buttonElement,
-          untrackedPaths,
-          isStreaming,
-        });
-        return;
-      }
-
-      await performArchiveWorkspace(workspaceId, buttonElement);
-    },
-    [
-      hasActiveStream,
-      performArchiveWorkspace,
-      preflightArchiveWorkspace,
-      workspaceArchiveError,
-      workspaceStore,
-    ]
-  );
-
-  const handleArchiveWorkspaceConfirm = useCallback(async () => {
-    if (!archiveConfirmation) {
-      return;
-    }
-
-    const confirmation = archiveConfirmation;
-    setArchiveConfirmation(null);
-    await performArchiveWorkspace(
-      confirmation.workspaceId,
-      confirmation.buttonElement,
-      confirmation.untrackedPaths
-    );
-  }, [archiveConfirmation, performArchiveWorkspace]);
-
-  const handleArchiveWorkspaceCancel = useCallback(() => {
-    setArchiveConfirmation(null);
-  }, []);
-
-  const showProjectRemoveError = useCallback(
-    (
-      projectPath: string,
-      error: {
-        type: string;
-        message?: string;
-        activeCount?: number;
-        archivedCount?: number;
-      },
-      buttonElement?: HTMLElement
-    ) => {
-      let message: string;
-      if (error.type === "workspace_blockers") {
-        const parts: string[] = [];
-        const activeCount = error.activeCount ?? 0;
-        const archivedCount = error.archivedCount ?? 0;
-
-        if (activeCount > 0) {
-          parts.push(`${activeCount} active`);
-        }
-        if (archivedCount > 0) {
-          parts.push(`${archivedCount} archived`);
-        }
-        message = `Has ${parts.join(" and ")} workspace(s)`;
-      } else if (error.type === "project_not_found") {
-        message = "Project not found";
-      } else {
-        message = error.message ?? "Failed to remove project";
-      }
-
-      let anchor: { top: number; left: number } | undefined;
-      if (buttonElement) {
-        const rect = buttonElement.getBoundingClientRect();
-        anchor = {
-          top: rect.top + window.scrollY,
-          left: rect.right + 10,
-        };
-      }
-
-      projectRemoveError.showError(projectPath, message, anchor);
-    },
-    [projectRemoveError]
-  );
-
-  const removeProjectWithFeedback = useCallback(
-    async (projectPath: string, options?: { force?: boolean }, buttonElement?: HTMLElement) => {
-      const result = await onRemoveProject(projectPath, options);
-      if (!result.success) {
-        showProjectRemoveError(projectPath, result.error, buttonElement);
-      }
-      return result;
-    },
-    [onRemoveProject, showProjectRemoveError]
-  );
-
-  const handleDeleteConfirm = useCallback(async () => {
-    if (!deleteConfirmation) {
-      return;
-    }
-
-    const result = await removeProjectWithFeedback(deleteConfirmation.projectPath, {
-      force: true,
-    });
-    if (result.success) {
-      setDeleteConfirmation(null);
-    }
-  }, [deleteConfirmation, removeProjectWithFeedback]);
-
-  const handleDeleteCancel = useCallback(() => {
-    setDeleteConfirmation(null);
-  }, []);
-  const handleCancelWorkspaceCreation = useCallback(
-    async (workspaceId: string) => {
-      // Give immediate UI feedback (spinner / disabled row) while deletion is in-flight.
-      setRemovingWorkspaceIds((prev) => new Set(prev).add(workspaceId));
-
-      try {
-        const result = await removeWorkspace(workspaceId, { force: true });
-        if (!result.success) {
-          workspaceRemoveError.showError(
-            workspaceId,
-            result.error ?? "Failed to cancel workspace creation"
-          );
-        }
-      } finally {
-        setRemovingWorkspaceIds((prev) => {
-          const next = new Set(prev);
-          next.delete(workspaceId);
-          return next;
-        });
-      }
-    },
-    [removeWorkspace, workspaceRemoveError]
-  );
-
-  const handleRemoveSection = async (
+interface ProjectTreeContextValue {
+  workspaceDraftsByProject: Record<string, WorkspaceDraft[]>;
+  workspaceDraftPromotionsByProject: Record<string, Record<string, FrontendWorkspaceMetadata>>;
+  userProjects: Map<string, ProjectConfig>;
+  workspaceRecency: Record<string, number>;
+  selectedWorkspace: WorkspaceSelection | null;
+  expandedCompletedParentIds: Set<string>;
+  expandedOldWorkspaces: Record<string, boolean>;
+  setExpandedOldWorkspaces: React.Dispatch<React.SetStateAction<Record<string, boolean>>>;
+  expandedSections: Record<string, boolean>;
+  expandedTaskGroups: Record<string, boolean>;
+  draftVisibilityByProject: Record<string, Record<string, boolean>>;
+  archivingWorkspaceIds: Set<string>;
+  removingWorkspaceIds: Set<string>;
+  autoEditingSection: { projectPath: string; sectionId: string } | null;
+  setAutoEditingSection: React.Dispatch<
+    React.SetStateAction<{ projectPath: string; sectionId: string } | null>
+  >;
+  pendingNewWorkspaceProject: string | null;
+  pendingNewWorkspaceDraftId: string | null;
+  sessionActiveTaskGroupKeysRef: React.MutableRefObject<Set<string>>;
+  isDraftVisible: (projectPath: string, draftId: string) => boolean;
+  handleSelectWorkspace: (selection: WorkspaceSelection) => void;
+  handleAddWorkspace: (projectPath: string, subProjectPath?: string) => void;
+  handleForkWorkspace: (workspaceId: string, buttonElement?: HTMLElement) => Promise<void>;
+  handleStopRuntime: (workspaceId: string, buttonElement?: HTMLElement) => Promise<void>;
+  handleArchiveWorkspace: (workspaceId: string, buttonElement?: HTMLElement) => Promise<void>;
+  handleCancelWorkspaceCreation: (workspaceId: string) => Promise<void>;
+  handleDraftVisibilityChange: (
+    projectPath: string,
+    draftId: string,
+    isVisible: boolean
+  ) => void;
+  handleOpenWorkspaceDraft: (projectPath: string, draftId: string) => void;
+  openWorkspaceDraft: (projectPath: string, draftId: string) => void;
+  navigateToProject: (path: string) => void;
+  deleteWorkspaceDraft: (projectPath: string, draftId: string) => void;
+  toggleCompletedChildrenExpansion: (workspaceId: string) => void;
+  toggleTaskGroupExpansion: (storageKey: string, isCurrentlyExpanded: boolean) => void;
+  toggleSection: (projectPath: string, sectionId: string) => void;
+  updateDisplayName: (projectPath: string, displayName: string | null) => Promise<Result<void>>;
+  updateProjectColor: (projectPath: string, color: string | null) => Promise<Result<void>>;
+  handleRemoveSection: (
     projectPath: string,
     subProjectPath: string,
     buttonElement?: HTMLElement
-  ) => {
-    // Capture the anchor location up front because the sub-project action menu unmounts its
-    // button immediately after click; failures still need stable error placement.
-    const anchor =
-      buttonElement != null
-        ? (() => {
-            const buttonRect = buttonElement.getBoundingClientRect();
-            return {
-              top: buttonRect.top + window.scrollY,
-              left: buttonRect.right + 10,
-            };
-          })()
-        : undefined;
+  ) => Promise<void>;
+  assignWorkspaceToSubProject: (
+    projectPath: string,
+    workspaceId: string,
+    targetSectionId: string | null
+  ) => Promise<{ success: boolean; error?: string }>;
+  refreshWorkspaceMetadata: () => Promise<void>;
+}
 
-    // Removing a sub-project unregisters it and clears the cwd pointer from its workspaces.
-    const workspacesInSection = (userProjects.get(projectPath)?.workspaces ?? []).filter(
-      (workspace) => workspace.subProjectPath === subProjectPath
-    );
+interface ProjectWorkspacesTreeProps {
+  projectPath: string;
+  projectWorkspaces: FrontendWorkspaceMetadata[];
+  projectName: string;
+  ctx: ProjectTreeContextValue;
+}
 
-    if (workspacesInSection.length > 0) {
-      const ok = await confirmDialog({
-        title: "Remove sub-project?",
-        description: `${workspacesInSection.length} workspace(s) in this sub-project will move back to the parent project.`,
-        confirmLabel: "Remove",
-        confirmVariant: "destructive",
-      });
-      if (!ok) {
-        return;
-      }
-    }
 
-    const result = await onRemoveProject(subProjectPath);
-    if (!result.success) {
-      const error = getErrorMessage(result.error) || "Failed to remove sub-project";
-      sectionRemoveError.showError(subProjectPath, error, anchor);
-    }
-  };
+// Extracted from ProjectSidebarInner's inline IIFE to isolate tree-math re-renders
+// from trivial UI state changes (color picker drag, context menus, modals).
+const ProjectWorkspacesTree: React.FC<ProjectWorkspacesTreeProps> = ({
+  projectPath,
+  projectWorkspaces,
+  projectName,
+  ctx,
+  }) => {
+  const workspaceStore = useWorkspaceStoreRaw();
 
-  const handleOpenSecrets = useCallback(
-    (projectPath: string) => {
-      // Collapse the off-canvas sidebar on mobile before navigating so the
-      // settings page is immediately accessible without a backdrop blocking it.
-      if (window.innerWidth <= MOBILE_BREAKPOINT && !collapsed) {
-        persistMobileSidebarScrollTop(mobileScrollTopRef.current);
-        onToggleCollapsed();
-      }
-      // Navigate to Settings → Secrets with the project pre-selected.
-      settings.open("secrets", { secretsProjectPath: projectPath });
-    },
-    [MOBILE_BREAKPOINT, collapsed, onToggleCollapsed, persistMobileSidebarScrollTop, settings]
-  );
+  const {
+    workspaceDraftsByProject,
+    workspaceDraftPromotionsByProject,
+    userProjects,
+    sessionActiveTaskGroupKeysRef,
+    expandedCompletedParentIds,
+    draftVisibilityByProject,
+    isDraftVisible,
+    selectedWorkspace,
+    expandedTaskGroups,
+    toggleTaskGroupExpansion,
+    workspaceRecency,
+    expandedOldWorkspaces,
+    setExpandedOldWorkspaces,
+    archivingWorkspaceIds,
+    removingWorkspaceIds,
+    handleSelectWorkspace,
+    handleForkWorkspace,
+    handleStopRuntime,
+    handleArchiveWorkspace,
+    handleCancelWorkspaceCreation,
+    toggleCompletedChildrenExpansion,
+    pendingNewWorkspaceProject,
+    pendingNewWorkspaceDraftId,
+    handleDraftVisibilityChange,
+    handleOpenWorkspaceDraft,
+    openWorkspaceDraft,
+    navigateToProject,
+    deleteWorkspaceDraft,
+    autoEditingSection,
+    setAutoEditingSection,
+    updateDisplayName,
+    updateProjectColor,
+    handleRemoveSection,
+    assignWorkspaceToSubProject,
+    refreshWorkspaceMetadata,
+    expandedSections,
+    toggleSection,
+    handleAddWorkspace,
+  } = ctx;
 
-  const closeProjectContextMenu = useCallback(() => {
-    projectContextMenu.close();
-    setProjectMenuTargetPath(null);
-    setShowProjectColorPicker(false);
-    setProjectColorPickerDirty(false);
-  }, [projectContextMenu]);
-
-  const handleProjectMenuOpenChange = useCallback(
-    (open: boolean) => {
-      projectContextMenu.onOpenChange(open);
-      if (!open) {
-        setProjectMenuTargetPath(null);
-        setShowProjectColorPicker(false);
-        setProjectColorPickerDirty(false);
-      }
-    },
-    [projectContextMenu]
-  );
-
-  const handleOpenProjectMenu = useCallback(
-    (event: React.MouseEvent, projectPath: string) => {
-      setProjectMenuTargetPath(projectPath);
-      setShowProjectColorPicker(false);
-      setProjectColorPickerDirty(false);
-      projectContextMenu.onContextMenu(event);
-    },
-    [projectContextMenu]
-  );
-
-  const handleProjectContextMenuTouchStart = useCallback(
-    (event: React.TouchEvent, projectPath: string) => {
-      setProjectMenuTargetPath(projectPath);
-      setShowProjectColorPicker(false);
-      setProjectColorPickerDirty(false);
-      projectContextMenu.touchHandlers.onTouchStart(event);
-    },
-    [projectContextMenu]
-  );
-
-  const handleRequestProjectRemoval = useCallback(
-    (projectPath: string, buttonElement?: HTMLElement) => {
-      const projectConfig = userProjects.get(projectPath);
-      if (!projectConfig) {
-        return;
-      }
-
-      const projectName = projectConfig.displayName ?? getProjectNameFromPath(projectPath);
-      const counts = getProjectWorkspaceCounts(projectConfig.workspaces);
-      const total = counts.activeCount + counts.archivedCount;
-      if (total > 0) {
-        setDeleteConfirmation({
-          projectPath,
-          projectName,
-          activeCount: counts.activeCount,
-          archivedCount: counts.archivedCount,
-        });
-        return;
-      }
-
-      void removeProjectWithFeedback(projectPath, undefined, buttonElement);
-    },
-    [removeProjectWithFeedback, userProjects]
-  );
-
-  const cancelProjectDisplayNameEditing = useCallback(() => {
-    setEditingProjectPath(null);
-    setEditingProjectDisplayName("");
-  }, []);
-
-  const commitProjectDisplayNameEdit = useCallback(
-    async (projectPath: string, nextDisplayName: string) => {
-      const normalizedDisplayName = normalizeDisplayNameInput(nextDisplayName);
-      const result = await updateDisplayName(projectPath, normalizedDisplayName);
-      if (!result.success) {
-        console.error("Failed to update project display name:", result.error);
-        return;
-      }
-      setEditingProjectPath((currentPath) => {
-        if (currentPath === projectPath) {
-          setEditingProjectDisplayName("");
-          return null;
-        }
-        return currentPath;
-      });
-    },
-    [updateDisplayName]
-  );
-
-  const handleProjectMenuEditName = useCallback(() => {
-    if (!projectMenuTargetPath) {
-      return;
-    }
-
-    const projectConfig = userProjects.get(projectMenuTargetPath);
-    if (!projectConfig) {
-      closeProjectContextMenu();
-      return;
-    }
-
-    // Escape can leave the skip-blur flag set when the input unmounts before a blur event fires.
-    // Clear it when a fresh edit session starts so the next blur commits as expected.
-    skipNextProjectNameBlurCommitRef.current = false;
-    const currentDisplayName =
-      projectConfig.displayName ?? getProjectFallbackLabel(projectMenuTargetPath);
-    setEditingProjectPath(projectMenuTargetPath);
-    setEditingProjectDisplayName(currentDisplayName);
-    closeProjectContextMenu();
-  }, [closeProjectContextMenu, projectMenuTargetPath, userProjects]);
-
-  const handleProjectMenuManageSecrets = useCallback(() => {
-    if (!projectMenuTargetPath) {
-      return;
-    }
-
-    handleOpenSecrets(projectMenuTargetPath);
-    closeProjectContextMenu();
-  }, [closeProjectContextMenu, handleOpenSecrets, projectMenuTargetPath]);
-
-  const handleProjectMenuDelete = useCallback(
-    (buttonElement?: HTMLElement) => {
-      if (!projectMenuTargetPath) {
-        return;
-      }
-
-      handleRequestProjectRemoval(projectMenuTargetPath, buttonElement);
-      closeProjectContextMenu();
-    },
-    [closeProjectContextMenu, handleRequestProjectRemoval, projectMenuTargetPath]
-  );
-
-  const handleProjectMenuAddSubFolder = useCallback(() => {
-    closeProjectContextMenu();
-    onAddProject(projectMenuTargetPath ? { initialPath: projectMenuTargetPath } : undefined);
-  }, [closeProjectContextMenu, onAddProject, projectMenuTargetPath]);
-
-  const projectMenuTargetConfig = projectMenuTargetPath
-    ? (userProjects.get(projectMenuTargetPath) ?? null)
-    : null;
-  const projectMenuResolvedColor = resolveSectionColor(projectMenuTargetConfig?.color);
-
-  // HexColorPicker emits on every drag tick; debounce project color writes so we
-  // don't flood IPC + project refreshes while the user drags through hues.
-  const debouncedProjectColorPickerValue = useDebouncedValue(projectColorPickerValue, 150);
-
-  const handleProjectMenuColorClick = useCallback(() => {
-    if (!projectMenuTargetPath) {
-      return;
-    }
-    setShowProjectColorPicker((prev) => {
-      const next = !prev;
-      if (next) {
-        setProjectColorHexInput(projectMenuResolvedColor);
-        setProjectColorPickerValue(projectMenuResolvedColor);
-      }
-      setProjectColorPickerDirty(false);
-      return next;
-    });
-  }, [projectMenuResolvedColor, projectMenuTargetPath]);
-
-  const handleProjectColorChange = useCallback(
-    async (color: string) => {
-      if (!projectMenuTargetPath) {
-        return;
-      }
-      const result = await updateProjectColor(projectMenuTargetPath, color);
-      if (!result.success) {
-        console.error("Failed to update project color:", result.error);
-      }
-    },
-    [projectMenuTargetPath, updateProjectColor]
-  );
-
-  useEffect(() => {
-    if (!showProjectColorPicker || !projectColorPickerDirty) {
-      return;
-    }
-    if (!/^#[0-9a-fA-F]{6}$/.test(debouncedProjectColorPickerValue)) {
-      return;
-    }
-    if (debouncedProjectColorPickerValue === projectMenuResolvedColor) {
-      return;
-    }
-
-    void handleProjectColorChange(debouncedProjectColorPickerValue);
-  }, [
-    debouncedProjectColorPickerValue,
-    handleProjectColorChange,
-    projectColorPickerDirty,
-    projectMenuResolvedColor,
-    showProjectColorPicker,
-  ]);
-
-  // UI preference: project order persists in localStorage
-  const [projectOrder, setProjectOrder] = usePersistedState<string[]>(PROJECT_ORDER_KEY, []);
-
-  // Build a stable signature of the project keys so effects don't fire on Map identity churn
-  const projectPathsSignature = React.useMemo(() => {
-    // sort to avoid order-related churn
-    const keys = Array.from(userProjects.keys()).sort();
-    return keys.join("\u0001"); // use non-printable separator
-  }, [userProjects]);
-
-  // Normalize order when the set of projects changes (not on every parent render)
-  useEffect(() => {
-    // Skip normalization if projects haven't loaded yet (empty Map on initial render)
-    // This prevents clearing projectOrder before projects load from backend
-    if (userProjects.size === 0) {
-      return;
-    }
-
-    const normalized = normalizeOrder(projectOrder, userProjects);
-    if (
-      normalized.length !== projectOrder.length ||
-      normalized.some((p, i) => p !== projectOrder[i])
-    ) {
-      setProjectOrder(normalized);
-    }
-    // Only re-run when project keys change (projectPathsSignature captures projects Map keys)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectPathsSignature]);
-
-  // Memoize sorted project PATHS (not entries) to avoid capturing stale config objects.
-  // Sorting depends only on keys + order; we read configs from the live Map during render.
-  const sortedProjectPaths = React.useMemo(
-    () =>
-      sortProjectsByOrder(userProjects, projectOrder)
-        .filter(([, config]) => !config.parentProjectPath)
-        .map(([p]) => p),
-    // projectPathsSignature captures projects Map keys
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [projectPathsSignature, projectOrder]
-  );
-
+  // Compute delegated activity per-project so attention changes in other
+  // projects don't invalidate this tree's context reference.
   const isWorkspaceLiveActive = (workspaceId: string): boolean => {
     const signal = getWorkspaceAttentionSignal(workspaceStore, workspaceId);
     return signal?.isWorking === true;
   };
   const delegatedActivityByWorkspaceId = computeDelegatedActivityByWorkspaceId(
-    Array.from(sortedWorkspacesByProject.values()).flat(),
+    projectWorkspaces,
     { isWorkspaceLiveActive }
   );
 
-  const singleProjectWorkspacesByProject = new Map<string, FrontendWorkspaceMetadata[]>();
-  const multiProjectWorkspacesById = new Map<string, FrontendWorkspaceMetadata>();
-  const workspaceAttentionById = new Map<string, boolean>();
-
-  for (const [projectPath, workspaces] of sortedWorkspacesByProject) {
-    const singleProjectWorkspaces: FrontendWorkspaceMetadata[] = [];
-    for (const workspace of workspaces) {
-      workspaceAttentionById.set(
-        workspace.id,
-        workspaceHasAttention(workspace) ||
-          (delegatedActivityByWorkspaceId.get(workspace.id)?.activeCount ?? 0) > 0
-      );
-      if (isMultiProject(workspace)) {
-        if (multiProjectWorkspacesEnabled) {
-          multiProjectWorkspacesById.set(workspace.id, workspace);
-        }
-        continue;
-      }
-
-      singleProjectWorkspaces.push(workspace);
-    }
-    singleProjectWorkspacesByProject.set(projectPath, singleProjectWorkspaces);
-  }
-
-  const multiProjectWorkspaces = Array.from(multiProjectWorkspacesById.values());
-  // Multi-project rows should share the same completed-subagent chevron behavior as
-  // regular workspace rows, so reuse the same visibility + metadata calculations.
-  const multiProjectDepthByWorkspaceId = computeWorkspaceDepthMap(multiProjectWorkspaces);
-  const visibleMultiProjectWorkspaces = filterVisibleAgentRows(
-    multiProjectWorkspaces,
-    expandedCompletedParentIds
-  );
-  const multiProjectRowMetaByWorkspaceId = computeAgentRowRenderMeta(
-    multiProjectWorkspaces,
-    multiProjectDepthByWorkspaceId,
-    expandedCompletedParentIds
-  );
-  const isMultiProjectSectionExpanded = expandedProjectsList.includes(
-    MULTI_PROJECT_SIDEBAR_SECTION_ID
-  );
-
-  const handleReorder = useCallback(
-    (draggedPath: string, targetPath: string) => {
-      const next = reorderProjects(projectOrder, userProjects, draggedPath, targetPath);
-      setProjectOrder(next);
-    },
-    [projectOrder, userProjects, setProjectOrder]
-  );
-
-  const hasProjectMenuTarget = projectMenuTargetPath !== null;
-
-  // Handle keyboard shortcuts
+  // Subscribe to this project's workspace state changes so delegated activity
+  // and attention indicators stay current without a global version counter.
+  const [, setAttentionVersion] = useState(0);
   useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      // Sub-project workspaces share the parent worktree, so recover the child
-      // target from the live sidebar metadata before opening a sibling draft.
-      if (matchesKeybind(e, KEYBINDS.NEW_WORKSPACE) && selectedWorkspace) {
-        e.preventDefault();
-        // Resolve the effective section ID exactly the way the renderer does:
-        // honor the workspace's own subProjectPath when it still exists,
-        // otherwise inherit from the parent workspace. This keeps Ctrl+N in
-        // lockstep with the visible section and avoids forwarding deleted
-        // sub-project paths that workspace.create would reject.
-        const projectWorkspaces =
-          sortedWorkspacesByProject.get(selectedWorkspace.projectPath) ?? [];
-        const byId = new Map(projectWorkspaces.map((m) => [m.id, m]));
-        const meta = byId.get(selectedWorkspace.workspaceId);
-        const validSectionIds = new Set(
-          getSubProjectsForParent(selectedWorkspace.projectPath, userProjects).map(
-            ([subPath]) => subPath
-          )
-        );
-        const subProjectPath = meta
-          ? resolveEffectiveSectionId(meta, byId, validSectionIds)
-          : undefined;
-        handleAddWorkspace(selectedWorkspace.projectPath, subProjectPath);
-      } else if (matchesKeybind(e, KEYBINDS.ARCHIVE_WORKSPACE) && selectedWorkspace) {
-        e.preventDefault();
-        void handleArchiveWorkspace(selectedWorkspace.workspaceId);
-      }
-    };
-
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [
-    closeProjectContextMenu,
-    selectedWorkspace,
-    handleAddWorkspace,
-    handleArchiveWorkspace,
-    sortedWorkspacesByProject,
-    userProjects,
-  ]);
-
-  return (
-    <TitleEditProvider onUpdateTitle={onUpdateTitle}>
-      <SidebarTitleEditKeybinds
-        selectedWorkspace={selectedWorkspace ?? undefined}
-        sortedWorkspacesByProject={sortedWorkspacesByProject}
-        collapsed={collapsed}
-      />
-      <DndProvider backend={HTML5Backend}>
-        <ProjectDragLayer />
-        <WorkspaceDragLayer />
-        <div
-          className={cn(
-            // The sidebar doubles as a drag surface, so keep copy selection disabled
-            // unless a child input explicitly opts back into text selection.
-            "font-primary bg-surface-primary border-border-light relative flex flex-1 select-none flex-col overflow-hidden border-r",
-            // In desktop mode when collapsed, hide border (LeftSidebar handles the partial border)
-            isDesktopMode() && collapsed && "border-r-0"
-          )}
-          role="navigation"
-          aria-label="Projects"
-        >
-          {!collapsed && (
-            <>
-              <div className="border-dark flex items-center justify-between border-b py-3 pr-3 pl-4">
-                <div className="flex min-w-0 items-center gap-2">
-                  <button
-                    onClick={handleGoHome}
-                    className="shrink-0 cursor-pointer border-none bg-transparent p-0"
-                    aria-label="Home"
-                  >
-                    <MuxLogo className="h-5 w-[44px]" aria-hidden="true" />
-                  </button>
-                </div>
-                <button
-                  onClick={() => onAddProject()}
-                  aria-label="Add project"
-                  className="text-secondary hover:bg-hover hover:border-border-light flex h-6 shrink-0 cursor-pointer items-center gap-1 rounded border border-transparent bg-transparent px-1.5 text-xs transition-all duration-200"
-                >
-                  <span className="text-base leading-none">+</span>
-                  <span>Add Project</span>
-                </button>
-              </div>
-              <ScrollArea
-                className="flex-1"
-                viewportRef={projectListScrollRef}
-                onViewportScroll={handleProjectListScroll}
-                viewportClassName="overflow-x-hidden"
-              >
-                {multiProjectWorkspaces.length > 0 && (
-                  <div>
-                    <div className={PROJECT_ITEM_BASE_CLASS}>
-                      <button
-                        onClick={() => toggleProject(MULTI_PROJECT_SIDEBAR_SECTION_ID)}
-                        aria-label={`${isMultiProjectSectionExpanded ? "Collapse" : "Expand"} multi-project workspaces`}
-                        className={PROJECT_TOGGLE_BUTTON_CLASSES}
-                      >
-                        <span className="relative flex h-4 w-4 items-center justify-center">
-                          <ChevronRight
-                            className="absolute inset-0 h-4 w-4 opacity-0 transition-[opacity,transform] duration-200 group-hover:opacity-100"
-                            style={{
-                              transform: isMultiProjectSectionExpanded
-                                ? "rotate(90deg)"
-                                : "rotate(0deg)",
-                            }}
-                          />
-                          {isMultiProjectSectionExpanded ? (
-                            <FolderOpen className="h-4 w-4 transition-opacity duration-200 group-hover:opacity-0" />
-                          ) : (
-                            <Folder className="h-4 w-4 transition-opacity duration-200 group-hover:opacity-0" />
-                          )}
-                        </span>
-                      </button>
-                      <div className="flex min-w-0 flex-1 items-center pr-2">
-                        <span className="text-foreground truncate text-sm font-medium">
-                          Multi-Project
-                        </span>
-                        <span className="text-muted ml-2 text-xs">
-                          ({multiProjectWorkspaces.length})
-                        </span>
-                      </div>
-                    </div>
-                    {isMultiProjectSectionExpanded && (
-                      <div className="pt-1 pb-1">
-                        {visibleMultiProjectWorkspaces.map((metadata) => {
-                          const rowRenderMeta = multiProjectRowMetaByWorkspaceId.get(metadata.id);
-
-                          return (
-                            <AgentListItem
-                              key={metadata.id}
-                              metadata={metadata}
-                              projectPath={metadata.projectPath}
-                              projectName={metadata.projectName}
-                              isSelected={selectedWorkspace?.workspaceId === metadata.id}
-                              isArchiving={archivingWorkspaceIds.has(metadata.id)}
-                              isRemoving={
-                                removingWorkspaceIds.has(metadata.id) ||
-                                metadata.isRemoving === true
-                              }
-                              onSelectWorkspace={handleSelectWorkspace}
-                              onForkWorkspace={handleForkWorkspace}
-                              onArchiveWorkspace={handleArchiveWorkspace}
-                              onCancelCreation={handleCancelWorkspaceCreation}
-                              depth={
-                                rowRenderMeta?.depth ??
-                                multiProjectDepthByWorkspaceId[metadata.id] ??
-                                0
-                              }
-                              rowRenderMeta={rowRenderMeta}
-                              delegatedActivity={delegatedActivityByWorkspaceId.get(metadata.id)}
-                              completedChildrenExpanded={expandedCompletedParentIds.has(
-                                metadata.id
-                              )}
-                              onToggleCompletedChildren={toggleCompletedChildrenExpansion}
-                            />
-                          );
-                        })}
-                      </div>
-                    )}
-                  </div>
-                )}
-
-                {sortedProjectPaths.length === 0 && multiProjectWorkspaces.length === 0 ? (
-                  <div className="px-4 py-8 text-center">
-                    <p className="text-muted mb-4 text-[13px]">No projects</p>
-                    {/*
-                      In browser/server mode the dev server resolves an isolated
-                      ~/.mux-dev home (NODE_ENV=development), which is empty by
-                      default. Explain that here so the by-design isolation is
-                      never mistaken for a missing-config bug. Suppressed when the
-                      user has pointed the server at a custom MUX_ROOT (they know).
-                    */}
-                    {muxHomeKind === "dev-default" &&
-                    typeof window !== "undefined" &&
-                    !window.api ? (
-                      <p
-                        data-testid="dev-home-hint"
-                        className="text-muted mx-auto mb-4 max-w-[260px] text-[12px] leading-relaxed"
-                      >
-                        The dev server uses an isolated{" "}
-                        <code className="text-[11px]">~/.mux-dev</code> home. To reuse your main
-                        projects, relaunch with <code className="text-[11px]">MUX_ROOT=~/.mux</code>
-                        .
-                      </p>
-                    ) : null}
-                    <button
-                      onClick={() => onAddProject()}
-                      className="bg-accent hover:bg-accent-dark cursor-pointer rounded border-none px-4 py-2 text-[13px] text-white transition-colors duration-200"
-                    >
-                      Add Project
-                    </button>
-                  </div>
-                ) : (
-                  sortedProjectPaths.map((projectPath) => {
-                    const config = userProjects.get(projectPath);
-                    if (!config) return null;
-                    const projectFolderColor = config.color
-                      ? resolveSectionColor(config.color)
-                      : undefined;
-                    const projectName = getProjectNameFromPath(projectPath);
-                    const sanitizedProjectId =
-                      projectPath.replace(/[^a-zA-Z0-9_-]/g, "-") || "root";
-                    const workspaceListId = `workspace-list-${sanitizedProjectId}`;
-                    const isExpanded = expandedProjectsList.includes(projectPath);
-                    const displayProjectName =
-                      config.displayName ?? getProjectFallbackLabel(projectPath);
-                    const isEditingProjectDisplayName = editingProjectPath === projectPath;
-                    const projectWorkspaces =
-                      singleProjectWorkspacesByProject.get(projectPath) ?? [];
-                    const projectAgentCount = projectWorkspaces.length;
-                    const projectHasAttention = projectWorkspaces.some(
-                      (workspace) => workspaceAttentionById.get(workspace.id) === true
-                    );
-
-                    return (
-                      <div key={projectPath}>
-                        <DraggableProjectItem
-                          projectPath={projectPath}
-                          onReorder={handleReorder}
-                          selected={false}
-                          onClick={() => {
-                            if (projectContextMenu.suppressClickIfLongPress()) {
-                              return;
-                            }
-                            if (isEditingProjectDisplayName) {
-                              return;
-                            }
-                            handleAddWorkspace(projectPath);
-                          }}
-                          onContextMenu={(event) => handleOpenProjectMenu(event, projectPath)}
-                          onTouchStart={(event) =>
-                            handleProjectContextMenuTouchStart(event, projectPath)
-                          }
-                          onTouchEnd={projectContextMenu.touchHandlers.onTouchEnd}
-                          onTouchMove={projectContextMenu.touchHandlers.onTouchMove}
-                          onKeyDown={(e: React.KeyboardEvent) => {
-                            // Ignore key events from child buttons
-                            if (e.target instanceof HTMLElement && e.target !== e.currentTarget) {
-                              return;
-                            }
-                            if (e.key === "Enter" || e.key === " ") {
-                              e.preventDefault();
-                              handleAddWorkspace(projectPath);
-                            }
-                          }}
-                          role="button"
-                          tabIndex={0}
-                          aria-expanded={isExpanded}
-                          aria-controls={workspaceListId}
-                          aria-label={`Create workspace in ${projectName}`}
-                          data-project-path={projectPath}
-                        >
-                          <button
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              toggleProject(projectPath);
-                            }}
-                            aria-label={`${isExpanded ? "Collapse" : "Expand"} project ${projectName}`}
-                            data-project-path={projectPath}
-                            className={PROJECT_TOGGLE_BUTTON_CLASSES}
-                          >
-                            <span className="relative flex h-4 w-4 items-center justify-center">
-                              <ChevronRight
-                                className="absolute inset-0 h-4 w-4 opacity-0 transition-[opacity,transform] duration-200 group-hover:opacity-100"
-                                style={{
-                                  transform: isExpanded ? "rotate(90deg)" : "rotate(0deg)",
-                                }}
-                              />
-                              {isExpanded ? (
-                                <FolderOpen
-                                  className="h-4 w-4 transition-opacity duration-200 group-hover:opacity-0"
-                                  style={
-                                    projectFolderColor ? { color: projectFolderColor } : undefined
-                                  }
-                                />
-                              ) : (
-                                <Folder
-                                  className="h-4 w-4 transition-opacity duration-200 group-hover:opacity-0"
-                                  style={
-                                    projectFolderColor ? { color: projectFolderColor } : undefined
-                                  }
-                                />
-                              )}
-                            </span>
-                          </button>
-                          <div
-                            className="flex min-w-0 flex-1 items-center pr-1"
-                            onContextMenu={(event) => handleOpenProjectMenu(event, projectPath)}
-                          >
-                            <Tooltip>
-                              <TooltipTrigger asChild>
-                                {isEditingProjectDisplayName ? (
-                                  <input
-                                    value={editingProjectDisplayName}
-                                    autoFocus
-                                    aria-label={`Edit project name for ${projectName}`}
-                                    className="bg-background text-foreground border-border-light h-6 w-full rounded border px-2 text-sm"
-                                    onClick={(event) => event.stopPropagation()}
-                                    onMouseDown={(event) => event.stopPropagation()}
-                                    onContextMenu={(event) => event.stopPropagation()}
-                                    onChange={(event) => {
-                                      setEditingProjectDisplayName(event.target.value);
-                                    }}
-                                    onKeyDown={(event) => {
-                                      stopKeyboardPropagation(event);
-                                      if (event.key === "Escape") {
-                                        event.preventDefault();
-                                        skipNextProjectNameBlurCommitRef.current = true;
-                                        cancelProjectDisplayNameEditing();
-                                        return;
-                                      }
-
-                                      if (event.key === "Enter") {
-                                        event.preventDefault();
-                                        event.currentTarget.blur();
-                                      }
-                                    }}
-                                    onBlur={(event) => {
-                                      event.stopPropagation();
-                                      if (skipNextProjectNameBlurCommitRef.current) {
-                                        skipNextProjectNameBlurCommitRef.current = false;
-                                        return;
-                                      }
-                                      void commitProjectDisplayNameEdit(
-                                        projectPath,
-                                        event.currentTarget.value
-                                      );
-                                    }}
-                                  />
-                                ) : (
-                                  <div className="text-muted-dark flex min-w-0 items-baseline gap-1.5 text-sm">
-                                    <span
-                                      className={cn(
-                                        "min-w-0 flex-1 truncate font-medium",
-                                        projectHasAttention
-                                          ? "text-content-primary"
-                                          : "text-content-secondary"
-                                      )}
-                                    >
-                                      {displayProjectName}
-                                    </span>
-                                    <span
-                                      className={cn(
-                                        "shrink-0 text-xs",
-                                        projectHasAttention
-                                          ? "text-content-secondary"
-                                          : "text-muted"
-                                      )}
-                                    >
-                                      ({projectAgentCount})
-                                    </span>
-                                  </div>
-                                )}
-                              </TooltipTrigger>
-                              <TooltipContent align="start">{projectPath}</TooltipContent>
-                            </Tooltip>
-                          </div>
-                          <Tooltip>
-                            <TooltipTrigger asChild>
-                              <button
-                                onClick={(event) => {
-                                  event.stopPropagation();
-                                  handleAddWorkspace(projectPath);
-                                }}
-                                aria-label={`New chat in ${projectName}`}
-                                data-project-path={projectPath}
-                                className="text-content-secondary hover:bg-hover hover:border-border-light pointer-events-none flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded border border-transparent bg-transparent text-sm leading-none opacity-0 transition-all duration-200 focus-visible:pointer-events-auto focus-visible:opacity-100"
-                              >
-                                <Plus className="h-4 w-4 shrink-0" strokeWidth={1.8} />
-                              </button>
-                            </TooltipTrigger>
-                            <TooltipContent>
-                              New chat ({formatKeybind(KEYBINDS.NEW_WORKSPACE)})
-                            </TooltipContent>
-                          </Tooltip>
-                          <Tooltip>
-                            <TooltipTrigger asChild>
-                              <button
-                                onClick={(event) => {
-                                  event.stopPropagation();
-                                  handleOpenProjectMenu(event, projectPath);
-                                }}
-                                aria-label={`Project options for ${projectName}`}
-                                data-project-path={projectPath}
-                                className={cn(
-                                  "text-content-secondary hover:bg-hover hover:border-border-light flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded border border-transparent bg-transparent transition-all duration-200 focus-visible:pointer-events-auto focus-visible:opacity-100",
-                                  projectContextMenu.isOpen && projectMenuTargetPath === projectPath
-                                    ? "pointer-events-auto opacity-100"
-                                    : "pointer-events-none opacity-0"
-                                )}
-                              >
-                                <EllipsisVertical className="h-4 w-4 shrink-0" strokeWidth={1.8} />
-                              </button>
-                            </TooltipTrigger>
-                            <TooltipContent align="end">Project options</TooltipContent>
-                          </Tooltip>
-                        </DraggableProjectItem>
-
-                        {isExpanded && (
-                          <div
-                            id={workspaceListId}
-                            role="region"
-                            aria-label={`Workspaces for ${projectName}`}
-                            className="pt-1"
-                          >
-                            {(() => {
-                              // Archived workspaces are excluded from workspaceMetadata so won't appear here
+    if (typeof window === "undefined") return;
+    const ids = projectWorkspaces.map((w) => w.id);
+    if (ids.length === 0) return;
+    const bump = () => setAttentionVersion((v) => v + 1);
+    const unsubscribers = [
+      ...ids.map((id) => workspaceStore.subscribeKey(id, bump)),
+    ];
+    for (const id of ids) {
+      const evt = getStorageChangeEvent(getWorkspaceLastReadKey(id));
+      window.addEventListener(evt, bump);
+      unsubscribers.push(() => window.removeEventListener(evt, bump));
+    }
+    return () => { for (const u of unsubscribers) u(); };
+  }, [projectWorkspaces, workspaceStore]);
 
                               const draftsForProject = workspaceDraftsByProject[projectPath] ?? [];
                               const activeDraftIds = new Set(
@@ -2727,12 +1488,27 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                 const sectionHasPromotedAttention = sectionDrafts.some((draft) => {
                                   const promotedMetadata = activeDraftPromotions[draft.draftId];
                                   return promotedMetadata
-                                    ? workspaceAttentionById.get(promotedMetadata.id) === true
+                                    ? checkWorkspaceHasAttention(
+                                        promotedMetadata.id,
+                                        workspaceStore,
+                                        workspaceRecency,
+                                        selectedWorkspace?.workspaceId,
+                                        archivingWorkspaceIds
+                                      ) ||
+                                      (delegatedActivityByWorkspaceId.get(promotedMetadata.id)?.activeCount ?? 0) > 0
                                     : false;
                                 });
                                 const sectionHasAttention =
                                   sectionAllWorkspaces.some(
-                                    (workspace) => workspaceAttentionById.get(workspace.id) === true
+                                    (workspace) =>
+                                      checkWorkspaceHasAttention(
+                                        workspace.id,
+                                        workspaceStore,
+                                        workspaceRecency,
+                                        selectedWorkspace?.workspaceId,
+                                        archivingWorkspaceIds
+                                      ) ||
+                                      (delegatedActivityByWorkspaceId.get(workspace.id)?.activeCount ?? 0) > 0
                                   ) || sectionHasPromotedAttention;
 
                                 const sectionExpandedKey = getSectionExpandedKey(
@@ -2865,7 +1641,1447 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                   {sections.map(renderSection)}
                                 </>
                               );
-                            })()}
+};
+
+const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
+  collapsed,
+  onToggleCollapsed,
+  sortedWorkspacesByProject,
+  workspaceRecency,
+}) => {
+  // Use the narrow actions context — does NOT subscribe to workspaceMetadata
+  // changes, preventing the entire sidebar tree from re-rendering on every
+  // workspace create/archive/rename.
+  const {
+    selectedWorkspace,
+    setSelectedWorkspace: onSelectWorkspace,
+    preflightArchiveWorkspace,
+    archiveWorkspace: onArchiveWorkspace,
+    removeWorkspace,
+    updateWorkspaceTitle: onUpdateTitle,
+    refreshWorkspaceMetadata,
+    pendingNewWorkspaceProject,
+    pendingNewWorkspaceDraftId,
+    workspaceDraftsByProject,
+    workspaceDraftPromotionsByProject,
+    createWorkspaceDraft,
+    openWorkspaceDraft,
+    deleteWorkspaceDraft,
+  } = useWorkspaceActions();
+  const workspaceStore = useWorkspaceStoreRaw();
+  useWorkspaceAttentionSubscription(sortedWorkspacesByProject, workspaceStore);
+  const runtimeStatusStore = useRuntimeStatusStoreRaw();
+  const { navigateToProject } = useRouter();
+  const { api } = useAPI();
+  const preserveSubagentsUntilArchive = usePreserveSubagentsUntilArchiveSetting(api);
+  const { confirm: confirmDialog } = useConfirmDialog();
+  const settings = useSettings();
+
+  // Get project state and operations from context
+  const {
+    userProjects,
+    muxHomeKind,
+    openProjectCreateModal: onAddProject,
+    removeProject: onRemoveProject,
+    updateDisplayName,
+    updateColor: updateProjectColor,
+    assignWorkspaceToSubProject,
+  } = useProjectContext();
+
+  // Theme for logo variant
+  const { theme } = useTheme();
+  const MuxLogo = theme === "dark" || theme.endsWith("-dark") ? MuxLogoDark : MuxLogoLight;
+  const multiProjectWorkspacesEnabled = useExperimentValue(EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES);
+
+  // Mobile breakpoint for auto-closing sidebar
+  const MOBILE_BREAKPOINT = 768;
+  const projectListScrollRef = useRef<HTMLDivElement | null>(null);
+  const mobileScrollTopRef = useRef(0);
+  const wasCollapsedRef = useRef(collapsed);
+
+  const normalizeMobileScrollTop = useCallback((scrollTop: number): number => {
+    return Number.isFinite(scrollTop) ? Math.max(0, Math.round(scrollTop)) : 0;
+  }, []);
+
+  const persistMobileSidebarScrollTop = useCallback(
+    (scrollTop: number) => {
+      if (window.innerWidth > MOBILE_BREAKPOINT) {
+        return;
+      }
+
+      // Keep the last viewed list position so reopening the touch sidebar returns
+      // users to where they were browsing instead of jumping back to the top.
+      const normalizedScrollTop = normalizeMobileScrollTop(scrollTop);
+      updatePersistedState<number>(MOBILE_LEFT_SIDEBAR_SCROLL_TOP_KEY, normalizedScrollTop, 0);
+    },
+    [MOBILE_BREAKPOINT, normalizeMobileScrollTop]
+  );
+
+  useEffect(() => {
+    if (collapsed || window.innerWidth > MOBILE_BREAKPOINT) {
+      return;
+    }
+
+    const persistedScrollTop = readPersistedState<unknown>(MOBILE_LEFT_SIDEBAR_SCROLL_TOP_KEY, 0);
+    const normalizedScrollTop =
+      typeof persistedScrollTop === "number" ? normalizeMobileScrollTop(persistedScrollTop) : 0;
+    mobileScrollTopRef.current = normalizedScrollTop;
+
+    if (projectListScrollRef.current) {
+      projectListScrollRef.current.scrollTop = normalizedScrollTop;
+    }
+  }, [collapsed, MOBILE_BREAKPOINT, normalizeMobileScrollTop]);
+
+  useEffect(() => {
+    const wasCollapsed = wasCollapsedRef.current;
+
+    if (!wasCollapsed && collapsed) {
+      persistMobileSidebarScrollTop(mobileScrollTopRef.current);
+    }
+
+    wasCollapsedRef.current = collapsed;
+  }, [collapsed, persistMobileSidebarScrollTop]);
+
+  const handleProjectListScroll = useCallback(
+    (event: React.UIEvent<HTMLDivElement>) => {
+      mobileScrollTopRef.current = normalizeMobileScrollTop(event.currentTarget.scrollTop);
+    },
+    [normalizeMobileScrollTop]
+  );
+
+  // Wrapper to close sidebar on mobile after workspace selection
+  const handleSelectWorkspace = useCallback(
+    (selection: WorkspaceSelection) => {
+      onSelectWorkspace(selection);
+      if (window.innerWidth <= MOBILE_BREAKPOINT && !collapsed) {
+        persistMobileSidebarScrollTop(mobileScrollTopRef.current);
+        onToggleCollapsed();
+      }
+    },
+    [onSelectWorkspace, collapsed, onToggleCollapsed, persistMobileSidebarScrollTop]
+  );
+
+  // Wrapper to close sidebar on mobile after adding workspace
+  const handleAddWorkspace = useCallback(
+    (projectPath: string, subProjectPath?: string) => {
+      createWorkspaceDraft(projectPath, subProjectPath);
+      if (window.innerWidth <= MOBILE_BREAKPOINT && !collapsed) {
+        persistMobileSidebarScrollTop(mobileScrollTopRef.current);
+        onToggleCollapsed();
+      }
+    },
+    [createWorkspaceDraft, collapsed, onToggleCollapsed, persistMobileSidebarScrollTop]
+  );
+
+  // Wrapper to close sidebar on mobile after opening an existing draft
+  const handleOpenWorkspaceDraft = useCallback(
+    (projectPath: string, draftId: string) => {
+      openWorkspaceDraft(projectPath, draftId);
+      if (window.innerWidth <= MOBILE_BREAKPOINT && !collapsed) {
+        persistMobileSidebarScrollTop(mobileScrollTopRef.current);
+        onToggleCollapsed();
+      }
+    },
+    [openWorkspaceDraft, collapsed, onToggleCollapsed, persistMobileSidebarScrollTop]
+  );
+
+  const handleGoHome = useCallback(() => {
+    // Selecting null delegates to WorkspaceContext's home-navigation + selection reset flow.
+    onSelectWorkspace(null);
+    // Close sidebar on mobile
+    if (window.innerWidth <= MOBILE_BREAKPOINT && !collapsed) {
+      persistMobileSidebarScrollTop(mobileScrollTopRef.current);
+      onToggleCollapsed();
+    }
+  }, [onSelectWorkspace, collapsed, onToggleCollapsed, persistMobileSidebarScrollTop]);
+  // Workspace-specific subscriptions moved to AgentListItem component
+
+  // Store as array in localStorage, convert to Set for usage
+  const [expandedProjectsArray, setExpandedProjectsArray] = usePersistedState<string[]>(
+    EXPANDED_PROJECTS_KEY,
+    []
+  );
+  // Handle corrupted localStorage data (old Set stored as {}).
+  // Use a plain array with .includes() instead of new Set() on every render —
+  // the React Compiler cannot stabilize Set allocations (see AGENTS.md).
+  // For typical sidebar sizes (< 20 projects) .includes() is equivalent perf.
+  const expandedProjectsList = Array.isArray(expandedProjectsArray) ? expandedProjectsArray : [];
+
+  // Track which projects have old workspaces expanded (per-project, per-tier)
+  // Key format: getTierKey(projectPath, tierIndex) where tierIndex is 0, 1, 2 for 1/7/30 days
+  const [expandedOldWorkspaces, setExpandedOldWorkspaces] = usePersistedState<
+    Record<string, boolean>
+  >("expandedOldWorkspaces", {});
+
+  // Track which sections are expanded
+  const [expandedSections, setExpandedSections] = usePersistedState<Record<string, boolean>>(
+    "expandedSections",
+    {}
+  );
+
+  // Track parent workspaces whose reported child tasks are expanded.
+  const [expandedCompletedSubAgents, setExpandedCompletedSubAgents] = usePersistedState<
+    Record<string, boolean>
+  >("expandedCompletedSubAgents", {});
+  const toggleCompletedChildrenExpansion = useCallback(
+    (workspaceId: string) => {
+      setExpandedCompletedSubAgents((prev) => {
+        const current = prev[workspaceId] ?? preserveSubagentsUntilArchive;
+        const next = !current;
+        const updated = { ...prev };
+        if (next === preserveSubagentsUntilArchive) {
+          delete updated[workspaceId];
+        } else {
+          updated[workspaceId] = next;
+        }
+        return updated;
+      });
+    },
+    [preserveSubagentsUntilArchive, setExpandedCompletedSubAgents]
+  );
+  const expandedCompletedParentIds = new Set<string>();
+  for (const workspaces of sortedWorkspacesByProject.values()) {
+    for (const workspace of workspaces) {
+      if (expandedCompletedSubAgents[workspace.id] ?? preserveSubagentsUntilArchive) {
+        expandedCompletedParentIds.add(workspace.id);
+      }
+    }
+  }
+
+  // Task-group expansion survives reloads (D7). Keys are namespaced per group
+  // kind: task:<parentWorkspaceId>:<groupId> / workflow:<parentWorkspaceId>:<runId>.
+  const [expandedTaskGroups, setExpandedTaskGroups] = usePersistedState<Record<string, boolean>>(
+    "expandedTaskGroups",
+    {}
+  );
+  // D6: a workflow group that is (or was, this session) active defaults to
+  // expanded and must not auto-collapse when its members finish mid-session.
+  // The render-time ref keeps that default sticky; an explicit toggle wins.
+  const sessionActiveTaskGroupKeysRef = useRef<Set<string>>(new Set());
+  const toggleTaskGroupExpansion = (storageKey: string, isCurrentlyExpanded: boolean) => {
+    setExpandedTaskGroups((prev) => ({
+      ...prev,
+      [storageKey]: !isCurrentlyExpanded,
+    }));
+  };
+
+  const [archivingWorkspaceIds, setArchivingWorkspaceIds] = useState<Set<string>>(new Set());
+  const [removingWorkspaceIds, setRemovingWorkspaceIds] = useState<Set<string>>(new Set());
+  const [draftVisibilityByProject, setDraftVisibilityByProject] = useState<
+    Record<string, Record<string, boolean>>
+  >({});
+  const workspaceArchiveError = usePopoverError();
+  const workspaceForkError = usePopoverError();
+  const workspaceStopRuntimeError = usePopoverError();
+  const workspaceRemoveError = usePopoverError();
+  const [archiveConfirmation, setArchiveConfirmation] = useState<{
+    workspaceId: string;
+    displayTitle: string;
+    buttonElement?: HTMLElement;
+    /** When set, the confirmation warns about permanent deletion of untracked files. */
+    untrackedPaths?: string[];
+    /** Whether the workspace has an active stream that will be interrupted. */
+    isStreaming?: boolean;
+  } | null>(null);
+  const [deleteConfirmation, setDeleteConfirmation] = useState<{
+    projectPath: string;
+    projectName: string;
+    activeCount: number;
+    archivedCount: number;
+  } | null>(null);
+  const projectRemoveError = usePopoverError();
+  const sectionRemoveError = usePopoverError();
+
+  const handleDraftVisibilityChange = useCallback(
+    (projectPath: string, draftId: string, isVisible: boolean) => {
+      setDraftVisibilityByProject((prev) => {
+        const existing = prev[projectPath] ?? {};
+        if (existing[draftId] === isVisible) {
+          return prev;
+        }
+
+        return {
+          ...prev,
+          [projectPath]: {
+            ...existing,
+            [draftId]: isVisible,
+          },
+        };
+      });
+    },
+    []
+  );
+
+  const projectContextMenu = useContextMenuPosition({ longPress: true });
+  const [projectMenuTargetPath, setProjectMenuTargetPath] = useState<string | null>(null);
+  const [editingProjectPath, setEditingProjectPath] = useState<string | null>(null);
+  const [editingProjectDisplayName, setEditingProjectDisplayName] = useState("");
+  const [autoEditingSection, setAutoEditingSection] = useState<{
+    projectPath: string;
+    sectionId: string;
+  } | null>(null);
+  const [showProjectColorPicker, setShowProjectColorPicker] = useState(false);
+  const [projectColorHexInput, setProjectColorHexInput] = useState("");
+  const [projectColorPickerValue, setProjectColorPickerValue] = useState("#000000");
+  const [projectColorPickerDirty, setProjectColorPickerDirty] = useState(false);
+  const skipNextProjectNameBlurCommitRef = useRef(false);
+
+  // Use functional update to avoid stale closure issues when clicking rapidly
+  const toggleProject = useCallback(
+    (projectPath: string) => {
+      setExpandedProjectsArray((prev) => {
+        const prevSet = new Set(Array.isArray(prev) ? prev : []);
+        if (prevSet.has(projectPath)) {
+          prevSet.delete(projectPath);
+        } else {
+          prevSet.add(projectPath);
+        }
+        return Array.from(prevSet);
+      });
+    },
+    [setExpandedProjectsArray]
+  );
+
+  const toggleSection = (projectPath: string, sectionId: string) => {
+    const key = getSectionExpandedKey(projectPath, sectionId);
+    setExpandedSections((prev) => ({
+      ...prev,
+      [key]: !prev[key],
+    }));
+  };
+
+  const handleForkWorkspace = useCallback(
+    async (workspaceId: string, buttonElement?: HTMLElement) => {
+      if (!api) {
+        workspaceForkError.showError(workspaceId, "Not connected to server");
+        return;
+      }
+
+      let anchor: { top: number; left: number } | undefined;
+      if (buttonElement) {
+        const rect = buttonElement.getBoundingClientRect();
+        anchor = {
+          top: rect.top + window.scrollY,
+          left: rect.right + 10,
+        };
+      }
+
+      try {
+        const result = await forkWorkspace({
+          client: api,
+          sourceWorkspaceId: workspaceId,
+        });
+        if (result.success) {
+          return;
+        }
+        workspaceForkError.showError(workspaceId, result.error ?? "Failed to fork chat", anchor);
+      } catch (error) {
+        // IPC/transport failures throw instead of returning { success: false }
+        const message = getErrorMessage(error);
+        workspaceForkError.showError(workspaceId, message, anchor);
+      }
+    },
+    [api, workspaceForkError]
+  );
+
+  const handleStopRuntime = useCallback(
+    async (workspaceId: string, buttonElement?: HTMLElement) => {
+      let anchor: { top: number; left: number } | undefined;
+      if (buttonElement) {
+        const rect = buttonElement.getBoundingClientRect();
+        anchor = {
+          top: rect.top + window.scrollY,
+          left: rect.right + 10,
+        };
+      }
+
+      if (!api) {
+        workspaceStopRuntimeError.showError(workspaceId, "Not connected to server", anchor);
+        return;
+      }
+
+      try {
+        const result = await api.workspace.stopRuntime({ workspaceId });
+        if (!result.success) {
+          workspaceStopRuntimeError.showError(
+            workspaceId,
+            result.error ?? "Failed to stop container",
+            anchor
+          );
+          return;
+        }
+
+        // A successful stop should hide the running indicator and menu action without
+        // forcing rows to own their own optimistic runtime state.
+        runtimeStatusStore.invalidateWorkspace(workspaceId);
+      } catch (error) {
+        workspaceStopRuntimeError.showError(workspaceId, getErrorMessage(error), anchor);
+      }
+    },
+    [api, runtimeStatusStore, workspaceStopRuntimeError]
+  );
+
+  const performArchiveWorkspace = useCallback(
+    async (
+      workspaceId: string,
+      buttonElement?: HTMLElement,
+      acknowledgedUntrackedPaths?: string[]
+    ) => {
+      // Mark workspace as being archived for UI feedback
+      setArchivingWorkspaceIds((prev) => new Set(prev).add(workspaceId));
+
+      try {
+        const result = await onArchiveWorkspace(
+          workspaceId,
+          acknowledgedUntrackedPaths ? { acknowledgedUntrackedPaths } : undefined
+        );
+        if (result.success && result.data?.kind === "confirm-lossy-untracked-files") {
+          const metadata = workspaceStore.getWorkspaceMetadata(workspaceId);
+          const displayTitle = metadata?.title ?? metadata?.name ?? workspaceId;
+          const aggregator = workspaceStore.getAggregator(workspaceId);
+          const hasActiveStreams = aggregator?.hasInterruptibleActiveStream() ?? false;
+          const pendingStreamStartTime = aggregator?.getPendingStreamStartTime();
+          const isStarting = pendingStreamStartTime != null && !hasActiveStreams;
+          const awaitingUserQuestion = aggregator?.hasAwaitingUserQuestion() ?? false;
+          const isStreaming = (hasActiveStreams || isStarting) && !awaitingUserQuestion;
+          setArchiveConfirmation({
+            workspaceId,
+            displayTitle,
+            buttonElement,
+            untrackedPaths: result.data.paths,
+            // The retry path already handled any earlier streaming warning. Only surface the
+            // interruption warning again when the archive attempt has not yet been confirmed.
+            isStreaming: acknowledgedUntrackedPaths == null ? isStreaming : false,
+          });
+          return;
+        }
+        if (!result.success) {
+          if (acknowledgedUntrackedPaths != null) {
+            // Archive may fail if new untracked files appear between confirmation and capture.
+            // Re-run preflight so we can reopen the modal with the latest paths.
+            const preflight = await preflightArchiveWorkspace(workspaceId);
+            if (preflight.success && preflight.data?.kind === "confirm-lossy-untracked-files") {
+              const pathsChanged = didUntrackedPathSetChange(
+                acknowledgedUntrackedPaths,
+                preflight.data.paths
+              );
+              if (pathsChanged) {
+                const metadata = workspaceStore.getWorkspaceMetadata(workspaceId);
+                const displayTitle = metadata?.title ?? metadata?.name ?? workspaceId;
+                setArchiveConfirmation({
+                  workspaceId,
+                  displayTitle,
+                  buttonElement,
+                  untrackedPaths: preflight.data.paths,
+                  isStreaming: (() => {
+                    const aggregator = workspaceStore.getAggregator(workspaceId);
+                    if (!aggregator) return false;
+                    const hasActiveStreams = aggregator.hasInterruptibleActiveStream();
+                    const isStarting =
+                      aggregator.getPendingStreamStartTime() !== null && !hasActiveStreams;
+                    const awaitingUserQuestion = aggregator.hasAwaitingUserQuestion();
+                    return (hasActiveStreams || isStarting) && !awaitingUserQuestion;
+                  })(),
+                });
+                return;
+              }
+            }
+          }
+
+          const error = result.error ?? "Failed to archive chat";
+          // Archive failures can be long-lived workflow errors (for example, untracked-file safety
+          // checks) that users should notice near the active workspace content, not pinned beside a
+          // left-sidebar row that may be far from their current focus. Use the shared toast fallback
+          // position so archive errors match other top-right UI error surfaces.
+          workspaceArchiveError.showError(workspaceId, error);
+        }
+      } finally {
+        // Clear archiving state
+        setArchivingWorkspaceIds((prev) => {
+          const next = new Set(prev);
+          next.delete(workspaceId);
+          return next;
+        });
+      }
+    },
+    [onArchiveWorkspace, preflightArchiveWorkspace, workspaceArchiveError, workspaceStore]
+  );
+
+  const hasActiveStream = useCallback(
+    (workspaceId: string) => {
+      const aggregator = workspaceStore.getAggregator(workspaceId);
+      if (!aggregator) return false;
+      const hasActiveStreams = aggregator.hasInterruptibleActiveStream();
+      const isStarting = aggregator.getPendingStreamStartTime() !== null && !hasActiveStreams;
+      const awaitingUserQuestion = aggregator.hasAwaitingUserQuestion();
+      return (hasActiveStreams || isStarting) && !awaitingUserQuestion;
+    },
+    [workspaceStore]
+  );
+
+  const handleArchiveWorkspace = useCallback(
+    async (workspaceId: string, buttonElement?: HTMLElement) => {
+      const metadata = workspaceStore.getWorkspaceMetadata(workspaceId);
+      const displayTitle = metadata?.title ?? metadata?.name ?? workspaceId;
+      const isStreaming = hasActiveStream(workspaceId);
+
+      // Run preflight to check for untracked files that can't be preserved.
+      const preflight = await preflightArchiveWorkspace(workspaceId);
+      if (!preflight.success) {
+        workspaceArchiveError.showError(
+          workspaceId,
+          preflight.error ?? "Failed to check archive readiness"
+        );
+        return;
+      }
+
+      const untrackedPaths =
+        preflight.data?.kind === "confirm-lossy-untracked-files" ? preflight.data.paths : undefined;
+
+      if (isStreaming || untrackedPaths) {
+        // Show a single combined confirmation dialog for streaming + untracked-file warnings.
+        setArchiveConfirmation({
+          workspaceId,
+          displayTitle,
+          buttonElement,
+          untrackedPaths,
+          isStreaming,
+        });
+        return;
+      }
+
+      await performArchiveWorkspace(workspaceId, buttonElement);
+    },
+    [
+      hasActiveStream,
+      performArchiveWorkspace,
+      preflightArchiveWorkspace,
+      workspaceArchiveError,
+      workspaceStore,
+    ]
+  );
+
+  const handleArchiveWorkspaceConfirm = useCallback(async () => {
+    if (!archiveConfirmation) {
+      return;
+    }
+
+    const confirmation = archiveConfirmation;
+    setArchiveConfirmation(null);
+    await performArchiveWorkspace(
+      confirmation.workspaceId,
+      confirmation.buttonElement,
+      confirmation.untrackedPaths
+    );
+  }, [archiveConfirmation, performArchiveWorkspace]);
+
+  const handleArchiveWorkspaceCancel = useCallback(() => {
+    setArchiveConfirmation(null);
+  }, []);
+
+  const showProjectRemoveError = useCallback(
+    (
+      projectPath: string,
+      error: {
+        type: string;
+        message?: string;
+        activeCount?: number;
+        archivedCount?: number;
+      },
+      buttonElement?: HTMLElement
+    ) => {
+      let message: string;
+      if (error.type === "workspace_blockers") {
+        const parts: string[] = [];
+        const activeCount = error.activeCount ?? 0;
+        const archivedCount = error.archivedCount ?? 0;
+
+        if (activeCount > 0) {
+          parts.push(`${activeCount} active`);
+        }
+        if (archivedCount > 0) {
+          parts.push(`${archivedCount} archived`);
+        }
+        message = `Has ${parts.join(" and ")} workspace(s)`;
+      } else if (error.type === "project_not_found") {
+        message = "Project not found";
+      } else {
+        message = error.message ?? "Failed to remove project";
+      }
+
+      let anchor: { top: number; left: number } | undefined;
+      if (buttonElement) {
+        const rect = buttonElement.getBoundingClientRect();
+        anchor = {
+          top: rect.top + window.scrollY,
+          left: rect.right + 10,
+        };
+      }
+
+      projectRemoveError.showError(projectPath, message, anchor);
+    },
+    [projectRemoveError]
+  );
+
+  const removeProjectWithFeedback = useCallback(
+    async (projectPath: string, options?: { force?: boolean }, buttonElement?: HTMLElement) => {
+      const result = await onRemoveProject(projectPath, options);
+      if (!result.success) {
+        showProjectRemoveError(projectPath, result.error, buttonElement);
+      }
+      return result;
+    },
+    [onRemoveProject, showProjectRemoveError]
+  );
+
+  const handleDeleteConfirm = useCallback(async () => {
+    if (!deleteConfirmation) {
+      return;
+    }
+
+    const result = await removeProjectWithFeedback(deleteConfirmation.projectPath, {
+      force: true,
+    });
+    if (result.success) {
+      setDeleteConfirmation(null);
+    }
+  }, [deleteConfirmation, removeProjectWithFeedback]);
+
+  const handleDeleteCancel = useCallback(() => {
+    setDeleteConfirmation(null);
+  }, []);
+  const handleCancelWorkspaceCreation = useCallback(
+    async (workspaceId: string) => {
+      // Give immediate UI feedback (spinner / disabled row) while deletion is in-flight.
+      setRemovingWorkspaceIds((prev) => new Set(prev).add(workspaceId));
+
+      try {
+        const result = await removeWorkspace(workspaceId, { force: true });
+        if (!result.success) {
+          workspaceRemoveError.showError(
+            workspaceId,
+            result.error ?? "Failed to cancel workspace creation"
+          );
+        }
+      } finally {
+        setRemovingWorkspaceIds((prev) => {
+          const next = new Set(prev);
+          next.delete(workspaceId);
+          return next;
+        });
+      }
+    },
+    [removeWorkspace, workspaceRemoveError]
+  );
+
+  const handleRemoveSection = async (
+    projectPath: string,
+    subProjectPath: string,
+    buttonElement?: HTMLElement
+  ) => {
+    // Capture the anchor location up front because the sub-project action menu unmounts its
+    // button immediately after click; failures still need stable error placement.
+    const anchor =
+      buttonElement != null
+        ? (() => {
+            const buttonRect = buttonElement.getBoundingClientRect();
+            return {
+              top: buttonRect.top + window.scrollY,
+              left: buttonRect.right + 10,
+            };
+          })()
+        : undefined;
+
+    // Removing a sub-project unregisters it and clears the cwd pointer from its workspaces.
+    const workspacesInSection = (userProjects.get(projectPath)?.workspaces ?? []).filter(
+      (workspace) => workspace.subProjectPath === subProjectPath
+    );
+
+    if (workspacesInSection.length > 0) {
+      const ok = await confirmDialog({
+        title: "Remove sub-project?",
+        description: `${workspacesInSection.length} workspace(s) in this sub-project will move back to the parent project.`,
+        confirmLabel: "Remove",
+        confirmVariant: "destructive",
+      });
+      if (!ok) {
+        return;
+      }
+    }
+
+    const result = await onRemoveProject(subProjectPath);
+    if (!result.success) {
+      const error = getErrorMessage(result.error) || "Failed to remove sub-project";
+      sectionRemoveError.showError(subProjectPath, error, anchor);
+    }
+  };
+
+  const handleOpenSecrets = useCallback(
+    (projectPath: string) => {
+      // Collapse the off-canvas sidebar on mobile before navigating so the
+      // settings page is immediately accessible without a backdrop blocking it.
+      if (window.innerWidth <= MOBILE_BREAKPOINT && !collapsed) {
+        persistMobileSidebarScrollTop(mobileScrollTopRef.current);
+        onToggleCollapsed();
+      }
+      // Navigate to Settings → Secrets with the project pre-selected.
+      settings.open("secrets", { secretsProjectPath: projectPath });
+    },
+    [MOBILE_BREAKPOINT, collapsed, onToggleCollapsed, persistMobileSidebarScrollTop, settings]
+  );
+
+  const closeProjectContextMenu = useCallback(() => {
+    projectContextMenu.close();
+    setProjectMenuTargetPath(null);
+    setShowProjectColorPicker(false);
+    setProjectColorPickerDirty(false);
+  }, [projectContextMenu]);
+
+  const handleProjectMenuOpenChange = useCallback(
+    (open: boolean) => {
+      projectContextMenu.onOpenChange(open);
+      if (!open) {
+        setProjectMenuTargetPath(null);
+        setShowProjectColorPicker(false);
+        setProjectColorPickerDirty(false);
+      }
+    },
+    [projectContextMenu]
+  );
+
+  const handleOpenProjectMenu = useCallback(
+    (event: React.MouseEvent, projectPath: string) => {
+      setProjectMenuTargetPath(projectPath);
+      setShowProjectColorPicker(false);
+      setProjectColorPickerDirty(false);
+      projectContextMenu.onContextMenu(event);
+    },
+    [projectContextMenu]
+  );
+
+  const handleProjectContextMenuTouchStart = useCallback(
+    (event: React.TouchEvent, projectPath: string) => {
+      setProjectMenuTargetPath(projectPath);
+      setShowProjectColorPicker(false);
+      setProjectColorPickerDirty(false);
+      projectContextMenu.touchHandlers.onTouchStart(event);
+    },
+    [projectContextMenu]
+  );
+
+  const handleRequestProjectRemoval = useCallback(
+    (projectPath: string, buttonElement?: HTMLElement) => {
+      const projectConfig = userProjects.get(projectPath);
+      if (!projectConfig) {
+        return;
+      }
+
+      const projectName = projectConfig.displayName ?? getProjectNameFromPath(projectPath);
+      const counts = getProjectWorkspaceCounts(projectConfig.workspaces);
+      const total = counts.activeCount + counts.archivedCount;
+      if (total > 0) {
+        setDeleteConfirmation({
+          projectPath,
+          projectName,
+          activeCount: counts.activeCount,
+          archivedCount: counts.archivedCount,
+        });
+        return;
+      }
+
+      void removeProjectWithFeedback(projectPath, undefined, buttonElement);
+    },
+    [removeProjectWithFeedback, userProjects]
+  );
+
+  const cancelProjectDisplayNameEditing = useCallback(() => {
+    setEditingProjectPath(null);
+    setEditingProjectDisplayName("");
+  }, []);
+
+  const commitProjectDisplayNameEdit = useCallback(
+    async (projectPath: string, nextDisplayName: string) => {
+      const normalizedDisplayName = normalizeDisplayNameInput(nextDisplayName);
+      const result = await updateDisplayName(projectPath, normalizedDisplayName);
+      if (!result.success) {
+        console.error("Failed to update project display name:", result.error);
+        return;
+      }
+      setEditingProjectPath((currentPath) => {
+        if (currentPath === projectPath) {
+          setEditingProjectDisplayName("");
+          return null;
+        }
+        return currentPath;
+      });
+    },
+    [updateDisplayName]
+  );
+
+  const handleProjectMenuEditName = useCallback(() => {
+    if (!projectMenuTargetPath) {
+      return;
+    }
+
+    const projectConfig = userProjects.get(projectMenuTargetPath);
+    if (!projectConfig) {
+      closeProjectContextMenu();
+      return;
+    }
+
+    // Escape can leave the skip-blur flag set when the input unmounts before a blur event fires.
+    // Clear it when a fresh edit session starts so the next blur commits as expected.
+    skipNextProjectNameBlurCommitRef.current = false;
+    const currentDisplayName =
+      projectConfig.displayName ?? getProjectFallbackLabel(projectMenuTargetPath);
+    setEditingProjectPath(projectMenuTargetPath);
+    setEditingProjectDisplayName(currentDisplayName);
+    closeProjectContextMenu();
+  }, [closeProjectContextMenu, projectMenuTargetPath, userProjects]);
+
+  const handleProjectMenuManageSecrets = useCallback(() => {
+    if (!projectMenuTargetPath) {
+      return;
+    }
+
+    handleOpenSecrets(projectMenuTargetPath);
+    closeProjectContextMenu();
+  }, [closeProjectContextMenu, handleOpenSecrets, projectMenuTargetPath]);
+
+  const handleProjectMenuDelete = useCallback(
+    (buttonElement?: HTMLElement) => {
+      if (!projectMenuTargetPath) {
+        return;
+      }
+
+      handleRequestProjectRemoval(projectMenuTargetPath, buttonElement);
+      closeProjectContextMenu();
+    },
+    [closeProjectContextMenu, handleRequestProjectRemoval, projectMenuTargetPath]
+  );
+
+  const handleProjectMenuAddSubFolder = useCallback(() => {
+    closeProjectContextMenu();
+    onAddProject(projectMenuTargetPath ? { initialPath: projectMenuTargetPath } : undefined);
+  }, [closeProjectContextMenu, onAddProject, projectMenuTargetPath]);
+
+  const projectMenuTargetConfig = projectMenuTargetPath
+    ? (userProjects.get(projectMenuTargetPath) ?? null)
+    : null;
+  const projectMenuResolvedColor = resolveSectionColor(projectMenuTargetConfig?.color);
+
+  // HexColorPicker emits on every drag tick; debounce project color writes so we
+  // don't flood IPC + project refreshes while the user drags through hues.
+  const debouncedProjectColorPickerValue = useDebouncedValue(projectColorPickerValue, 150);
+
+  const handleProjectMenuColorClick = useCallback(() => {
+    if (!projectMenuTargetPath) {
+      return;
+    }
+    setShowProjectColorPicker((prev) => {
+      const next = !prev;
+      if (next) {
+        setProjectColorHexInput(projectMenuResolvedColor);
+        setProjectColorPickerValue(projectMenuResolvedColor);
+      }
+      setProjectColorPickerDirty(false);
+      return next;
+    });
+  }, [projectMenuResolvedColor, projectMenuTargetPath]);
+
+  const handleProjectColorChange = useCallback(
+    async (color: string) => {
+      if (!projectMenuTargetPath) {
+        return;
+      }
+      const result = await updateProjectColor(projectMenuTargetPath, color);
+      if (!result.success) {
+        console.error("Failed to update project color:", result.error);
+      }
+    },
+    [projectMenuTargetPath, updateProjectColor]
+  );
+
+  useEffect(() => {
+    if (!showProjectColorPicker || !projectColorPickerDirty) {
+      return;
+    }
+    if (!/^#[0-9a-fA-F]{6}$/.test(debouncedProjectColorPickerValue)) {
+      return;
+    }
+    if (debouncedProjectColorPickerValue === projectMenuResolvedColor) {
+      return;
+    }
+
+    void handleProjectColorChange(debouncedProjectColorPickerValue);
+  }, [
+    debouncedProjectColorPickerValue,
+    handleProjectColorChange,
+    projectColorPickerDirty,
+    projectMenuResolvedColor,
+    showProjectColorPicker,
+  ]);
+
+  // UI preference: project order persists in localStorage
+  const [projectOrder, setProjectOrder] = usePersistedState<string[]>(PROJECT_ORDER_KEY, []);
+
+  // Build a stable signature of the project keys so effects don't fire on Map identity churn
+  const projectPathsSignature = React.useMemo(() => {
+    // sort to avoid order-related churn
+    const keys = Array.from(userProjects.keys()).sort();
+    return keys.join("\u0001"); // use non-printable separator
+  }, [userProjects]);
+
+  // Normalize order when the set of projects changes (not on every parent render)
+  useEffect(() => {
+    // Skip normalization if projects haven't loaded yet (empty Map on initial render)
+    // This prevents clearing projectOrder before projects load from backend
+    if (userProjects.size === 0) {
+      return;
+    }
+
+    const normalized = normalizeOrder(projectOrder, userProjects);
+    if (
+      normalized.length !== projectOrder.length ||
+      normalized.some((p, i) => p !== projectOrder[i])
+    ) {
+      setProjectOrder(normalized);
+    }
+    // Only re-run when project keys change (projectPathsSignature captures projects Map keys)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectPathsSignature]);
+
+  // Memoize sorted project PATHS (not entries) to avoid capturing stale config objects.
+  // Sorting depends only on keys + order; we read configs from the live Map during render.
+  const sortedProjectPaths = React.useMemo(
+    () =>
+      sortProjectsByOrder(userProjects, projectOrder)
+        .filter(([, config]) => !config.parentProjectPath)
+        .map(([p]) => p),
+    // projectPathsSignature captures projects Map keys
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [projectPathsSignature, projectOrder]
+  );
+
+  const isWorkspaceLiveActive = (workspaceId: string): boolean => {
+    const signal = getWorkspaceAttentionSignal(workspaceStore, workspaceId);
+    return signal?.isWorking === true;
+  };
+  const delegatedActivityByWorkspaceId = computeDelegatedActivityByWorkspaceId(
+    Array.from(sortedWorkspacesByProject.values()).flat(),
+    { isWorkspaceLiveActive }
+  );
+
+  const singleProjectWorkspacesByProject = new Map<string, FrontendWorkspaceMetadata[]>();
+  const multiProjectWorkspacesById = new Map<string, FrontendWorkspaceMetadata>();
+
+  for (const [projectPath, workspaces] of sortedWorkspacesByProject) {
+    const singleProjectWorkspaces: FrontendWorkspaceMetadata[] = [];
+    for (const workspace of workspaces) {
+      if (isMultiProject(workspace)) {
+        if (multiProjectWorkspacesEnabled) {
+          multiProjectWorkspacesById.set(workspace.id, workspace);
+        }
+        continue;
+      }
+
+      singleProjectWorkspaces.push(workspace);
+    }
+    singleProjectWorkspacesByProject.set(projectPath, singleProjectWorkspaces);
+  }
+
+  // Shared context for ProjectWorkspacesTree components.
+  // React Compiler memoizes this object — when trivial UI state (color picker,
+  // menus, modals) changes, the reference stays stable, so tree components
+  // skip re-rendering and their tree math doesn't re-run.
+  const treeCtx: ProjectTreeContextValue = {
+    workspaceDraftsByProject,
+    workspaceDraftPromotionsByProject,
+    userProjects,
+    workspaceRecency,
+    selectedWorkspace,
+    expandedCompletedParentIds,
+    expandedOldWorkspaces,
+    setExpandedOldWorkspaces,
+    expandedSections,
+    expandedTaskGroups,
+    draftVisibilityByProject,
+    archivingWorkspaceIds,
+    removingWorkspaceIds,
+    autoEditingSection,
+    setAutoEditingSection,
+    pendingNewWorkspaceProject,
+    pendingNewWorkspaceDraftId,
+    sessionActiveTaskGroupKeysRef,
+    isDraftVisible,
+    handleSelectWorkspace,
+    handleAddWorkspace,
+    handleForkWorkspace,
+    handleStopRuntime,
+    handleArchiveWorkspace,
+    handleCancelWorkspaceCreation,
+    handleDraftVisibilityChange,
+    handleOpenWorkspaceDraft,
+    openWorkspaceDraft,
+    navigateToProject,
+    deleteWorkspaceDraft,
+    toggleCompletedChildrenExpansion,
+    toggleTaskGroupExpansion,
+    toggleSection,
+    updateDisplayName,
+    updateProjectColor,
+    handleRemoveSection,
+    assignWorkspaceToSubProject,
+    refreshWorkspaceMetadata,
+  };
+
+  const multiProjectWorkspaces = Array.from(multiProjectWorkspacesById.values());
+  // Multi-project rows should share the same completed-subagent chevron behavior as
+  // regular workspace rows, so reuse the same visibility + metadata calculations.
+  const multiProjectDepthByWorkspaceId = computeWorkspaceDepthMap(multiProjectWorkspaces);
+  const visibleMultiProjectWorkspaces = filterVisibleAgentRows(
+    multiProjectWorkspaces,
+    expandedCompletedParentIds
+  );
+  const multiProjectRowMetaByWorkspaceId = computeAgentRowRenderMeta(
+    multiProjectWorkspaces,
+    multiProjectDepthByWorkspaceId,
+    expandedCompletedParentIds
+  );
+  const isMultiProjectSectionExpanded = expandedProjectsList.includes(
+    MULTI_PROJECT_SIDEBAR_SECTION_ID
+  );
+
+  const handleReorder = useCallback(
+    (draggedPath: string, targetPath: string) => {
+      const next = reorderProjects(projectOrder, userProjects, draggedPath, targetPath);
+      setProjectOrder(next);
+    },
+    [projectOrder, userProjects, setProjectOrder]
+  );
+
+  const hasProjectMenuTarget = projectMenuTargetPath !== null;
+
+  // Handle keyboard shortcuts
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Sub-project workspaces share the parent worktree, so recover the child
+      // target from the live sidebar metadata before opening a sibling draft.
+      if (matchesKeybind(e, KEYBINDS.NEW_WORKSPACE) && selectedWorkspace) {
+        e.preventDefault();
+        // Resolve the effective section ID exactly the way the renderer does:
+        // honor the workspace's own subProjectPath when it still exists,
+        // otherwise inherit from the parent workspace. This keeps Ctrl+N in
+        // lockstep with the visible section and avoids forwarding deleted
+        // sub-project paths that workspace.create would reject.
+        const projectWorkspaces =
+          sortedWorkspacesByProject.get(selectedWorkspace.projectPath) ?? [];
+        const byId = new Map(projectWorkspaces.map((m) => [m.id, m]));
+        const meta = byId.get(selectedWorkspace.workspaceId);
+        const validSectionIds = new Set(
+          getSubProjectsForParent(selectedWorkspace.projectPath, userProjects).map(
+            ([subPath]) => subPath
+          )
+        );
+        const subProjectPath = meta
+          ? resolveEffectiveSectionId(meta, byId, validSectionIds)
+          : undefined;
+        handleAddWorkspace(selectedWorkspace.projectPath, subProjectPath);
+      } else if (matchesKeybind(e, KEYBINDS.ARCHIVE_WORKSPACE) && selectedWorkspace) {
+        e.preventDefault();
+        void handleArchiveWorkspace(selectedWorkspace.workspaceId);
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [
+    closeProjectContextMenu,
+    selectedWorkspace,
+    handleAddWorkspace,
+    handleArchiveWorkspace,
+    sortedWorkspacesByProject,
+    userProjects,
+  ]);
+
+  return (
+    <TitleEditProvider onUpdateTitle={onUpdateTitle}>
+      <SidebarTitleEditKeybinds
+        selectedWorkspace={selectedWorkspace ?? undefined}
+        sortedWorkspacesByProject={sortedWorkspacesByProject}
+        collapsed={collapsed}
+      />
+      <DndProvider backend={HTML5Backend}>
+        <ProjectDragLayer />
+        <WorkspaceDragLayer />
+        <div
+          className={cn(
+            // The sidebar doubles as a drag surface, so keep copy selection disabled
+            // unless a child input explicitly opts back into text selection.
+            "font-primary bg-surface-primary border-border-light relative flex flex-1 select-none flex-col overflow-hidden border-r",
+            // In desktop mode when collapsed, hide border (LeftSidebar handles the partial border)
+            isDesktopMode() && collapsed && "border-r-0"
+          )}
+          role="navigation"
+          aria-label="Projects"
+        >
+          {!collapsed && (
+            <>
+              <div className="border-dark flex items-center justify-between border-b py-3 pr-3 pl-4">
+                <div className="flex min-w-0 items-center gap-2">
+                  <button
+                    onClick={handleGoHome}
+                    className="shrink-0 cursor-pointer border-none bg-transparent p-0"
+                    aria-label="Home"
+                  >
+                    <MuxLogo className="h-5 w-[44px]" aria-hidden="true" />
+                  </button>
+                </div>
+                <button
+                  onClick={() => onAddProject()}
+                  aria-label="Add project"
+                  className="text-secondary hover:bg-hover hover:border-border-light flex h-6 shrink-0 cursor-pointer items-center gap-1 rounded border border-transparent bg-transparent px-1.5 text-xs transition-all duration-200"
+                >
+                  <span className="text-base leading-none">+</span>
+                  <span>Add Project</span>
+                </button>
+              </div>
+              <ScrollArea
+                className="flex-1"
+                viewportRef={projectListScrollRef}
+                onViewportScroll={handleProjectListScroll}
+                viewportClassName="overflow-x-hidden"
+              >
+                {multiProjectWorkspaces.length > 0 && (
+                  <div>
+                    <div className={PROJECT_ITEM_BASE_CLASS}>
+                      <button
+                        onClick={() => toggleProject(MULTI_PROJECT_SIDEBAR_SECTION_ID)}
+                        aria-label={`${isMultiProjectSectionExpanded ? "Collapse" : "Expand"} multi-project workspaces`}
+                        className={PROJECT_TOGGLE_BUTTON_CLASSES}
+                      >
+                        <span className="relative flex h-4 w-4 items-center justify-center">
+                          <ChevronRight
+                            className="absolute inset-0 h-4 w-4 opacity-0 transition-[opacity,transform] duration-200 group-hover:opacity-100"
+                            style={{
+                              transform: isMultiProjectSectionExpanded
+                                ? "rotate(90deg)"
+                                : "rotate(0deg)",
+                            }}
+                          />
+                          {isMultiProjectSectionExpanded ? (
+                            <FolderOpen className="h-4 w-4 transition-opacity duration-200 group-hover:opacity-0" />
+                          ) : (
+                            <Folder className="h-4 w-4 transition-opacity duration-200 group-hover:opacity-0" />
+                          )}
+                        </span>
+                      </button>
+                      <div className="flex min-w-0 flex-1 items-center pr-2">
+                        <span className="text-foreground truncate text-sm font-medium">
+                          Multi-Project
+                        </span>
+                        <span className="text-muted ml-2 text-xs">
+                          ({multiProjectWorkspaces.length})
+                        </span>
+                      </div>
+                    </div>
+                    {isMultiProjectSectionExpanded && (
+                      <div className="pt-1 pb-1">
+                        {visibleMultiProjectWorkspaces.map((metadata) => {
+                          const rowRenderMeta = multiProjectRowMetaByWorkspaceId.get(metadata.id);
+
+                          return (
+                            <AgentListItem
+                              key={metadata.id}
+                              metadata={metadata}
+                              projectPath={metadata.projectPath}
+                              projectName={metadata.projectName}
+                              isSelected={selectedWorkspace?.workspaceId === metadata.id}
+                              isArchiving={archivingWorkspaceIds.has(metadata.id)}
+                              isRemoving={
+                                removingWorkspaceIds.has(metadata.id) ||
+                                metadata.isRemoving === true
+                              }
+                              onSelectWorkspace={handleSelectWorkspace}
+                              onForkWorkspace={handleForkWorkspace}
+                              onArchiveWorkspace={handleArchiveWorkspace}
+                              onCancelCreation={handleCancelWorkspaceCreation}
+                              depth={
+                                rowRenderMeta?.depth ??
+                                multiProjectDepthByWorkspaceId[metadata.id] ??
+                                0
+                              }
+                              rowRenderMeta={rowRenderMeta}
+                              delegatedActivity={delegatedActivityByWorkspaceId.get(metadata.id)}
+                              completedChildrenExpanded={expandedCompletedParentIds.has(
+                                metadata.id
+                              )}
+                              onToggleCompletedChildren={toggleCompletedChildrenExpansion}
+                            />
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {sortedProjectPaths.length === 0 && multiProjectWorkspaces.length === 0 ? (
+                  <div className="px-4 py-8 text-center">
+                    <p className="text-muted mb-4 text-[13px]">No projects</p>
+                    {/*
+                      In browser/server mode the dev server resolves an isolated
+                      ~/.mux-dev home (NODE_ENV=development), which is empty by
+                      default. Explain that here so the by-design isolation is
+                      never mistaken for a missing-config bug. Suppressed when the
+                      user has pointed the server at a custom MUX_ROOT (they know).
+                    */}
+                    {muxHomeKind === "dev-default" &&
+                    typeof window !== "undefined" &&
+                    !window.api ? (
+                      <p
+                        data-testid="dev-home-hint"
+                        className="text-muted mx-auto mb-4 max-w-[260px] text-[12px] leading-relaxed"
+                      >
+                        The dev server uses an isolated{" "}
+                        <code className="text-[11px]">~/.mux-dev</code> home. To reuse your main
+                        projects, relaunch with <code className="text-[11px]">MUX_ROOT=~/.mux</code>
+                        .
+                      </p>
+                    ) : null}
+                    <button
+                      onClick={() => onAddProject()}
+                      className="bg-accent hover:bg-accent-dark cursor-pointer rounded border-none px-4 py-2 text-[13px] text-white transition-colors duration-200"
+                    >
+                      Add Project
+                    </button>
+                  </div>
+                ) : (
+                  sortedProjectPaths.map((projectPath) => {
+                    const config = userProjects.get(projectPath);
+                    if (!config) return null;
+                    const projectFolderColor = config.color
+                      ? resolveSectionColor(config.color)
+                      : undefined;
+                    const projectName = getProjectNameFromPath(projectPath);
+                    const sanitizedProjectId =
+                      projectPath.replace(/[^a-zA-Z0-9_-]/g, "-") || "root";
+                    const workspaceListId = `workspace-list-${sanitizedProjectId}`;
+                    const isExpanded = expandedProjectsList.includes(projectPath);
+                    const displayProjectName =
+                      config.displayName ?? getProjectFallbackLabel(projectPath);
+                    const isEditingProjectDisplayName = editingProjectPath === projectPath;
+                    const projectWorkspaces =
+                      singleProjectWorkspacesByProject.get(projectPath) ?? [];
+                    const projectAgentCount = projectWorkspaces.length;
+                    const projectHasAttention = projectWorkspaces.some(
+                      (workspace) =>
+                        checkWorkspaceHasAttention(
+                          workspace.id,
+                          workspaceStore,
+                          workspaceRecency,
+                          selectedWorkspace?.workspaceId,
+                          archivingWorkspaceIds
+                        ) ||
+                        (delegatedActivityByWorkspaceId.get(workspace.id)?.activeCount ?? 0) > 0
+                    );
+
+                    return (
+                      <div key={projectPath}>
+                        <DraggableProjectItem
+                          projectPath={projectPath}
+                          onReorder={handleReorder}
+                          selected={false}
+                          onClick={() => {
+                            if (projectContextMenu.suppressClickIfLongPress()) {
+                              return;
+                            }
+                            if (isEditingProjectDisplayName) {
+                              return;
+                            }
+                            handleAddWorkspace(projectPath);
+                          }}
+                          onContextMenu={(event) => handleOpenProjectMenu(event, projectPath)}
+                          onTouchStart={(event) =>
+                            handleProjectContextMenuTouchStart(event, projectPath)
+                          }
+                          onTouchEnd={projectContextMenu.touchHandlers.onTouchEnd}
+                          onTouchMove={projectContextMenu.touchHandlers.onTouchMove}
+                          onKeyDown={(e: React.KeyboardEvent) => {
+                            // Ignore key events from child buttons
+                            if (e.target instanceof HTMLElement && e.target !== e.currentTarget) {
+                              return;
+                            }
+                            if (e.key === "Enter" || e.key === " ") {
+                              e.preventDefault();
+                              handleAddWorkspace(projectPath);
+                            }
+                          }}
+                          role="button"
+                          tabIndex={0}
+                          aria-expanded={isExpanded}
+                          aria-controls={workspaceListId}
+                          aria-label={`Create workspace in ${projectName}`}
+                          data-project-path={projectPath}
+                        >
+                          <button
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              toggleProject(projectPath);
+                            }}
+                            aria-label={`${isExpanded ? "Collapse" : "Expand"} project ${projectName}`}
+                            data-project-path={projectPath}
+                            className={PROJECT_TOGGLE_BUTTON_CLASSES}
+                          >
+                            <span className="relative flex h-4 w-4 items-center justify-center">
+                              <ChevronRight
+                                className="absolute inset-0 h-4 w-4 opacity-0 transition-[opacity,transform] duration-200 group-hover:opacity-100"
+                                style={{
+                                  transform: isExpanded ? "rotate(90deg)" : "rotate(0deg)",
+                                }}
+                              />
+                              {isExpanded ? (
+                                <FolderOpen
+                                  className="h-4 w-4 transition-opacity duration-200 group-hover:opacity-0"
+                                  style={
+                                    projectFolderColor ? { color: projectFolderColor } : undefined
+                                  }
+                                />
+                              ) : (
+                                <Folder
+                                  className="h-4 w-4 transition-opacity duration-200 group-hover:opacity-0"
+                                  style={
+                                    projectFolderColor ? { color: projectFolderColor } : undefined
+                                  }
+                                />
+                              )}
+                            </span>
+                          </button>
+                          <div
+                            className="flex min-w-0 flex-1 items-center pr-1"
+                            onContextMenu={(event) => handleOpenProjectMenu(event, projectPath)}
+                          >
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                {isEditingProjectDisplayName ? (
+                                  <input
+                                    value={editingProjectDisplayName}
+                                    autoFocus
+                                    aria-label={`Edit project name for ${projectName}`}
+                                    className="bg-background text-foreground border-border-light h-6 w-full rounded border px-2 text-sm"
+                                    onClick={(event) => event.stopPropagation()}
+                                    onMouseDown={(event) => event.stopPropagation()}
+                                    onContextMenu={(event) => event.stopPropagation()}
+                                    onChange={(event) => {
+                                      setEditingProjectDisplayName(event.target.value);
+                                    }}
+                                    onKeyDown={(event) => {
+                                      stopKeyboardPropagation(event);
+                                      if (event.key === "Escape") {
+                                        event.preventDefault();
+                                        skipNextProjectNameBlurCommitRef.current = true;
+                                        cancelProjectDisplayNameEditing();
+                                        return;
+                                      }
+
+                                      if (event.key === "Enter") {
+                                        event.preventDefault();
+                                        event.currentTarget.blur();
+                                      }
+                                    }}
+                                    onBlur={(event) => {
+                                      event.stopPropagation();
+                                      if (skipNextProjectNameBlurCommitRef.current) {
+                                        skipNextProjectNameBlurCommitRef.current = false;
+                                        return;
+                                      }
+                                      void commitProjectDisplayNameEdit(
+                                        projectPath,
+                                        event.currentTarget.value
+                                      );
+                                    }}
+                                  />
+                                ) : (
+                                  <div className="text-muted-dark flex min-w-0 items-baseline gap-1.5 text-sm">
+                                    <span
+                                      className={cn(
+                                        "min-w-0 flex-1 truncate font-medium",
+                                        projectHasAttention
+                                          ? "text-content-primary"
+                                          : "text-content-secondary"
+                                      )}
+                                    >
+                                      {displayProjectName}
+                                    </span>
+                                    <span
+                                      className={cn(
+                                        "shrink-0 text-xs",
+                                        projectHasAttention
+                                          ? "text-content-secondary"
+                                          : "text-muted"
+                                      )}
+                                    >
+                                      ({projectAgentCount})
+                                    </span>
+                                  </div>
+                                )}
+                              </TooltipTrigger>
+                              <TooltipContent align="start">{projectPath}</TooltipContent>
+                            </Tooltip>
+                          </div>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <button
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  handleAddWorkspace(projectPath);
+                                }}
+                                aria-label={`New chat in ${projectName}`}
+                                data-project-path={projectPath}
+                                className="text-content-secondary hover:bg-hover hover:border-border-light pointer-events-none flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded border border-transparent bg-transparent text-sm leading-none opacity-0 transition-all duration-200 focus-visible:pointer-events-auto focus-visible:opacity-100"
+                              >
+                                <Plus className="h-4 w-4 shrink-0" strokeWidth={1.8} />
+                              </button>
+                            </TooltipTrigger>
+                            <TooltipContent>
+                              New chat ({formatKeybind(KEYBINDS.NEW_WORKSPACE)})
+                            </TooltipContent>
+                          </Tooltip>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <button
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  handleOpenProjectMenu(event, projectPath);
+                                }}
+                                aria-label={`Project options for ${projectName}`}
+                                data-project-path={projectPath}
+                                className={cn(
+                                  "text-content-secondary hover:bg-hover hover:border-border-light flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded border border-transparent bg-transparent transition-all duration-200 focus-visible:pointer-events-auto focus-visible:opacity-100",
+                                  projectContextMenu.isOpen && projectMenuTargetPath === projectPath
+                                    ? "pointer-events-auto opacity-100"
+                                    : "pointer-events-none opacity-0"
+                                )}
+                              >
+                                <EllipsisVertical className="h-4 w-4 shrink-0" strokeWidth={1.8} />
+                              </button>
+                            </TooltipTrigger>
+                            <TooltipContent align="end">Project options</TooltipContent>
+                          </Tooltip>
+                        </DraggableProjectItem>
+
+                        {isExpanded && (
+                          <div
+                            id={workspaceListId}
+                            role="region"
+                            aria-label={`Workspaces for ${projectName}`}
+                            className="pt-1"
+                          >
+                            <ProjectWorkspacesTree
+                              projectPath={projectPath}
+                              projectWorkspaces={projectWorkspaces}
+                              projectName={projectName}
+                              ctx={treeCtx}
+                            />
                           </div>
                         )}
                       </div>
