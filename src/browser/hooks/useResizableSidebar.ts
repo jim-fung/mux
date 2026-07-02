@@ -101,7 +101,7 @@ export function useResizableSidebar({
 
     try {
       return resolveInitialResizableSidebarWidth({
-        storedValue: localStorage.getItem(storageKey),
+        storedValue: readPersistedString(storageKey) ?? null,
         defaultWidth,
         minWidth,
         maxWidth: resolvedMaxWidth,
@@ -137,11 +137,12 @@ export function useResizableSidebar({
     return Math.max(minWidth, resolved);
   }, [maxWidth, minWidth]);
 
-  // Persist width changes to localStorage
+  // Persist once dragging settles so resize stays smooth while preserving the
+  // current behavior for non-drag width changes like layout presets.
   useEffect(() => {
-    if (!enabled) return;
+    if (!enabled || isResizing) return;
     updatePersistedState<number>(storageKey, width);
-  }, [width, storageKey, enabled]);
+  }, [width, storageKey, enabled, isResizing]);
 
   // Keep width in sync when updated externally (e.g., layout presets)
   useEffect(() => {
@@ -229,7 +230,8 @@ export function useResizableSidebar({
 
   /**
    * Handle mouse up to end drag session
-   * Width is already persisted via useEffect, just need to clear drag state
+   * Width persists after drag state clears so we avoid synchronous localStorage
+   * writes on every mousemove while the user is dragging.
    */
   const handleMouseUp = useCallback(() => {
     setIsResizing(false);

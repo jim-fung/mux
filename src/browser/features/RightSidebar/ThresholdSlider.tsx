@@ -1,4 +1,4 @@
-import React, { useRef } from "react";
+import React, { useRef, useState } from "react";
 import {
   AUTO_COMPACTION_THRESHOLD_MIN,
   AUTO_COMPACTION_THRESHOLD_MAX,
@@ -83,6 +83,10 @@ const getTooltipText = (threshold: number): string => {
  */
 export const ThresholdSlider: React.FC<{ config: AutoCompactionConfig }> = ({ config }) => {
   const containerRef = useRef<HTMLDivElement>(null);
+  // Keep the drag preview local so we do not write persisted state and sync IPC
+  // on every pointermove while the user is still adjusting the threshold.
+  const dragThresholdRef = useRef<number | null>(null);
+  const [dragThreshold, setDragThreshold] = useState<number | null>(null);
 
   const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     e.preventDefault();
@@ -94,14 +98,27 @@ export const ThresholdSlider: React.FC<{ config: AutoCompactionConfig }> = ({ co
     const calcPercent = (clientX: number) =>
       snapPercent(((clientX - rect.left) / rect.width) * 100);
 
-    const apply = (pct: number) => applyThreshold(pct, config.setThreshold);
+    const previewThreshold = (pct: number) => {
+      dragThresholdRef.current = pct;
+      setDragThreshold(pct);
+    };
 
-    apply(calcPercent(e.clientX));
+    const commitThreshold = () => {
+      const nextThreshold = dragThresholdRef.current;
+      dragThresholdRef.current = null;
+      setDragThreshold(null);
+
+      if (nextThreshold != null) {
+        applyThreshold(nextThreshold, config.setThreshold);
+      }
+    };
+
+    previewThreshold(calcPercent(e.clientX));
 
     const onMove = (ev: PointerEvent) => {
       if (ev.pointerId !== pointerId) return;
       ev.preventDefault();
-      apply(calcPercent(ev.clientX));
+      previewThreshold(calcPercent(ev.clientX));
     };
 
     const onUp = (ev: PointerEvent) => {
@@ -109,6 +126,7 @@ export const ThresholdSlider: React.FC<{ config: AutoCompactionConfig }> = ({ co
       document.removeEventListener("pointermove", onMove);
       document.removeEventListener("pointerup", onUp);
       document.removeEventListener("pointercancel", onUp);
+      commitThreshold();
     };
 
     document.addEventListener("pointermove", onMove);
@@ -116,9 +134,10 @@ export const ThresholdSlider: React.FC<{ config: AutoCompactionConfig }> = ({ co
     document.addEventListener("pointercancel", onUp);
   };
 
-  const isEnabled = config.threshold < DISABLE_THRESHOLD;
+  const displayThreshold = dragThreshold ?? config.threshold;
+  const isEnabled = displayThreshold < DISABLE_THRESHOLD;
   const color = isEnabled ? "var(--color-plan-mode)" : "var(--color-muted)";
-  const tooltipText = getTooltipText(config.threshold);
+  const tooltipText = getTooltipText(displayThreshold);
 
   // Container styles - covers the full bar area for drag handling
   // Uses pointer-events: none by default, only the indicator handle has pointer-events: auto
@@ -141,7 +160,7 @@ export const ThresholdSlider: React.FC<{ config: AutoCompactionConfig }> = ({ co
     pointerEvents: "auto",
     // Prevent page scrolling while dragging the slider on touch devices.
     touchAction: "none",
-    left: `calc(${config.threshold}% - ${DRAG_ZONE_SIZE}px)`,
+    left: `calc(${displayThreshold}% - ${DRAG_ZONE_SIZE}px)`,
     width: DRAG_ZONE_SIZE * 2,
     top: 0,
     bottom: 0,
@@ -154,7 +173,7 @@ export const ThresholdSlider: React.FC<{ config: AutoCompactionConfig }> = ({ co
     display: "flex",
     alignItems: "center",
     flexDirection: "column",
-    left: `${config.threshold}%`,
+    left: `${displayThreshold}%`,
     top: "50%",
     transform: "translate(-50%, -50%)",
   };
@@ -163,7 +182,11 @@ export const ThresholdSlider: React.FC<{ config: AutoCompactionConfig }> = ({ co
     <div ref={containerRef} style={containerStyle}>
       <Tooltip>
         <TooltipTrigger asChild>
-          <div style={handleStyle} onPointerDown={handlePointerDown} />
+          <div
+            data-testid="auto-compaction-threshold-handle"
+            style={handleStyle}
+            onPointerDown={handlePointerDown}
+          />
         </TooltipTrigger>
         <TooltipContent side="top" showArrow={false}>
           {tooltipText}
