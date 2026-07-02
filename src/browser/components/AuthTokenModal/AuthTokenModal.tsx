@@ -33,27 +33,78 @@ interface GithubLoginStartResponse {
 
 const AUTH_TOKEN_STORAGE_KEY = "mux:auth-token";
 
-export function getStoredAuthToken(): string | null {
+// G — Auth tokens are stored securely via Electron safeStorage (OS keychain)
+// when window.api is available (desktop). In browser/PWA mode, sessionStorage
+// is used instead of localStorage so the token auto-clears when the tab closes,
+// reducing the XSS blast radius.
+export function getStoredAuthToken(): Promise<string | null> {
   try {
-    return localStorage.getItem(AUTH_TOKEN_STORAGE_KEY);
+    if (typeof window !== "undefined" && window.api?.authToken) {
+      return window.api.authToken.get();
+    }
+    // Browser fallback: sessionStorage (shorter XSS window than localStorage)
+    const value = sessionStorage.getItem(AUTH_TOKEN_STORAGE_KEY);
+    return Promise.resolve(value);
+  } catch {
+    return Promise.resolve(null);
+  }
+}
+
+export function setStoredAuthToken(token: string): Promise<void> {
+  try {
+    if (typeof window !== "undefined" && window.api?.authToken) {
+      return window.api.authToken.set(token);
+    }
+    sessionStorage.setItem(AUTH_TOKEN_STORAGE_KEY, token);
+    return Promise.resolve();
+  } catch {
+    return Promise.resolve();
+  }
+}
+
+export function clearStoredAuthToken(): Promise<void> {
+  try {
+    if (typeof window !== "undefined" && window.api?.authToken) {
+      return window.api.authToken.clear();
+    }
+    sessionStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+    return Promise.resolve();
+  } catch {
+    return Promise.resolve();
+  }
+}
+
+/**
+ * Synchronous read for contexts that cannot await (e.g., during initial render).
+ * Uses sessionStorage only — desktop mode should always await getStoredAuthToken().
+ */
+export function getStoredAuthTokenSync(): string | null {
+  try {
+    return sessionStorage.getItem(AUTH_TOKEN_STORAGE_KEY);
   } catch {
     return null;
   }
 }
 
-export function setStoredAuthToken(token: string): void {
+/**
+ * One-time migration: if the new secure store is empty but legacy localStorage
+ * has a token, copy it to the secure store and clear localStorage. Safe to call
+ * multiple times — once localStorage is cleared, it's a no-op.
+ */
+export async function migrateAuthTokenFromLocalStorage(): Promise<void> {
   try {
-    localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, token);
-  } catch {
-    // Ignore storage errors
-  }
-}
+    const legacyToken = localStorage.getItem(AUTH_TOKEN_STORAGE_KEY);
+    if (!legacyToken) return;
 
-export function clearStoredAuthToken(): void {
-  try {
+    // Check if the secure store already has a token (don't overwrite).
+    const existing = await getStoredAuthToken();
+    if (!existing) {
+      await setStoredAuthToken(legacyToken);
+    }
+    // Always clear localStorage regardless — the secure store is now authoritative.
     localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
   } catch {
-    // Ignore storage errors
+    // Best-effort: don't crash startup if migration fails.
   }
 }
 
@@ -95,7 +146,7 @@ export function AuthTokenModal(props: AuthTokenModalProps) {
     (e: React.FormEvent) => {
       e.preventDefault();
       if (token.trim()) {
-        setStoredAuthToken(token.trim());
+        void setStoredAuthToken(token.trim());
         onSubmit(token.trim());
       }
     },
@@ -215,7 +266,7 @@ export function AuthTokenModal(props: AuthTokenModalProps) {
           return;
         }
 
-        clearStoredAuthToken();
+        void clearStoredAuthToken();
         props.onSessionAuthenticated?.();
       } catch (error) {
         if (isAbortError(error)) {

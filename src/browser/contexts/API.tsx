@@ -11,9 +11,10 @@ import { createClient } from "@/common/orpc/client";
 import { RPCLink as WebSocketLink } from "@orpc/client/websocket";
 import { RPCLink as MessagePortLink } from "@orpc/client/message-port";
 import {
-  getStoredAuthToken,
+  getStoredAuthTokenSync,
   setStoredAuthToken,
   clearStoredAuthToken,
+  migrateAuthTokenFromLocalStorage,
 } from "@/browser/components/AuthTokenModal/AuthTokenModal";
 import { getBrowserBackendBaseUrl } from "@/browser/utils/backendBaseUrl";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -187,7 +188,7 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
     const urlParams = new URLSearchParams(window.location.search);
     const urlToken = urlParams.get("token")?.trim();
     if (urlToken) {
-      setStoredAuthToken(urlToken);
+      void setStoredAuthToken(urlToken);
       // Strip token from URL so it doesn't leak into bookmarks, browser
       // history, PWA launch URLs, or Referer headers.
       const cleanUrl = new URL(window.location.href);
@@ -196,8 +197,16 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
       return urlToken;
     }
 
-    return getStoredAuthToken();
+    // Sync read: desktop mode doesn't need the token for ORPC (main injects it
+    // at the MessagePort boundary); browser mode reads from sessionStorage.
+    return getStoredAuthTokenSync();
   });
+
+  // G3 — One-time migration: if legacy localStorage still has a token, move it
+  // to the secure store and clear localStorage. Runs once on mount.
+  useEffect(() => {
+    void migrateAuthTokenFromLocalStorage();
+  }, []);
 
   const cleanupRef = useRef<(() => void) | null>(null);
   const hasConnectedRef = useRef(false);
@@ -317,7 +326,7 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
 
             if (isAuthError) {
               authRequiredRef.current = true;
-              clearStoredAuthToken();
+              void clearStoredAuthToken();
               hasConnectedRef.current = false; // Reset - need fresh auth
               setState({ status: "auth_required", error: token ? "Invalid token" : undefined });
               cleanup();
@@ -352,7 +361,7 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
         // Auth-specific close codes
         if (event.code === 1008 || event.code === 4401) {
           authRequiredRef.current = true;
-          clearStoredAuthToken();
+          void clearStoredAuthToken();
           hasConnectedRef.current = false; // Reset - need fresh auth
           setState({ status: "auth_required", error: "Authentication required" });
           return;
@@ -416,7 +425,7 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
 
               if (result === "requires_auth") {
                 authRequiredRef.current = true;
-                clearStoredAuthToken();
+                void clearStoredAuthToken();
                 hasConnectedRef.current = false; // Reset - need fresh auth
                 setState({ status: "auth_required", error: "Authentication required" });
                 return;
@@ -620,7 +629,7 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
   const authenticate = useCallback(
     (token: string) => {
       authProbeAttemptedRef.current = false;
-      setStoredAuthToken(token);
+      void setStoredAuthToken(token);
       setAuthToken(token);
       connect(token);
     },

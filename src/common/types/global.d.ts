@@ -35,6 +35,13 @@ declare global {
     consumePendingDeepLinks?: () => MuxDeepLinkPayload[];
     // Subscribe to mux:// deep links as they arrive. Returns an unsubscribe function.
     onDeepLink?: (callback: (payload: MuxDeepLinkPayload) => void) => () => void;
+    // Auth-token secure storage (Electron safeStorage + IPC).
+    // In browser mode these are unavailable and sessionStorage is used instead.
+    authToken?: {
+      get: () => Promise<string | null>;
+      set: (token: string) => Promise<void>;
+      clear: () => Promise<void>;
+    };
     // Optional ORPC-backed API surfaces populated in tests/storybook mocks
     tokenizer?: unknown;
     providers?: unknown;

@@ -20,10 +20,11 @@ import { getStoredAuthToken } from "@/browser/components/AuthTokenModal/AuthToke
 import { getBrowserBackendBaseUrl } from "@/browser/utils/backendBaseUrl";
 import { getErrorMessage } from "@/common/utils/errors";
 
-/** Get server auth token from URL query param or localStorage. */
-function getServerAuthToken(): string | null {
+/** Get server auth token from URL query param or secure storage. */
+async function getServerAuthToken(): Promise<string | null> {
   const urlToken = new URLSearchParams(window.location.search).get("token")?.trim();
-  return urlToken?.length ? urlToken : getStoredAuthToken();
+  if (urlToken?.length) return urlToken;
+  return getStoredAuthToken();
 }
 
 type EnrollStatus = "idle" | "starting" | "waiting" | "success" | "error";
@@ -205,7 +206,7 @@ export function GovernorSection() {
       const startUrl = new URL(`${backendBaseUrl}/auth/mux-governor/start`);
       startUrl.searchParams.set("governorUrl", governorOrigin);
 
-      const authToken = getServerAuthToken();
+      const authToken = await getServerAuthToken();
       let json: { authorizeUrl?: unknown; state?: unknown; error?: unknown };
       try {
         const res = await fetch(startUrl.toString(), {

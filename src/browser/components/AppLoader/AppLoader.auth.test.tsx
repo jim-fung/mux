@@ -28,6 +28,7 @@ void mock.module("lottie-react", () => ({
 }));
 
 void mock.module("@/browser/contexts/API", () => ({
+  APIContext: { Provider: ({ children }: { children: React.ReactNode }) => children },
   APIProvider: (props: { children: React.ReactNode }) => props.children,
   useAPI: () => {
     if (apiStatus === "auth_required") {
@@ -58,6 +59,7 @@ void mock.module("@/browser/contexts/API", () => ({
       retry: () => undefined,
     };
   },
+  useOptionalAPI: () => null,
 }));
 
 void mock.module("@/browser/components/LoadingScreen/LoadingScreen", () => ({
@@ -79,11 +81,13 @@ void mock.module("@/browser/components/AuthTokenModal/AuthTokenModal", () => ({
   AuthTokenModal: (props: { error?: string | null }) => (
     <div data-testid="AuthTokenModalMock">{props.error ?? "no-error"}</div>
   ),
-  getStoredAuthToken: () => null,
+  getStoredAuthToken: () => Promise.resolve(null),
+  getStoredAuthTokenSync: () => null,
+  migrateAuthTokenFromLocalStorage: () => Promise.resolve(),
   // eslint-disable-next-line @typescript-eslint/no-empty-function
-  setStoredAuthToken: () => {},
+  setStoredAuthToken: () => Promise.resolve(),
   // eslint-disable-next-line @typescript-eslint/no-empty-function
-  clearStoredAuthToken: () => {},
+  clearStoredAuthToken: () => Promise.resolve(),
 }));
 
 import type { AppLoader as AppLoaderComponent } from "../AppLoader/AppLoader";

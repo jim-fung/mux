@@ -6,9 +6,10 @@ import { CUSTOM_EVENTS } from "@/common/constants/events";
 import { MUX_GATEWAY_SESSION_EXPIRED_MESSAGE } from "@/common/constants/muxGatewayOAuth";
 import { getErrorMessage } from "@/common/utils/errors";
 
-function getServerAuthToken(): string | null {
+async function getServerAuthToken(): Promise<string | null> {
   const urlToken = new URLSearchParams(window.location.search).get("token")?.trim();
-  return urlToken?.length ? urlToken : getStoredAuthToken();
+  if (urlToken?.length) return urlToken;
+  return getStoredAuthToken();
 }
 
 export function MuxGatewaySessionExpiredDialog() {
@@ -79,7 +80,7 @@ export function MuxGatewaySessionExpiredDialog() {
 
       const backendBaseUrl = getBrowserBackendBaseUrl();
       const startUrl = new URL(`${backendBaseUrl}/auth/mux-gateway/start`);
-      const authToken = getServerAuthToken();
+      const authToken = await getServerAuthToken();
 
       let json: { authorizeUrl?: unknown; state?: unknown; error?: unknown };
       try {

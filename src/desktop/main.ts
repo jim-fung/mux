@@ -55,6 +55,7 @@ import {
   dialog,
   nativeImage,
   nativeTheme,
+  safeStorage,
   screen,
   shell,
 } from "electron";
@@ -696,6 +697,55 @@ async function loadServices(): Promise<void> {
     }
 
     return looksLikeWsl;
+  });
+
+  // Auth-token IPC: store the server auth token encrypted via Electron safeStorage
+  // (OS keychain) instead of plaintext in renderer localStorage. The token is only
+  // needed by the renderer for HTTP Bearer calls (OAuth flows, gateway enrollment);
+  // the main ORPC connection injects the header at the MessagePort boundary.
+  const authTokenFile = path.join(config.rootDir, "auth-token.enc");
+
+  electronIpcMain.handle("authToken:get", async () => {
+    try {
+      if (!fs.existsSync(authTokenFile)) return null;
+      const encryptedB64 = fs.readFileSync(authTokenFile, "utf-8").trim();
+      if (!encryptedB64) return null;
+      const encrypted = Buffer.from(encryptedB64, "base64");
+      if (!safeStorage.isEncryptionAvailable()) {
+        // Fallback: treat as plaintext if keychain is unavailable.
+        return encrypted.toString("utf-8");
+      }
+      return safeStorage.decryptString(encrypted);
+    } catch (error) {
+      console.error("[authToken:get] Failed to read encrypted auth token:", error);
+      return null;
+    }
+  });
+
+  electronIpcMain.handle("authToken:set", async (_event, token: string) => {
+    try {
+      if (safeStorage.isEncryptionAvailable()) {
+        const encrypted = safeStorage.encryptString(token);
+        await fsPromises.writeFile(authTokenFile, encrypted.toString("base64"), {
+          mode: 0o600,
+        });
+      } else {
+        // Best-effort fallback for headless/test environments without keychain.
+        await fsPromises.writeFile(authTokenFile, token, { mode: 0o600 });
+      }
+    } catch (error) {
+      console.error("[authToken:set] Failed to persist encrypted auth token:", error);
+    }
+  });
+
+  electronIpcMain.handle("authToken:clear", async () => {
+    try {
+      if (fs.existsSync(authTokenFile)) {
+        await fsPromises.unlink(authTokenFile);
+      }
+    } catch (error) {
+      console.error("[authToken:clear] Failed to remove auth token file:", error);
+    }
   });
 
   electronIpcMain.on("start-orpc-server", (event) => {

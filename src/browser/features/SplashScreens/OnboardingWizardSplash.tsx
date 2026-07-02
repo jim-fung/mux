@@ -56,9 +56,10 @@ interface OAuthMessage {
 
 type MuxGatewayLoginStatus = "idle" | "starting" | "waiting" | "success" | "error";
 
-function getServerAuthToken(): string | null {
+async function getServerAuthToken(): Promise<string | null> {
   const urlToken = new URLSearchParams(window.location.search).get("token")?.trim();
-  return urlToken?.length ? urlToken : getStoredAuthToken();
+  if (urlToken?.length) return urlToken;
+  return getStoredAuthToken();
 }
 
 const KBD_CLASSNAME =
@@ -373,7 +374,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
       setMuxGatewayLoginStatus("starting");
 
       const startUrl = new URL(`${backendBaseUrl}/auth/mux-gateway/start`);
-      const authToken = getServerAuthToken();
+      const authToken = await getServerAuthToken();
 
       let json: { authorizeUrl?: unknown; state?: unknown; error?: unknown };
       try {

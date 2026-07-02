@@ -66,12 +66,16 @@ let fetchImpl: (input: RequestInfo | URL, init?: RequestInit) => Promise<Respons
 // Mock orpc client
 let pingImpl: () => Promise<string> = () => Promise.resolve("pong");
 let storedAuthToken: string | null = null;
-const getStoredAuthTokenMock = mock(() => storedAuthToken);
+const getStoredAuthTokenMock = mock(() => Promise.resolve(storedAuthToken));
+const getStoredAuthTokenSyncMock = mock(() => storedAuthToken);
+const migrateAuthTokenFromLocalStorageMock = mock(() => Promise.resolve());
 const setStoredAuthTokenMock = mock((token: string) => {
   storedAuthToken = token;
+  return Promise.resolve();
 });
 const clearStoredAuthTokenMock = mock(() => {
   storedAuthToken = null;
+  return Promise.resolve();
 });
 
 void mock.module("@/common/orpc/client", () => ({
@@ -95,6 +99,8 @@ void mock.module("@/browser/components/AuthTokenModal/AuthTokenModal", () => ({
   // Export all commonly-used symbols to avoid cross-test import errors.
   AuthTokenModal: () => null,
   getStoredAuthToken: getStoredAuthTokenMock,
+  getStoredAuthTokenSync: getStoredAuthTokenSyncMock,
+  migrateAuthTokenFromLocalStorage: migrateAuthTokenFromLocalStorageMock,
   setStoredAuthToken: setStoredAuthTokenMock,
   clearStoredAuthToken: clearStoredAuthTokenMock,
 }));
@@ -150,6 +156,8 @@ describe("API reconnection", () => {
     pingImpl = () => Promise.resolve("pong");
     storedAuthToken = null;
     getStoredAuthTokenMock.mockClear();
+    getStoredAuthTokenSyncMock.mockClear();
+    migrateAuthTokenFromLocalStorageMock.mockClear();
     setStoredAuthTokenMock.mockClear();
     clearStoredAuthTokenMock.mockClear();
   });

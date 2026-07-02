@@ -72,6 +72,13 @@ contextBridge.exposeInMainWorld("api", {
   // like `child_process` (which can break in hardened/sandboxed environments).
   getIsRosetta: () => ipcRenderer.invoke("mux:get-is-rosetta"),
   getIsWindowsWslShell: () => ipcRenderer.invoke("mux:get-is-windows-wsl-shell"),
+  // Auth-token IPC: encrypted storage via safeStorage (OS keychain) instead of
+  // plaintext localStorage. Renderer requests token via IPC for HTTP Bearer calls.
+  authToken: {
+    get: () => ipcRenderer.invoke("authToken:get") as Promise<string | null>,
+    set: (token: string) => ipcRenderer.invoke("authToken:set", token) as Promise<void>,
+    clear: () => ipcRenderer.invoke("authToken:clear") as Promise<void>,
+  },
   // Register a callback for notification clicks (navigates to workspace)
   // Returns an unsubscribe function.
   onNotificationClicked: (callback: (data: { workspaceId: string }) => void) => {
