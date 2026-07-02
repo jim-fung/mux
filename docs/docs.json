@@ -152,7 +152,9 @@
               "improvement/06-workflow-engine",
               "improvement/07-react-frontend",
               "improvement/08-mobile",
-              "improvement/09-testing-ci-security"
+              "improvement/09-testing-ci-security",
+              "improvement/10-quick-win-optimization-pass",
+              "improvement/11-phase3-complete-elimination"
             ]
           }
         ]
