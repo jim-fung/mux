@@ -281,7 +281,6 @@ const DiagramModal: React.FC<{ children: ReactNode; onClose: () => void }> = ({
 // Mermaid diagram component
 export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
   const { isStreaming } = useContext(StreamingContext);
-  const modalContainerRef = useRef<HTMLDivElement>(null);
   const [error, setError] = useState<string | null>(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [svg, setSvg] = useState<string>("");
@@ -359,14 +358,6 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
       cancelled = true;
     };
   }, [debouncedChart, stableId]);
-
-  // Update modal container when opened
-  useEffect(() => {
-    if (isModalOpen && modalContainerRef.current && svg) {
-      // SECURITY AUDIT: svg state only stores sanitizeMermaidSvg() output.
-      modalContainerRef.current.innerHTML = svg;
-    }
-  }, [isModalOpen, svg]);
 
   if (error && !isStreaming) {
     return (
@@ -451,8 +442,9 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
       </div>
       {isModalOpen && (
         <DiagramModal onClose={() => setIsModalOpen(false)}>
+          {/* SECURITY AUDIT: displaySvg is produced by sanitizeMermaidSvg(), which
+              strips active SVG/HTML content. Same sink pattern as the inline view. */}
           <div
-            ref={modalContainerRef}
             className="mermaid-container mermaid-modal"
             style={{
               background: "var(--color-code-bg)",
@@ -461,6 +453,7 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
               minWidth: "80vw",
               minHeight: "60vh",
             }}
+            dangerouslySetInnerHTML={{ __html: displaySvg }}
           />
         </DiagramModal>
       )}

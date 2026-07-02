@@ -235,7 +235,8 @@ function WorkspaceScreenInner({
     if (effectiveThinkingLevel === thinkingLevel) {
       return;
     }
-    void setThinkingLevel(effectiveThinkingLevel);
+    // Best-effort: keep persisted thinking level compatible with the selected model.
+    setThinkingLevel(effectiveThinkingLevel).catch(() => {});
   }, [effectiveThinkingLevel, thinkingLevel, setThinkingLevel]);
   const [suppressCommandSuggestions, setSuppressCommandSuggestions] = useState(false);
   const setInputWithSuggestionGuard = useCallback((next: string) => {
@@ -513,11 +514,11 @@ function WorkspaceScreenInner({
       : null;
 
     if (nextModel && nextModel !== model) {
-      void setModel(nextModel);
+      setModel(nextModel).catch(() => {});
     }
 
     if (effectiveThinking && effectiveThinking !== thinkingLevel) {
-      void setThinkingLevel(effectiveThinking);
+      setThinkingLevel(effectiveThinking).catch(() => {});
     }
   }, [
     workspaceId,
@@ -807,7 +808,9 @@ function WorkspaceScreenInner({
       if (nextMode === mode) {
         return;
       }
-      void setMode(nextMode);
+      setMode(nextMode).catch(() => {
+        showToast({ title: "Failed to save", message: "Could not update mode.", tone: "error" });
+      });
     },
     [mode, setMode]
   );
@@ -819,21 +822,29 @@ function WorkspaceScreenInner({
         return;
       }
 
-      void setThinkingLevel(effective).then(() => {
-        if (!workspaceId) {
-          return;
-        }
+      setThinkingLevel(effective)
+        .then(() => {
+          if (!workspaceId) {
+            return;
+          }
 
-        client.workspace
-          .updateAgentAISettings({
-            workspaceId,
-            agentId: mode,
-            aiSettings: { model, thinkingLevel: effective },
-          })
-          .catch(() => {
-            // Best-effort only.
+          client.workspace
+            .updateAgentAISettings({
+              workspaceId,
+              agentId: mode,
+              aiSettings: { model, thinkingLevel: effective },
+            })
+            .catch(() => {
+              // Best-effort only.
+            });
+        })
+        .catch(() => {
+          showToast({
+            title: "Failed to save",
+            message: "Could not update thinking level.",
+            tone: "error",
           });
-      });
+        });
     },
     [client, getMinimum, model, mode, thinkingLevel, setThinkingLevel, workspaceId]
   );
@@ -842,7 +853,13 @@ function WorkspaceScreenInner({
     if (!supportsBeta1MContext) {
       return;
     }
-    void setUse1MContext(!use1MContext);
+    setUse1MContext(!use1MContext).catch(() => {
+      showToast({
+        title: "Failed to save",
+        message: "Could not toggle 1M context.",
+        tone: "error",
+      });
+    });
   }, [supportsBeta1MContext, use1MContext, setUse1MContext]);
 
   const handleCancelEdit = useCallback(() => {

@@ -105,6 +105,8 @@ async function writeSetting(workspaceId: string, setting: string, value: string)
     if (process.env.NODE_ENV !== "production") {
       console.warn(`Failed to write setting ${setting}:`, error);
     }
+    // Re-throw so callers can react (e.g. skip the optimistic state update).
+    throw error;
   }
 }
 
@@ -218,19 +220,21 @@ export function useWorkspaceSettings(workspaceId: string): {
     };
   }, [workspaceId]);
 
-  // Setters
+  // Setters — persist first, then update React state so UI never leads disk.
+  // If the write fails the promise rejects and the state stays consistent with
+  // what's actually stored.
   const setMode = useCallback(
     async (newMode: WorkspaceMode) => {
-      setModeState(newMode);
       await writeSetting(workspaceId, "mode", newMode);
+      setModeState(newMode);
     },
     [workspaceId]
   );
 
   const setThinkingLevel = useCallback(
     async (level: ThinkingLevel) => {
-      setThinkingLevelState(level);
       await writeSetting(workspaceId, "reasoning", level);
+      setThinkingLevelState(level);
     },
     [workspaceId]
   );
@@ -238,16 +242,16 @@ export function useWorkspaceSettings(workspaceId: string): {
   const setModel = useCallback(
     async (newModel: string) => {
       assertKnownModelId(newModel);
-      setModelState(newModel);
       await writeSetting(workspaceId, "model", newModel);
+      setModelState(newModel);
     },
     [workspaceId]
   );
 
   const setUse1MContext = useCallback(
     async (enabled: boolean) => {
-      setUse1MContextState(enabled);
       await writeSetting(workspaceId, "use1MContext", enabled ? "true" : "false");
+      setUse1MContextState(enabled);
     },
     [workspaceId]
   );
