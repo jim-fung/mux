@@ -62,7 +62,9 @@ import {
   EyeOff,
   ChevronDown,
   HeartPulse,
+  Pin,
 } from "lucide-react";
+import { isWorkspacePinnable, isWorkspacePinned } from "@/common/utils/pin";
 import { WorkspaceStatusIndicator } from "../WorkspaceStatusIndicator/WorkspaceStatusIndicator";
 import { ArchiveIcon } from "../icons/ArchiveIcon/ArchiveIcon";
 import { WorkspaceTerminalIcon } from "../icons/WorkspaceTerminalIcon/WorkspaceTerminalIcon";
@@ -74,6 +76,7 @@ import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { WorkspaceHeartbeatModal } from "../WorkspaceHeartbeatModal";
 import { WorkspaceActionsMenuContent } from "../WorkspaceActionsMenuContent/WorkspaceActionsMenuContent";
 import { useAPI } from "@/browser/contexts/API";
+import { useWorkspaceActionsOptional } from "@/browser/contexts/WorkspaceContext";
 
 export interface WorkspaceSelection {
   projectPath: string;
@@ -481,6 +484,10 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
   const isGeneratingTitle = generatingTitleWorkspaceIds.has(workspaceId);
   const isPendingAutoTitle = metadata.pendingAutoTitle === true;
   const { api } = useAPI();
+  // Route pin toggles through the context wrapper: it applies an optimistic
+  // pinnedAt (instant reorder on click) and works with mock API clients.
+  // Optional because stories/tests render this row without WorkspaceProvider.
+  const setWorkspacePinned = useWorkspaceActionsOptional()?.setWorkspacePinned;
 
   // Local state for title editing
   const [editingTitle, setEditingTitle] = useState<string>("");
@@ -514,6 +521,8 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
       ? `${groupLabel} · ${workspaceTitle}`
       : workspaceTitle;
   const isEditing = editingWorkspaceId === workspaceId;
+  const isPinned = isWorkspacePinned(metadata);
+  const isPinnable = isWorkspacePinnable(metadata);
   const [heartbeatModalOpen, setHeartbeatModalOpen] = useState(false);
   const overflowMenuButtonRef = useRef<HTMLButtonElement | null>(null);
   const overflowMenuFrameRef = useRef<number | null>(null);
@@ -1002,6 +1011,16 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
                     onForkChat={(anchorEl) => {
                       void onForkWorkspace(workspaceId, anchorEl);
                     }}
+                    onTogglePinned={
+                      isPinnable && setWorkspacePinned
+                        ? () => {
+                            // Fire-and-forget: optimistic reorder happens synchronously
+                            // inside setWorkspacePinned; errors are logged there.
+                            void setWorkspacePinned(workspaceId, !isPinned);
+                          }
+                        : null
+                    }
+                    isPinned={isPinned}
                     onArchiveChat={(anchorEl) => {
                       void onArchiveWorkspace(workspaceId, anchorEl);
                     }}
@@ -1109,6 +1128,9 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
 
             {!isInitializing && !isEditing && (
               <div className="flex items-center gap-1">
+                {isPinned && (
+                  <Pin className="text-muted h-3 w-3 shrink-0" aria-label="Pinned" role="img" />
+                )}
                 {shouldShowInlineArchivingStatus ? (
                   <div
                     className="text-muted flex shrink-0 items-center gap-1 text-xs whitespace-nowrap"

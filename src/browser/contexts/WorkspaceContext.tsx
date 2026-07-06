@@ -447,6 +447,10 @@ export interface WorkspaceContext extends WorkspaceMetadataContextValue {
     workspaceId: string,
     newTitle: string
   ) => Promise<{ success: boolean; error?: string }>;
+  setWorkspacePinned: (
+    workspaceId: string,
+    pinned: boolean
+  ) => Promise<{ success: boolean; error?: string }>;
   preflightArchiveWorkspace: (
     workspaceId: string
   ) => Promise<{ success: boolean; error?: string; data?: ArchivePreflightResult }>;
@@ -1452,6 +1456,68 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     [api]
   );
 
+  /**
+   * Pin or unpin a chat. Applies an optimistic pinnedAt locally so the row
+   * moves on click, even over slow connections; the workspace metadata
+   * subscription round-trip then reconciles all clients with the server's
+   * authoritative monotonic timestamp (and reverts on failure).
+   */
+  const setWorkspacePinned = useCallback(
+    async (workspaceId: string, pinned: boolean): Promise<{ success: boolean; error?: string }> => {
+      if (!api) return { success: false, error: "API not connected" };
+
+      let previousPinnedAt: string | undefined;
+      let applied = false;
+      setWorkspaceMetadata((prev) => {
+        const meta = prev.get(workspaceId);
+        if (!meta || Boolean(meta.pinnedAt) === pinned) return prev;
+        previousPinnedAt = meta.pinnedAt;
+        applied = true;
+        // Mirror the server's append-only ordering: strictly greater than every
+        // existing pin in the same project so rapid pins stay in click order.
+        let optimisticPinnedAt: string | undefined;
+        if (pinned) {
+          let pinnedAtMs = Date.now();
+          for (const other of prev.values()) {
+            if (other.projectPath !== meta.projectPath || !other.pinnedAt) continue;
+            const otherMs = new Date(other.pinnedAt).getTime();
+            if (Number.isFinite(otherMs) && otherMs >= pinnedAtMs) pinnedAtMs = otherMs + 1;
+          }
+          optimisticPinnedAt = new Date(pinnedAtMs).toISOString();
+        }
+        const next = new Map(prev);
+        next.set(workspaceId, { ...meta, pinnedAt: optimisticPinnedAt });
+        return next;
+      });
+      const revert = () => {
+        if (!applied) return;
+        setWorkspaceMetadata((prev) => {
+          const meta = prev.get(workspaceId);
+          if (!meta) return prev;
+          const next = new Map(prev);
+          next.set(workspaceId, { ...meta, pinnedAt: previousPinnedAt });
+          return next;
+        });
+      };
+
+      try {
+        const result = await api.workspace.setPinned({ workspaceId, pinned });
+        if (result.success) {
+          return { success: true };
+        }
+        revert();
+        console.error("Failed to update workspace pin state:", result.error);
+        return { success: false, error: result.error };
+      } catch (error) {
+        revert();
+        const errorMessage = getErrorMessage(error);
+        console.error("Failed to update workspace pin state:", errorMessage);
+        return { success: false, error: errorMessage };
+      }
+    },
+    [api, setWorkspaceMetadata]
+  );
+
   const preflightArchiveWorkspace = useCallback(
     async (
       workspaceId: string
@@ -1840,6 +1906,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       createWorkspace,
       removeWorkspace,
       updateWorkspaceTitle,
+      setWorkspacePinned,
       preflightArchiveWorkspace,
       archiveWorkspace,
       unarchiveWorkspace,
@@ -1864,6 +1931,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       createWorkspace,
       removeWorkspace,
       updateWorkspaceTitle,
+      setWorkspacePinned,
       preflightArchiveWorkspace,
       archiveWorkspace,
       unarchiveWorkspace,
@@ -1922,6 +1990,17 @@ export function useWorkspaceActions(): Omit<
     throw new Error("useWorkspaceActions must be used within WorkspaceProvider");
   }
   return context;
+}
+
+/**
+ * Like useWorkspaceActions, but returns undefined outside WorkspaceProvider.
+ * For components (e.g. AgentListItem) that are also rendered in Storybook or
+ * tests without the full provider tree.
+ */
+export function useWorkspaceActionsOptional():
+  | Omit<WorkspaceContext, "workspaceMetadata" | "loading" | "loaded" | "loadError">
+  | undefined {
+  return useContext(WorkspaceActionsContext) ?? undefined;
 }
 
 /**
