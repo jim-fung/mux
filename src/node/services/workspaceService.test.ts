@@ -2,6 +2,7 @@ import { describe, expect, test, mock, beforeEach, afterEach, spyOn, type Mock }
 import { WorkspaceService, generateForkBranchName, generateForkTitle } from "./workspaceService";
 import type { IdleCompactionOutcome } from "./idleCompactionService";
 import type { AgentSession } from "./agentSession";
+import { askUserQuestionManager } from "./askUserQuestionManager";
 import { WorkspaceLifecycleHooks } from "./workspaceLifecycleHooks";
 import { EventEmitter } from "events";
 import * as fsPromises from "fs/promises";
@@ -3645,6 +3646,8 @@ describe("WorkspaceService sendMessage status clearing", () => {
   let cleanupHistory: () => Promise<void>;
   let fakeSession: {
     isBusy: ReturnType<typeof mock>;
+    hasQueuedMessages: ReturnType<typeof mock>;
+    dropQueuedMessageWithOnlyDedupeKey: ReturnType<typeof mock>;
     queueMessage: ReturnType<typeof mock>;
     sendMessage: ReturnType<typeof mock>;
     resumeStream: ReturnType<typeof mock>;
@@ -3715,6 +3718,8 @@ describe("WorkspaceService sendMessage status clearing", () => {
 
     fakeSession = {
       isBusy: mock(() => true),
+      hasQueuedMessages: mock(() => false),
+      dropQueuedMessageWithOnlyDedupeKey: mock(() => false),
       queueMessage: mock(() => "tool-end" as const),
       sendMessage: mock(() => Promise.resolve(Ok(undefined))),
       resumeStream: mock(() => Promise.resolve(Ok({ started: true }))),
@@ -3999,6 +4004,143 @@ describe("WorkspaceService sendMessage status clearing", () => {
     expect(result.success).toBe(true);
     expect(fakeSession.queueMessage).toHaveBeenCalled();
     expect(resetAutoResumeCount).not.toHaveBeenCalled();
+  });
+
+  test("synthetic queued sends leave a pending interactive question intact", async () => {
+    fakeSession.isBusy.mockReturnValue(true);
+
+    const questionPromise = askUserQuestionManager.registerPending("test-workspace", "tool-q1", [
+      {
+        question: "Proceed?",
+        header: "Next",
+        options: [
+          { label: "Yes", description: "Continue" },
+          { label: "No", description: "Stop" },
+        ],
+        multiSelect: false,
+      },
+    ]);
+    // Attach handler before cleanup cancel so Bun does not flag an unhandled rejection.
+    const settled = questionPromise.catch((error: unknown) => error);
+
+    try {
+      const result = await workspaceService.sendMessage(
+        "test-workspace",
+        "[Heartbeat] scheduled check-in",
+        { model: "openai:gpt-4o-mini", agentId: "exec", queueDispatchMode: "turn-end" },
+        { synthetic: true, skipAutoResumeReset: true }
+      );
+
+      expect(result.success).toBe(true);
+      expect(fakeSession.queueMessage).toHaveBeenCalled();
+      // A backend-initiated maintenance send is not a user response: the prompt survives.
+      expect(askUserQuestionManager.getLatestPending("test-workspace")?.toolCallId).toBe("tool-q1");
+    } finally {
+      askUserQuestionManager.cancel("test-workspace", "tool-q1", "test cleanup");
+      await settled;
+    }
+  });
+
+  // The heartbeat caller's queue-emptiness check happens before sendMessage's internal
+  // awaits (pricing gate, settings persistence), so a user send can queue in that window.
+  // yieldToQueuedMessages re-checks at the enqueue point: queued messages own the slot.
+  test("yieldToQueuedMessages drops the send when messages queued during preparation", async () => {
+    fakeSession.isBusy.mockReturnValue(true);
+    fakeSession.hasQueuedMessages.mockReturnValue(true);
+
+    const result = await workspaceService.sendMessage(
+      "test-workspace",
+      "[Heartbeat] scheduled check-in",
+      { model: "openai:gpt-4o-mini", agentId: "exec", queueDispatchMode: "turn-end" },
+      { synthetic: true, skipAutoResumeReset: true, yieldToQueuedMessages: true }
+    );
+
+    // Quiet success: the slot is consumed, but nothing is enqueued over the user's message.
+    expect(result.success).toBe(true);
+    expect(fakeSession.queueMessage).not.toHaveBeenCalled();
+  });
+
+  // The reverse race: a heartbeat queued first must not absorb a later real message —
+  // MessageQueue batches texts under the first entry's muxMetadata, so input queued behind
+  // a heartbeat would dispatch tagged as a heartbeat. New input supersedes the heartbeat.
+  test("queued sends supersede a pending queued heartbeat before enqueueing", async () => {
+    fakeSession.isBusy.mockReturnValue(true);
+    fakeSession.dropQueuedMessageWithOnlyDedupeKey.mockReturnValue(true);
+
+    const result = await workspaceService.sendMessage("test-workspace", "real user input", {
+      model: "openai:gpt-4o-mini",
+      agentId: "exec",
+    });
+
+    expect(result.success).toBe(true);
+    expect(fakeSession.dropQueuedMessageWithOnlyDedupeKey).toHaveBeenCalledWith(
+      "heartbeat-request"
+    );
+    // The user message still queues normally after the heartbeat is dropped.
+    expect(fakeSession.queueMessage).toHaveBeenCalled();
+  });
+
+  test("a queued heartbeat send does not supersede itself", async () => {
+    fakeSession.isBusy.mockReturnValue(true);
+
+    const result = await workspaceService.sendMessage(
+      "test-workspace",
+      "[Heartbeat] scheduled check-in",
+      { model: "openai:gpt-4o-mini", agentId: "exec", queueDispatchMode: "turn-end" },
+      {
+        synthetic: true,
+        skipAutoResumeReset: true,
+        queueDedupeKey: "heartbeat-request",
+        yieldToQueuedMessages: true,
+      }
+    );
+
+    expect(result.success).toBe(true);
+    expect(fakeSession.dropQueuedMessageWithOnlyDedupeKey).not.toHaveBeenCalled();
+  });
+
+  test("yieldToQueuedMessages still queues into an empty queue", async () => {
+    fakeSession.isBusy.mockReturnValue(true);
+    fakeSession.hasQueuedMessages.mockReturnValue(false);
+
+    const result = await workspaceService.sendMessage(
+      "test-workspace",
+      "[Heartbeat] scheduled check-in",
+      { model: "openai:gpt-4o-mini", agentId: "exec", queueDispatchMode: "turn-end" },
+      { synthetic: true, skipAutoResumeReset: true, yieldToQueuedMessages: true }
+    );
+
+    expect(result.success).toBe(true);
+    expect(fakeSession.queueMessage).toHaveBeenCalled();
+  });
+
+  test("non-synthetic queued sends cancel a pending interactive question", async () => {
+    fakeSession.isBusy.mockReturnValue(true);
+
+    const questionPromise = askUserQuestionManager.registerPending("test-workspace", "tool-q1", [
+      {
+        question: "Proceed?",
+        header: "Next",
+        options: [
+          { label: "Yes", description: "Continue" },
+          { label: "No", description: "Stop" },
+        ],
+        multiSelect: false,
+      },
+    ]);
+    // Attach handler before the send cancels the question, avoiding an unhandled rejection.
+    const settled = questionPromise.catch((error: unknown) => error);
+
+    const result = await workspaceService.sendMessage("test-workspace", "hello", {
+      model: "openai:gpt-4o-mini",
+      agentId: "exec",
+    });
+
+    expect(result.success).toBe(true);
+    expect(fakeSession.queueMessage).toHaveBeenCalled();
+    // A real user message supersedes the question: it is canceled before queueing.
+    expect(askUserQuestionManager.getLatestPending("test-workspace")).toBeNull();
+    expect(await settled).toBeInstanceOf(Error);
   });
 
   test("backgrounds foreground task waits when queuing a tool-end message", async () => {

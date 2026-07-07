@@ -145,6 +145,23 @@ export class MessageQueue {
   }
 
   /**
+   * Whether a message queued via {@link addOnce} with this dedupe key is still pending.
+   * Keys reset when the queue is cleared (drain or user clear).
+   */
+  hasDedupeKey(dedupeKey: string): boolean {
+    return this.dedupeKeys.has(dedupeKey);
+  }
+
+  /**
+   * Whether the queue's only content is the single entry queued under this dedupe key.
+   * Used to supersede low-value scheduled entries (heartbeats): a later real message must
+   * not batch behind them, because batching would adopt the first entry's muxMetadata.
+   */
+  holdsOnlyDedupeKey(dedupeKey: string): boolean {
+    return this.queuedEntryCount === 1 && this.dedupeKeys.has(dedupeKey);
+  }
+
+  /**
    * Add a message to the queue once, keyed by dedupeKey.
    * Returns true if the message was queued.
    */

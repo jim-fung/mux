@@ -3,6 +3,8 @@ import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 
 import type * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
+import type * as APIModule from "@/browser/contexts/API";
+import { overlayWorkspaceStoreRaw } from "@/browser/stores/workspaceStoreTestOverlay";
 
 interface MockWorkspaceState {
   autoRetryStatus:
@@ -92,7 +94,15 @@ const setAutoRetryEnabled = mock((input: unknown) => {
   });
 });
 
+/* eslint-disable @typescript-eslint/no-require-imports */
+const actualAPI = require("@/browser/contexts/API?real=1") as typeof APIModule;
+/* eslint-enable @typescript-eslint/no-require-imports */
+
+// Spread the real module: replacing it outright deletes exports like APIContext that
+// later-evaluated test files import statically, crashing them at load (module mocks are
+// process-wide and bun evaluates every test file before running tests).
 void mock.module("@/browser/contexts/API", () => ({
+  ...actualAPI,
   useAPI: () => ({
     api: {
       workspace: {
@@ -112,17 +122,24 @@ const actualWorkspaceStore =
   require("@/browser/stores/WorkspaceStore?real=1") as typeof WorkspaceStoreModule;
 /* eslint-enable @typescript-eslint/no-require-imports */
 
+// Overlay (not replace) the raw store: bun evaluates every test file before running tests
+// and static import bindings freeze at eval time, so this file-scope mock is what any
+// later-evaluated file in the same bun process gets forever. A bare fake missing store
+// methods breaks those files' cleanup and cascades.
 void mock.module("@/browser/stores/WorkspaceStore", () => ({
   ...actualWorkspaceStore,
   useWorkspaceState: () => currentWorkspaceState,
-  useWorkspaceStoreRaw: () => ({
-    getWorkspaceState: (_workspaceId: string) => currentWorkspaceState,
-  }),
+  useWorkspaceStoreRaw: () =>
+    overlayWorkspaceStoreRaw(actualWorkspaceStore.useWorkspaceStoreRaw(), {
+      getWorkspaceState: (_workspaceId: string) => currentWorkspaceState,
+    }),
 }));
 
-void mock.module("@/browser/hooks/usePersistedState", () => ({
-  usePersistedState: () => [false, () => undefined] as const,
-}));
+// No usePersistedState module mock: the real hook returns [false, setter] for the unset
+// vim key in a fresh happy-dom localStorage (what the old fake hardcoded), and a partial
+// module replacement here leaks process-wide (bun evaluates every test file before running
+// tests), turning later-evaluated suites' persistence into no-ops (seen as GeneralSection
+// CI failures).
 
 import { RetryBarrier } from "./RetryBarrier";
 

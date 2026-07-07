@@ -181,8 +181,15 @@ import {
   HEARTBEAT_DEFAULT_MESSAGE_BODY,
   HEARTBEAT_MAX_INTERVAL_MS,
   HEARTBEAT_MIN_INTERVAL_MS,
+  HEARTBEAT_QUEUE_DEDUPE_KEY,
   HEARTBEAT_RESET_BOUNDARY_MESSAGE,
+  formatHeartbeatInterval,
+  isHeartbeatTrigger,
+  isHeartbeatWhenBusy,
+  isValidHeartbeatScheduleUpdatedAt,
+  resolveHeartbeatSchedulePolicy,
   type HeartbeatContextMode,
+  type HeartbeatSchedulePolicy,
 } from "@/constants/heartbeat";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import {
@@ -293,6 +300,7 @@ interface HeartbeatWorkspaceConfigEntry {
 }
 interface HeartbeatExecutionRequest {
   contextMode: HeartbeatContextMode;
+  schedulePolicy: HeartbeatSchedulePolicy;
   sendOptions: SendMessageOptions;
   heartbeatPrompt: string;
   muxMetadata: Extract<MuxMessageMetadata, { type: "heartbeat-request" }>;
@@ -481,6 +489,14 @@ function normalizeHeartbeatSettings(
     intervalMs: sanitizeHeartbeatIntervalMs(settings.intervalMs, defaultIntervalMs),
     contextMode: sanitizeHeartbeatContextMode(settings.contextMode),
     ...(message != null ? { message } : {}),
+    // trigger/whenBusy stay sparse: unset values are never materialized so read-time
+    // defaulting (resolveHeartbeatSchedulePolicy) keeps working and "never touched"
+    // remains distinguishable from an explicit choice.
+    ...(isHeartbeatTrigger(settings.trigger) ? { trigger: settings.trigger } : {}),
+    ...(isHeartbeatWhenBusy(settings.whenBusy) ? { whenBusy: settings.whenBusy } : {}),
+    ...(isValidHeartbeatScheduleUpdatedAt(settings.scheduleUpdatedAt)
+      ? { scheduleUpdatedAt: settings.scheduleUpdatedAt }
+      : {}),
   };
 }
 
@@ -4636,6 +4652,16 @@ export class WorkspaceService extends EventEmitter {
           isHeartbeatContextMode(settings.contextMode),
         "Heartbeat context mode must be a supported value when provided"
       );
+      const hasTriggerUpdate = Object.prototype.hasOwnProperty.call(settings, "trigger");
+      assert(
+        !hasTriggerUpdate || settings.trigger == null || isHeartbeatTrigger(settings.trigger),
+        "Heartbeat trigger must be a supported value when provided"
+      );
+      const hasWhenBusyUpdate = Object.prototype.hasOwnProperty.call(settings, "whenBusy");
+      assert(
+        !hasWhenBusyUpdate || settings.whenBusy == null || isHeartbeatWhenBusy(settings.whenBusy),
+        "Heartbeat whenBusy must be a supported value when provided"
+      );
 
       const resolved = this.resolveHeartbeatWorkspaceEntry(workspaceId, "setHeartbeatSettings");
       if (!resolved.success) {
@@ -4651,16 +4677,45 @@ export class WorkspaceService extends EventEmitter {
       const nextMessage = hasMessageUpdate
         ? sanitizeHeartbeatMessage(settings.message)
         : currentSettings?.message;
+      // trigger/whenBusy mirror the `message` pattern (not `contextMode`): a present key with
+      // null clears back to unset, an absent key preserves, and unset is never materialized
+      // into config so read-time defaulting stays intact (see resolveHeartbeatSchedulePolicy).
+      const nextTrigger = hasTriggerUpdate
+        ? (settings.trigger ?? undefined)
+        : currentSettings?.trigger;
+      const nextWhenBusy = hasWhenBusyUpdate
+        ? (settings.whenBusy ?? undefined)
+        : currentSettings?.whenBusy;
+      const nextEnabled = hasEnabledUpdate ? settings.enabled! : (currentSettings?.enabled ?? true);
+      const nextIntervalMs = hasIntervalUpdate
+        ? settings.intervalMs!
+        : (currentSettings?.intervalMs ?? defaultIntervalMs);
+      // Server-managed cadence-edit stamp: fixed-interval restart anchoring uses
+      // max(last persisted firing, scheduleUpdatedAt), so a heartbeat fired under the
+      // previous schedule cannot bypass this edit (HeartbeatService's
+      // deriveInitialIntervalNextEligibleAt). Only cadence-affecting fields count —
+      // resolved trigger, not raw, so an explicit no-op like null→"idle" does not
+      // re-anchor (mirroring ensureTrackedWorkspace's live re-anchor conditions).
+      const interactionTimestamp = Date.now();
+      const cadenceChanged =
+        currentSettings?.enabled !== nextEnabled ||
+        currentSettings?.intervalMs !== nextIntervalMs ||
+        resolveHeartbeatSchedulePolicy(currentSettings ?? undefined).trigger !==
+          resolveHeartbeatSchedulePolicy({ trigger: nextTrigger, whenBusy: nextWhenBusy }).trigger;
+      const nextScheduleUpdatedAt = cadenceChanged
+        ? interactionTimestamp
+        : currentSettings?.scheduleUpdatedAt;
       // Keep the interval on disk even when disabled so re-enabling restores the user's choice.
       const nextSettings: WorkspaceHeartbeatSettings = {
-        enabled: hasEnabledUpdate ? settings.enabled! : (currentSettings?.enabled ?? true),
-        intervalMs: hasIntervalUpdate
-          ? settings.intervalMs!
-          : (currentSettings?.intervalMs ?? defaultIntervalMs),
+        enabled: nextEnabled,
+        intervalMs: nextIntervalMs,
         contextMode: hasContextModeUpdate
           ? sanitizeHeartbeatContextMode(settings.contextMode)
           : (currentSettings?.contextMode ?? HEARTBEAT_DEFAULT_CONTEXT_MODE),
         ...(nextMessage != null ? { message: nextMessage } : {}),
+        ...(nextTrigger != null ? { trigger: nextTrigger } : {}),
+        ...(nextWhenBusy != null ? { whenBusy: nextWhenBusy } : {}),
+        ...(nextScheduleUpdatedAt != null ? { scheduleUpdatedAt: nextScheduleUpdatedAt } : {}),
       };
 
       const changed =
@@ -4668,7 +4723,9 @@ export class WorkspaceService extends EventEmitter {
         workspaceEntry.heartbeat?.intervalMs !== nextSettings.intervalMs ||
         workspaceEntry.heartbeat?.message !== nextSettings.message ||
         sanitizeHeartbeatContextMode(workspaceEntry.heartbeat?.contextMode) !==
-          nextSettings.contextMode;
+          nextSettings.contextMode ||
+        (workspaceEntry.heartbeat?.trigger ?? undefined) !== nextSettings.trigger ||
+        (workspaceEntry.heartbeat?.whenBusy ?? undefined) !== nextSettings.whenBusy;
       if (!changed) {
         return Ok(nextSettings);
       }
@@ -4679,7 +4736,6 @@ export class WorkspaceService extends EventEmitter {
       // Changing heartbeat settings is a real user interaction. Persist that recency before
       // emitting metadata so restarts preserve the post-config-change first-fire deadline
       // instead of rebuilding from an older completed turn.
-      const interactionTimestamp = Date.now();
       await this.updateRecencyTimestamp(normalizedWorkspaceId, interactionTimestamp);
       await this.emitCurrentWorkspaceMetadata(normalizedWorkspaceId);
 
@@ -7374,6 +7430,16 @@ export class WorkspaceService extends EventEmitter {
       startStreamInBackground?: boolean;
       /** When true, reject instead of queueing if the workspace is busy. */
       requireIdle?: boolean;
+      /** Coalescing for queued sends: drop the message when the same key is already queued. */
+      queueDedupeKey?: string;
+      /**
+       * For queued sends: quietly drop the message (success) when other messages are already
+       * queued at enqueue time. Scheduled heartbeats use this so a user send racing the awaits
+       * in this method keeps queue ownership — MessageQueue dispatches with the latest queued
+       * options, so merging a heartbeat in would run the user's queued turn with the
+       * heartbeat's model/agent.
+       */
+      yieldToQueuedMessages?: boolean;
     }
   ): Promise<Result<void, SendMessageError>> {
     log.debug("sendMessage handler: Received", {
@@ -7511,7 +7577,14 @@ export class WorkspaceService extends EventEmitter {
           });
         }
 
-        const pendingAskUserQuestion = askUserQuestionManager.getLatestPending(workspaceId);
+        // A pending interactive question is only moot when the user actually responds in
+        // chat. Backend-initiated synthetic sends (scheduled heartbeats, task wakes) are
+        // not user responses — canceling would destroy a user-facing prompt and record a
+        // misleading cancel reason, so synthetic sends queue behind the question instead.
+        const pendingAskUserQuestion =
+          internal?.synthetic === true
+            ? null
+            : askUserQuestionManager.getLatestPending(workspaceId);
         if (pendingAskUserQuestion) {
           try {
             askUserQuestionManager.cancel(
@@ -7528,6 +7601,31 @@ export class WorkspaceService extends EventEmitter {
           }
         }
 
+        // The reverse of yieldToQueuedMessages below: a pending scheduled heartbeat must
+        // never absorb real input. MessageQueue batches later texts under the first entry's
+        // muxMetadata, so a message queued behind a heartbeat would dispatch tagged (and
+        // displayed) as a heartbeat. New input supersedes the check-in instead — the
+        // heartbeat is periodic and its next slot will fire anyway.
+        if (
+          internal?.queueDedupeKey !== HEARTBEAT_QUEUE_DEDUPE_KEY &&
+          session.dropQueuedMessageWithOnlyDedupeKey(HEARTBEAT_QUEUE_DEDUPE_KEY)
+        ) {
+          log.info("sendMessage: dropped pending queued heartbeat superseded by new input", {
+            workspaceId,
+          });
+        }
+
+        // Re-check queue emptiness at the enqueue point: the caller's decision may be stale
+        // by now (the pricing/settings awaits above yield the event loop, so a user send can
+        // queue first). Everything from here to queueMessage is synchronous, so this check
+        // cannot go stale again.
+        if (internal?.yieldToQueuedMessages === true && session.hasQueuedMessages()) {
+          log.info("sendMessage: yielded to messages queued during send preparation", {
+            workspaceId,
+          });
+          return Ok(undefined);
+        }
+
         // Background any foreground task waits so the queued message can dispatch promptly.
         // This must happen after queueMessage succeeds — if enqueue fails (throws),
         // we must not cancel foreground waits. Use the queue's effective dispatch mode
@@ -7535,10 +7633,20 @@ export class WorkspaceService extends EventEmitter {
         const effectiveQueueDispatchMode = session.queueMessage(message, normalizedOptions, {
           synthetic: internal?.synthetic,
           agentInitiated: internal?.agentInitiated,
+          dedupeKey: internal?.queueDedupeKey,
           onCanceled: internal?.onCanceled,
           onAccepted: internal?.onAccepted,
           onAcceptedPreStreamFailure: internal?.onAcceptedPreStreamFailure,
         });
+
+        // A dedupe-keyed send that raced an already-pending duplicate is a quiet success:
+        // the pending queue entry already covers it (coalescing), so don't double-queue.
+        if (effectiveQueueDispatchMode == null && internal?.queueDedupeKey != null) {
+          log.info("sendMessage: dropped duplicate queued message for dedupe key", {
+            workspaceId,
+            queueDedupeKey: internal.queueDedupeKey,
+          });
+        }
 
         if (effectiveQueueDispatchMode != null && !internal?.skipAutoResumeReset) {
           this.taskService?.resetAutoResumeCount?.(workspaceId);
@@ -9617,15 +9725,42 @@ export class WorkspaceService extends EventEmitter {
 
     const heartbeatRequest = await this.buildHeartbeatRequest(workspaceId);
     const session = this.getOrCreateSession(workspaceId);
-    if (session.isBusy()) {
-      throw new Error(
-        "Failed to execute heartbeat: Workspace is busy; idle-only send was skipped."
-      );
-    }
-    if (session.hasQueuedMessages()) {
-      throw new Error(
-        "Failed to execute heartbeat: Workspace has queued user input; idle-only send was skipped."
-      );
+    if (heartbeatRequest.schedulePolicy.whenBusy === "skip") {
+      // Idle-only delivery (default): a busy workspace misses this slot entirely.
+      if (session.isBusy()) {
+        throw new Error(
+          "Failed to execute heartbeat: Workspace is busy; idle-only send was skipped."
+        );
+      }
+      if (session.hasQueuedMessages()) {
+        throw new Error(
+          "Failed to execute heartbeat: Workspace has queued user input; idle-only send was skipped."
+        );
+      }
+    } else {
+      // Queue modes deliver through the message queue only while a turn is actively
+      // streaming. A non-empty queue instead wins the slot outright: merging a heartbeat
+      // into queued user input would clobber that queue's send options (MessageQueue
+      // dispatches with the latest options, so the user's queued turn could run with the
+      // heartbeat's model/agent), and parking a heartbeat in an idle session's queue
+      // deadlocks descendant-task terminal wake-ups — they defer while the owner has
+      // queued messages, and an idle queue only drains at the next turn boundary, which
+      // would then never come. This also coalesces: a still-pending queued heartbeat is
+      // itself a queued message, so the next firing consumes its slot quietly here.
+      if (session.hasQueuedMessages()) {
+        log.info("Skipped heartbeat enqueue: queued messages own the next turn", {
+          workspaceId,
+          hadQueuedHeartbeat: session.hasQueuedDedupeKey(HEARTBEAT_QUEUE_DEDUPE_KEY),
+        });
+        return;
+      }
+      if (session.isBusy()) {
+        await this.queueHeartbeatMessage(workspaceId, heartbeatRequest);
+        return;
+      }
+      // Active descendant tasks alone leave the session idle — fall through to immediate
+      // dispatch: the child's terminal wake defers during the heartbeat turn and delivers
+      // right after it, so nothing is preempted and nothing deadlocks.
     }
 
     log.info("Executing heartbeat", {
@@ -9670,7 +9805,7 @@ export class WorkspaceService extends EventEmitter {
   }
 
   private async buildHeartbeatRequest(workspaceId: string): Promise<HeartbeatExecutionRequest> {
-    const { sendOptions, heartbeatMessage, contextMode } =
+    const { sendOptions, heartbeatMessage, contextMode, schedulePolicy, intervalMs } =
       await this.buildHeartbeatSendOptions(workspaceId);
 
     const activity = await this.extensionMetadata.getSnapshot(workspaceId);
@@ -9679,7 +9814,13 @@ export class WorkspaceService extends EventEmitter {
         ? Math.max(0, Date.now() - activity.recency)
         : HEARTBEAT_DEFAULT_INTERVAL_MS;
     const idleDuration = this.formatIdleDuration(idleMs);
-    const heartbeatLead = `[Heartbeat] This workspace has been idle for approximately ${idleDuration}.`;
+    // Fixed-interval heartbeats are wall-clock scheduled, so "idle for approximately X"
+    // would be wrong (the workspace may not have been idle at all). Only the lead varies by
+    // trigger; the custom `message` override still replaces only the body, never the lead.
+    const heartbeatLead =
+      schedulePolicy.trigger === "interval"
+        ? `[Scheduled heartbeat] This is a scheduled check-in that fires every ${formatHeartbeatInterval(intervalMs)}.`
+        : `[Heartbeat] This workspace has been idle for approximately ${idleDuration}.`;
     const heartbeatBody = heartbeatMessage ?? HEARTBEAT_DEFAULT_MESSAGE_BODY;
     const heartbeatPrompt = `${heartbeatLead} ${heartbeatBody}`;
 
@@ -9693,10 +9834,14 @@ export class WorkspaceService extends EventEmitter {
       source: "heartbeat",
       requestedModel: sendOptions.model,
       displayStatus: { emoji: "💓", message: "Heartbeat check..." },
+      // The slot's fire time. Queue-mode deliveries persist the history row after the
+      // busy turn ends, so restart anchoring reads this instead of the row timestamp.
+      firedAt: Date.now(),
     };
 
     return {
       contextMode,
+      schedulePolicy,
       sendOptions,
       heartbeatPrompt,
       muxMetadata,
@@ -9711,25 +9856,101 @@ export class WorkspaceService extends EventEmitter {
     };
   }
 
-  private async dispatchHeartbeatMessage(
+  /**
+   * Deliver a heartbeat that fired while a turn was actively streaming through the message
+   * queue. Only used for whenBusy queue modes ("tool-end" / "turn-end"); the caller has
+   * already ruled out queued messages (a non-empty queue wins the slot instead).
+   */
+  private async queueHeartbeatMessage(
     workspaceId: string,
     heartbeatRequest: HeartbeatExecutionRequest
   ): Promise<void> {
+    const whenBusy = heartbeatRequest.schedulePolicy.whenBusy;
+    assert(whenBusy !== "skip", "queueHeartbeatMessage requires a queue whenBusy mode");
+
+    // The awaiting_interactive_input eligibility gate only sees committed history, but a
+    // mid-stream ask_user_question lives in partial.json until the turn commits — so the
+    // delivery path must re-check the live manager. A scheduled check-in must never disturb
+    // a user-facing prompt; consume the slot quietly instead (like the coalescing skip).
+    if (askUserQuestionManager.getLatestPending(workspaceId) != null) {
+      log.info("Skipped heartbeat enqueue: an interactive question is pending", {
+        workspaceId,
+      });
+      return;
+    }
+
+    // compact/reset boundaries cannot be applied mid-turn, so a busy firing downgrades to a
+    // plain queued message for this slot. Idle firings keep honoring contextMode.
+    if (heartbeatRequest.contextMode !== "normal") {
+      log.info("Busy heartbeat delivery downgrades contextMode to normal for this firing", {
+        workspaceId,
+        contextMode: heartbeatRequest.contextMode,
+      });
+    }
+
+    log.info("Queueing heartbeat for busy workspace", {
+      workspaceId,
+      queueDispatchMode: whenBusy,
+    });
+
     const sendResult = await this.sendMessage(
       workspaceId,
       heartbeatRequest.heartbeatPrompt,
       {
         ...heartbeatRequest.sendOptions,
         muxMetadata: heartbeatRequest.muxMetadata,
+        queueDispatchMode: whenBusy,
       },
       {
         // Heartbeats run in background; avoid mutating auto-resume counters.
         skipAutoResumeReset: true,
         // Backend-initiated maintenance turn: do not treat as explicit user re-engagement.
         synthetic: true,
-        // If the workspace became active after eligibility checks, skip instead of queueing
-        // stale maintenance work for later.
-        requireIdle: true,
+        // If the stream ends between the caller's isBusy check and this send, the message
+        // dispatches immediately — the workspace is idle then, so that is the right outcome.
+        // The dedupe key guards the opposite race: a heartbeat queued mid-flight coalesces
+        // instead of double-queueing.
+        queueDedupeKey: HEARTBEAT_QUEUE_DEDUPE_KEY,
+        // And if a user send queued during this method's awaits, it owns the slot — the
+        // caller's queue-emptiness check is re-verified at the enqueue point.
+        yieldToQueuedMessages: true,
+      }
+    );
+
+    if (!sendResult.success) {
+      throw new Error(
+        `Failed to execute heartbeat: ${this.formatSendMessageError(sendResult.error)}`
+      );
+    }
+  }
+
+  private async dispatchHeartbeatMessage(
+    workspaceId: string,
+    heartbeatRequest: HeartbeatExecutionRequest
+  ): Promise<void> {
+    const whenBusy = heartbeatRequest.schedulePolicy.whenBusy;
+    const sendResult = await this.sendMessage(
+      workspaceId,
+      heartbeatRequest.heartbeatPrompt,
+      {
+        ...heartbeatRequest.sendOptions,
+        muxMetadata: heartbeatRequest.muxMetadata,
+        // Queue whenBusy modes tolerate a busy race between the idle check and this send:
+        // the heartbeat queues at the requested boundary instead of being dropped.
+        ...(whenBusy !== "skip" ? { queueDispatchMode: whenBusy } : {}),
+      },
+      {
+        // Heartbeats run in background; avoid mutating auto-resume counters.
+        skipAutoResumeReset: true,
+        // Backend-initiated maintenance turn: do not treat as explicit user re-engagement.
+        synthetic: true,
+        // whenBusy "skip": if the workspace became active after eligibility checks, skip
+        // instead of queueing stale maintenance work for later. Queue modes instead queue on
+        // that race, deduped against an already-pending heartbeat and yielding to any user
+        // input that queued first (queued messages own the slot).
+        ...(whenBusy === "skip"
+          ? { requireIdle: true }
+          : { queueDedupeKey: HEARTBEAT_QUEUE_DEDUPE_KEY, yieldToQueuedMessages: true }),
       }
     );
 
@@ -9795,6 +10016,8 @@ export class WorkspaceService extends EventEmitter {
     sendOptions: SendMessageOptions;
     heartbeatMessage: string | undefined;
     contextMode: HeartbeatContextMode;
+    schedulePolicy: HeartbeatSchedulePolicy;
+    intervalMs: number;
   }> {
     const config = this.config.loadConfigOrDefault();
     const workspaceMatch = this.config.findWorkspace(workspaceId);
@@ -9894,6 +10117,11 @@ export class WorkspaceService extends EventEmitter {
         sanitizeHeartbeatMessage(workspaceEntry?.heartbeat?.message) ??
         sanitizeHeartbeatMessage(config.heartbeatDefaultPrompt),
       contextMode: sanitizeHeartbeatContextMode(workspaceEntry?.heartbeat?.contextMode),
+      schedulePolicy: resolveHeartbeatSchedulePolicy(workspaceEntry?.heartbeat),
+      intervalMs: sanitizeHeartbeatIntervalMs(
+        workspaceEntry?.heartbeat?.intervalMs,
+        this.getHeartbeatDefaultIntervalMsFromConfig(config)
+      ),
     };
   }
 

@@ -3,6 +3,9 @@ import { cleanup, fireEvent, render } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 
 import type * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
+import type * as ModelsFromSettingsModule from "@/browser/hooks/useModelsFromSettings";
+import type * as APIModule from "@/browser/contexts/API";
+import { overlayWorkspaceStoreRaw } from "@/browser/stores/workspaceStoreTestOverlay";
 
 interface MockWorkspaceState {
   canInterrupt: boolean;
@@ -64,19 +67,32 @@ const actualWorkspaceStore =
   require("@/browser/stores/WorkspaceStore?real=1") as typeof WorkspaceStoreModule;
 /* eslint-enable @typescript-eslint/no-require-imports */
 
+// Overlay (not replace) the raw store: bun evaluates every test file before running tests
+// and static import bindings freeze at eval time, so this file-scope mock is what any
+// later-evaluated file in the same bun process gets forever. A bare fake missing store
+// methods breaks those files' cleanup and cascades.
 void mock.module("@/browser/stores/WorkspaceStore", () => ({
   ...actualWorkspaceStore,
   useWorkspaceState: () => currentWorkspaceState,
   useWorkspaceAggregator: () => ({
     hasInterruptingStream: () => hasInterruptingStream,
   }),
-  useWorkspaceStoreRaw: () => ({
-    setInterrupting,
-  }),
+  useWorkspaceStoreRaw: () =>
+    overlayWorkspaceStoreRaw(actualWorkspaceStore.useWorkspaceStoreRaw(), {
+      setInterrupting,
+    }),
   useWorkspaceStreamingStats: () => currentStreamingStats,
 }));
 
+/* eslint-disable @typescript-eslint/no-require-imports */
+const actualAPI = require("@/browser/contexts/API?real=1") as typeof APIModule;
+/* eslint-enable @typescript-eslint/no-require-imports */
+
+// Spread the real module: replacing it outright deletes exports like APIContext that
+// later-evaluated test files import statically, crashing them at load (module mocks are
+// process-wide and bun evaluates every test file before running tests).
 void mock.module("@/browser/contexts/API", () => ({
+  ...actualAPI,
   useAPI: () => ({
     api: {
       workspace: {
@@ -103,14 +119,21 @@ void mock.module("@/browser/contexts/SettingsContext", () => ({
   }),
 }));
 
-void mock.module("@/browser/hooks/usePersistedState", () => ({
-  readPersistedState: function <T>(_key: string, defaultValue: T): T {
-    return defaultValue;
-  },
-  readPersistedString: () => null,
-}));
+// No usePersistedState module mock: in a fresh happy-dom localStorage the real
+// readPersistedState/readPersistedString already return the defaults this suite relied on,
+// and a partial module replacement here leaks process-wide (bun evaluates every test file
+// before running tests), deleting exports that later-evaluated suites need (seen as
+// GeneralSection/MemoryTab CI failures).
 
+/* eslint-disable @typescript-eslint/no-require-imports */
+const actualModelsFromSettings =
+  require("@/browser/hooks/useModelsFromSettings?real=1") as typeof ModelsFromSettingsModule;
+/* eslint-enable @typescript-eslint/no-require-imports */
+
+// Spread the real module: this suite only pins getDefaultModel (its assertions expect
+// "openai:gpt-4o-mini"); replacing the whole module would leak missing exports.
 void mock.module("@/browser/hooks/useModelsFromSettings", () => ({
+  ...actualModelsFromSettings,
   getDefaultModel: () => "openai:gpt-4o-mini",
 }));
 
