@@ -4,6 +4,7 @@ import type { APIClient } from "@/browser/contexts/API";
 import type { ConfirmDialogOptions } from "@/browser/contexts/ConfirmDialogContext";
 import { getContextResetSuccessMessage } from "@/browser/utils/contextResetFeedback";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
+import type { PinnedMoveDirection } from "@/browser/utils/ui/pinnedReorder";
 import { THINKING_LEVELS, type ThinkingLevel } from "@/common/types/thinking";
 import {
   enforceThinkingPolicy,
@@ -106,6 +107,7 @@ export interface BuildSourcesParams {
   onRemoveProject: (path: string) => void;
   onToggleSidebar: () => void;
   onNavigateWorkspace: (dir: "next" | "prev") => void;
+  onMovePinnedChat: (direction: PinnedMoveDirection) => void;
   onOpenWorkspaceInTerminal: (workspaceId: string, runtimeConfig?: RuntimeConfig) => void;
   onToggleTheme: () => void;
   onSetTheme: (theme: ThemePreference) => void;
@@ -476,6 +478,26 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
             });
           },
         });
+        if (pinned) {
+          // Edge positions are handled inside the move handler (no-op), so the
+          // commands stay listed whenever the chat is pinned.
+          list.push({
+            id: CommandIds.workspaceMovePinnedUp(),
+            title: "Move Pinned Chat Up",
+            subtitle: workspaceDisplayName,
+            shortcutHint: formatKeybind(KEYBINDS.MOVE_PINNED_UP),
+            section: section.workspaces,
+            run: () => p.onMovePinnedChat("up"),
+          });
+          list.push({
+            id: CommandIds.workspaceMovePinnedDown(),
+            title: "Move Pinned Chat Down",
+            subtitle: workspaceDisplayName,
+            shortcutHint: formatKeybind(KEYBINDS.MOVE_PINNED_DOWN),
+            section: section.workspaces,
+            run: () => p.onMovePinnedChat("down"),
+          });
+        }
       }
     }
 

@@ -2,7 +2,7 @@ import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { ProjectConfig } from "@/common/types/project";
 import { hasCompletedAgentReport } from "@/common/utils/agentTaskCompletion";
 import { assert } from "@/common/utils/assert";
-import { isWorkspacePinned } from "@/common/utils/pin";
+import { comparePinnedOrder, isWorkspacePinned } from "@/common/utils/pin";
 
 interface WorkspaceGroupConfig {
   id: string;
@@ -652,14 +652,7 @@ export function buildSortedWorkspacesByProject(
         return aPinned ? -1 : 1;
       }
       if (aPinned && bPinned) {
-        const aPinnedAtRaw = Date.parse(a.pinnedAt ?? "");
-        const bPinnedAtRaw = Date.parse(b.pinnedAt ?? "");
-        const aPinnedAt = Number.isFinite(aPinnedAtRaw) ? aPinnedAtRaw : 0;
-        const bPinnedAt = Number.isFinite(bPinnedAtRaw) ? bPinnedAtRaw : 0;
-        if (aPinnedAt !== bPinnedAt) {
-          return aPinnedAt - bPinnedAt;
-        }
-        return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+        return comparePinnedOrder(a, b);
       }
 
       const aTimestamp = workspaceRecency[a.id] ?? 0;
@@ -694,6 +687,32 @@ export function buildSortedWorkspacesByProject(
   }
 
   return result;
+}
+
+/**
+ * Order rows for the flat Multi-Project section. The rows are collected across
+ * per-primary-project buckets of the sorted map, so without this pass two
+ * pinned multi-project chats with different primary projects would render in
+ * bucket order and a cross-primary pinned reorder would visually snap back.
+ * Pinned roots float to the top in global pinnedAt order (matching every other
+ * pinned block); unpinned rows keep their collected relative order (stable
+ * sort), and the tree flatten restores sub-agent adjacency under parents.
+ *
+ * Shared by the sidebar renderer and pinned-reorder block resolution so drag
+ * targets always match what is on screen.
+ */
+export function orderMultiProjectSectionRows(
+  rows: FrontendWorkspaceMetadata[]
+): FrontendWorkspaceMetadata[] {
+  const sorted = rows.slice().sort((a, b) => {
+    const aPinned = isWorkspacePinned(a);
+    const bPinned = isWorkspacePinned(b);
+    if (aPinned !== bPinned) {
+      return aPinned ? -1 : 1;
+    }
+    return aPinned && bPinned ? comparePinnedOrder(a, b) : 0;
+  });
+  return flattenWorkspaceTree(sorted);
 }
 
 /**
