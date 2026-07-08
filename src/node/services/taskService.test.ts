@@ -220,10 +220,10 @@ async function saveTestConfig(
   projects: Array<[string, ProjectConfig]>,
   overrides: TestConfigOverrides = {}
 ): Promise<void> {
-  await config.saveConfig({
+  await config.editConfig(() => ({
     projects: new Map(projects),
     ...overrides,
-  });
+  }));
 }
 
 async function saveWorkspaces(
@@ -4785,7 +4785,7 @@ describe("TaskService", () => {
       },
     ];
 
-    await config.saveConfig({
+    await config.editConfig(() => ({
       projects: new Map([
         [
           primaryProjectPath,
@@ -4818,7 +4818,7 @@ describe("TaskService", () => {
         [secondaryProjectPath, { trusted: true, workspaces: [] }],
       ]),
       taskSettings: { maxParallelAgentTasks: 1, maxTaskNestingDepth: 3 },
-    });
+    }));
 
     await config.updateProjectSecrets(primaryProjectPath, [
       { key: "PRIMARY_SECRET", value: "primary-secret" },
@@ -5336,7 +5336,7 @@ describe("TaskService", () => {
       },
     ];
 
-    await config.saveConfig({
+    await config.editConfig(() => ({
       projects: new Map([
         [
           primaryProjectPath,
@@ -5369,7 +5369,7 @@ describe("TaskService", () => {
         [secondaryProjectPath, { trusted: true, workspaces: [] }],
       ]),
       taskSettings: { maxParallelAgentTasks: 1, maxTaskNestingDepth: 3 },
-    });
+    }));
 
     await config.editConfig((cfg) => {
       const secondaryProject = cfg.projects.get(secondaryProjectPath);
@@ -9813,6 +9813,407 @@ describe("TaskService", () => {
       }),
       expect.objectContaining({ synthetic: true })
     );
+  });
+
+  // Archive mock that mirrors the real WorkspaceService.archive persistence effect
+  // (sets archivedAt in config) so tests can assert the sidebar-relevant state rather
+  // than only mock call counts.
+  function createConfigMutatingArchiveMock(getConfig: () => Config) {
+    return mock(async (workspaceId: string): Promise<Result<{ kind: "archived" }>> => {
+      await getConfig().editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          const workspace = project.workspaces.find((w) => w.id === workspaceId);
+          if (workspace) workspace.archivedAt = new Date().toISOString();
+        }
+        return cfg;
+      });
+      return Ok({ kind: "archived" });
+    });
+  }
+
+  test("markWorkflowRunEnded archives interrupted workflow children and blocked reported ancestors", async () => {
+    const config = await createTestConfig(rootDir);
+
+    const projectPath = path.join(rootDir, "repo");
+    const rootId = "root-run-ended";
+    const reportedParentId = "reported-parent-blocked";
+    const interruptedChildId = "interrupted-child-no-report";
+    const completedChildId = "completed-leaf-child";
+    const userInterruptedId = "user-spawned-interrupted";
+    const workflowRunId = "wfr_ended_garbage_sweep";
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", rootId),
+        // Reported workflow-owned task blocked by the structural-leaf topology gate:
+        // its interrupted-without-report child keeps hasChildAgentTasks true forever.
+        projectWorkspace(projectPath, "reported-parent", reportedParentId, {
+          name: "agent_exec_reported_parent",
+          parentWorkspaceId: rootId,
+          agentId: "exec",
+          agentType: "exec",
+          taskStatus: "reported",
+          reportedAt: "2026-05-29T00:00:02.000Z",
+          taskModelString: defaultModel,
+          workflowTask: { runId: workflowRunId, stepId: "parent" },
+        }),
+        // Interrupted WITHOUT a completed report: canCleanupReportedTask never accepts
+        // it, so before the sweep it lingered in the active sidebar forever.
+        projectWorkspace(projectPath, "interrupted-child", interruptedChildId, {
+          name: "agent_explore_interrupted",
+          parentWorkspaceId: reportedParentId,
+          agentId: "explore",
+          agentType: "explore",
+          taskStatus: "interrupted",
+          taskModelString: defaultModel,
+        }),
+        // Completed-report leaf: must go through the existing remove-based cleanup,
+        // not the archive path.
+        projectWorkspace(projectPath, "completed-child", completedChildId, {
+          name: "agent_explore_completed",
+          parentWorkspaceId: rootId,
+          agentId: "explore",
+          agentType: "explore",
+          taskStatus: "reported",
+          reportedAt: "2026-05-29T00:00:03.000Z",
+          taskModelString: defaultModel,
+          workflowTask: { runId: workflowRunId, stepId: "completed" },
+        }),
+        // User-spawned interrupted task (no workflowTask in ancestry): intentionally
+        // stays visible for manual inspection.
+        projectWorkspace(projectPath, "user-interrupted", userInterruptedId, {
+          name: "agent_explore_user",
+          parentWorkspaceId: rootId,
+          agentId: "explore",
+          agentType: "explore",
+          taskStatus: "interrupted",
+          taskModelString: defaultModel,
+        }),
+      ],
+      testTaskSettings(10, 3)
+    );
+
+    const archive = createConfigMutatingArchiveMock(() => config);
+    const remove = mock(async (workspaceId: string): Promise<Result<void>> => {
+      await config.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          const index = project.workspaces.findIndex((w) => w.id === workspaceId);
+          if (index !== -1) project.workspaces.splice(index, 1);
+        }
+        return cfg;
+      });
+      return Ok(undefined);
+    });
+    const { aiService } = createAIServiceMocks(config, { isStreaming: mock(() => false) });
+    const { workspaceService } = createWorkspaceServiceMocks({ archive, remove });
+    const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
+
+    await taskService.markWorkflowRunEnded(workflowRunId);
+
+    // Interrupted-without-report workflow child: archived (hidden from the active
+    // sidebar) but preserved, still interrupted.
+    const interruptedChild = findWorkspaceInConfig(config, interruptedChildId);
+    expect(interruptedChild?.archivedAt).toBeString();
+    expect(interruptedChild?.taskStatus).toBe("interrupted");
+
+    // Completed-report leaf: removed via the existing cleanup walk, never archived.
+    expect(findWorkspaceInConfig(config, completedChildId)).toBeUndefined();
+
+    // Reported ancestor blocked only by its archived interrupted child: archived too,
+    // so the garbage cluster leaves the active sidebar without deleting anything.
+    const reportedParent = findWorkspaceInConfig(config, reportedParentId);
+    expect(reportedParent?.archivedAt).toBeString();
+    expect(reportedParent?.taskStatus).toBe("reported");
+
+    // User-spawned interrupted task keeps current behavior: visible, untouched.
+    const userInterrupted = findWorkspaceInConfig(config, userInterruptedId);
+    expect(userInterrupted?.archivedAt).toBeUndefined();
+    expect(userInterrupted?.taskStatus).toBe("interrupted");
+  });
+
+  test("terminateAllDescendantAgentTasks archives run-scoped interrupted children immediately", async () => {
+    const config = await createTestConfig(rootDir);
+
+    const projectPath = path.join(rootDir, "repo");
+    const rootId = "root-run-interrupt";
+    const workflowChildId = "workflow-running-child";
+    const userChildId = "user-running-child";
+    const workflowRunId = "wfr_interrupt_sweep";
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", rootId),
+        projectWorkspace(projectPath, "workflow-child", workflowChildId, {
+          name: "agent_explore_workflow",
+          parentWorkspaceId: rootId,
+          agentId: "explore",
+          agentType: "explore",
+          taskStatus: "running",
+          taskModelString: defaultModel,
+          workflowTask: { runId: workflowRunId, stepId: "child" },
+        }),
+        projectWorkspace(projectPath, "user-child", userChildId, {
+          name: "agent_explore_user",
+          parentWorkspaceId: rootId,
+          agentId: "explore",
+          agentType: "explore",
+          taskStatus: "running",
+          taskModelString: defaultModel,
+        }),
+      ],
+      testTaskSettings(10, 3)
+    );
+
+    const archive = createConfigMutatingArchiveMock(() => config);
+    const { aiService } = createAIServiceMocks(config, { isStreaming: mock(() => false) });
+    const { workspaceService } = createWorkspaceServiceMocks({ archive });
+    const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
+
+    // Run-scoped interrupt (WorkflowService.interruptRun path): the sweep archives the
+    // freshly interrupted workflow child even if the runner's onRunEnded hook already
+    // fired before the children were interrupted.
+    await taskService.terminateAllDescendantAgentTasks(rootId, { workflowRunId });
+
+    const workflowChild = findWorkspaceInConfig(config, workflowChildId);
+    expect(workflowChild?.taskStatus).toBe("interrupted");
+    expect(workflowChild?.archivedAt).toBeString();
+
+    // The run-scoped filter leaves the user-spawned sibling running and unarchived.
+    const userChild = findWorkspaceInConfig(config, userChildId);
+    expect(userChild?.taskStatus).toBe("running");
+    expect(userChild?.archivedAt).toBeUndefined();
+  });
+
+  test("sweep keeps an ancestor visible when a descendant archive is skipped", async () => {
+    // Regression (PR #3694 Codex P2): a child archive skipped by the lossy-untracked-file
+    // confirmation (or a failed archive) must block its ancestors' archives too —
+    // otherwise the parent gets hidden while its unarchived child stays active in the
+    // sidebar as an orphan.
+    const config = await createTestConfig(rootDir);
+
+    const projectPath = path.join(rootDir, "repo");
+    const rootId = "root-skip-blocks-ancestor";
+    const parentTaskId = "interrupted-parent-task";
+    const childTaskId = "interrupted-child-lossy";
+    const workflowRunId = "wfr_skip_blocks_ancestor";
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", rootId),
+        projectWorkspace(projectPath, "interrupted-parent", parentTaskId, {
+          name: "agent_exec_parent",
+          parentWorkspaceId: rootId,
+          agentId: "exec",
+          agentType: "exec",
+          taskStatus: "interrupted",
+          taskModelString: defaultModel,
+          workflowTask: { runId: workflowRunId, stepId: "parent" },
+        }),
+        projectWorkspace(projectPath, "interrupted-child", childTaskId, {
+          name: "agent_exec_child",
+          parentWorkspaceId: parentTaskId,
+          agentId: "exec",
+          agentType: "exec",
+          taskStatus: "interrupted",
+          taskModelString: defaultModel,
+        }),
+      ],
+      testTaskSettings(10, 3)
+    );
+
+    // Child archive is deferred pending untracked-file confirmation; parent would archive.
+    const archived: string[] = [];
+    const archive = mock(
+      async (
+        workspaceId: string
+      ): Promise<Result<{ kind: "archived" } | { kind: "confirm-lossy-untracked-files" }>> => {
+        if (workspaceId === childTaskId) {
+          return Ok({ kind: "confirm-lossy-untracked-files" });
+        }
+        await config.editConfig((cfg) => {
+          for (const project of cfg.projects.values()) {
+            const workspace = project.workspaces.find((w) => w.id === workspaceId);
+            if (workspace) workspace.archivedAt = new Date().toISOString();
+          }
+          return cfg;
+        });
+        archived.push(workspaceId);
+        return Ok({ kind: "archived" });
+      }
+    );
+    const { aiService } = createAIServiceMocks(config, { isStreaming: mock(() => false) });
+    const { workspaceService } = createWorkspaceServiceMocks({ archive });
+    const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
+
+    await taskService.markWorkflowRunEnded(workflowRunId);
+
+    // Child stayed visible (confirmation pending) — so the parent must stay visible too.
+    expect(findWorkspaceInConfig(config, childTaskId)?.archivedAt).toBeUndefined();
+    expect(findWorkspaceInConfig(config, parentTaskId)?.archivedAt).toBeUndefined();
+    expect(archived).not.toContain(parentTaskId);
+  });
+
+  test("initialize archives interrupted workflow-owned children of inactive runs but not user-spawned tasks", async () => {
+    const config = await createTestConfig(rootDir);
+
+    const projectPath = path.join(rootDir, "repo");
+    const rootId = "root-startup-sweep";
+    const workflowChildId = "workflow-child-startup";
+    const staleInterruptedId = "workflow-child-stale-interrupted";
+    const userInterruptedId = "user-interrupted-startup";
+    const workflowRunId = "wfr_startup_sweep";
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", rootId),
+        // Running child of an inactive run: the startup prepass transitions it to
+        // "interrupted"; the startup sweep must then archive it.
+        projectWorkspace(projectPath, "workflow-child", workflowChildId, {
+          name: "agent_explore_workflow",
+          parentWorkspaceId: rootId,
+          agentId: "explore",
+          agentType: "explore",
+          taskStatus: "running",
+          taskModelString: defaultModel,
+          workflowTask: { runId: workflowRunId, stepId: "child" },
+        }),
+        // Historical garbage: already interrupted (pre-sweep sessions) — must self-heal.
+        projectWorkspace(projectPath, "stale-interrupted", staleInterruptedId, {
+          name: "agent_explore_stale",
+          parentWorkspaceId: rootId,
+          agentId: "explore",
+          agentType: "explore",
+          taskStatus: "interrupted",
+          taskModelString: defaultModel,
+          workflowTask: { runId: workflowRunId, stepId: "stale" },
+        }),
+        projectWorkspace(projectPath, "user-interrupted", userInterruptedId, {
+          name: "agent_explore_user",
+          parentWorkspaceId: rootId,
+          agentId: "explore",
+          agentType: "explore",
+          taskStatus: "interrupted",
+          taskModelString: defaultModel,
+        }),
+      ],
+      testTaskSettings(10, 3)
+    );
+    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(rootId) });
+    await runStore.createRun({
+      id: workflowRunId,
+      workspaceId: rootId,
+      workflow: {
+        name: "interrupted",
+        description: "Interrupted",
+        scope: "built-in",
+        executable: true,
+      },
+      source: "export default function workflow() { return {}; }\n",
+      args: {},
+      now: "2026-05-29T00:00:00.000Z",
+    });
+    await runStore.appendStatus(workflowRunId, "interrupted", "2026-05-29T00:00:01.000Z");
+
+    const archive = createConfigMutatingArchiveMock(() => config);
+    const { aiService } = createAIServiceMocks(config, { isStreaming: mock(() => false) });
+    const { workspaceService } = createWorkspaceServiceMocks({ archive });
+    const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
+
+    await taskService.initialize();
+
+    // Prepass interrupted the running child; the startup sweep archived both it and
+    // the historical interrupted leftover.
+    for (const taskId of [workflowChildId, staleInterruptedId]) {
+      const workspace = findWorkspaceInConfig(config, taskId);
+      expect(workspace?.taskStatus).toBe("interrupted");
+      expect(workspace?.archivedAt).toBeString();
+    }
+
+    // User-spawned interrupted task keeps current behavior: visible, untouched.
+    const userInterrupted = findWorkspaceInConfig(config, userInterruptedId);
+    expect(userInterrupted?.taskStatus).toBe("interrupted");
+    expect(userInterrupted?.archivedAt).toBeUndefined();
+  });
+
+  test("initialize re-sweeps a run whose interrupted children were archived but reported ancestor was not", async () => {
+    // Regression (PR #3694 Codex P2): crash window between sweep phases. If a previous
+    // session archived the interrupted child (phase 1) but crashed before archiving the
+    // reported ancestor it blocks (phase 2), no unarchived interrupted task remains to
+    // seed the startup sweep — so the reported ancestor stayed visible forever. The
+    // seeding now also considers unarchived reported workflow-owned tasks.
+    const config = await createTestConfig(rootDir);
+
+    const projectPath = path.join(rootDir, "repo");
+    const rootId = "root-crash-window";
+    const reportedParentId = "reported-parent-crash-window";
+    const archivedChildId = "archived-interrupted-child";
+    const workflowRunId = "wfr_crash_window_sweep";
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", rootId),
+        // Phase-2 leftover: reported, unarchived, blocked by its archived child.
+        projectWorkspace(projectPath, "reported-parent", reportedParentId, {
+          name: "agent_exec_reported_parent",
+          parentWorkspaceId: rootId,
+          agentId: "exec",
+          agentType: "exec",
+          taskStatus: "reported",
+          reportedAt: "2026-05-29T00:00:02.000Z",
+          taskModelString: defaultModel,
+          workflowTask: { runId: workflowRunId, stepId: "parent" },
+        }),
+        // Phase-1 result from the crashed session: interrupted child already archived.
+        projectWorkspace(projectPath, "archived-child", archivedChildId, {
+          name: "agent_explore_archived",
+          parentWorkspaceId: reportedParentId,
+          agentId: "explore",
+          agentType: "explore",
+          taskStatus: "interrupted",
+          taskModelString: defaultModel,
+          archivedAt: "2026-05-29T00:00:03.000Z",
+        }),
+      ],
+      testTaskSettings(10, 3)
+    );
+    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(rootId) });
+    await runStore.createRun({
+      id: workflowRunId,
+      workspaceId: rootId,
+      workflow: {
+        name: "interrupted",
+        description: "Interrupted",
+        scope: "built-in",
+        executable: true,
+      },
+      source: "export default function workflow() { return {}; }\n",
+      args: {},
+      now: "2026-05-29T00:00:00.000Z",
+    });
+    await runStore.appendStatus(workflowRunId, "interrupted", "2026-05-29T00:00:01.000Z");
+
+    const archive = createConfigMutatingArchiveMock(() => config);
+    const { aiService } = createAIServiceMocks(config, { isStreaming: mock(() => false) });
+    const { workspaceService } = createWorkspaceServiceMocks({ archive });
+    const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
+
+    await taskService.initialize();
+
+    // The startup sweep re-seeded the run from the unarchived reported ancestor and
+    // archived it (blocked only by its archived child), completing the interrupted sweep.
+    const reportedParent = findWorkspaceInConfig(config, reportedParentId);
+    expect(reportedParent?.archivedAt).toBeString();
+    expect(reportedParent?.taskStatus).toBe("reported");
   });
 
   test("initialize drains queued tasks after interrupting inactive workflow children", async () => {
@@ -15398,7 +15799,7 @@ describe("TaskService", () => {
     if (!childEntry) return;
 
     childEntry.taskModelString = "   ";
-    await config.saveConfig(preCfg);
+    await config.editConfig(() => preCfg);
 
     await internal.handleStreamEnd(makeSuccessfulProposePlanStreamEndEvent(childId));
 
@@ -16648,7 +17049,7 @@ describe("TaskService", () => {
     // This simulates the case where parent workspace name (e.g., from SSH)
     // doesn't correspond to a local branch in the project repository.
     const nonExistentBranchName = "non-existent-branch-xyz";
-    await config.saveConfig({
+    await config.editConfig(() => ({
       projects: new Map([
         [
           projectPath,
@@ -16667,7 +17068,7 @@ describe("TaskService", () => {
         ],
       ]),
       taskSettings: { maxParallelAgentTasks: 3, maxTaskNestingDepth: 3 },
-    });
+    }));
     const { taskService } = createTaskServiceHarness(config);
 
     // Creating a task should succeed by falling back to "main" as trunkBranch
@@ -16700,7 +17101,7 @@ describe("TaskService", () => {
     }
 
     assert(removed, `Expected workspace ${workspaceId} to exist in test config`);
-    await config.saveConfig(cfg);
+    await config.editConfig(() => cfg);
   }
 
   test("reported leaf cleanup deletes the finished leaf but keeps siblings and parents", async () => {
@@ -16712,7 +17113,7 @@ describe("TaskService", () => {
     const childTaskAId = "child-a-333";
     const childTaskBId = "child-b-444";
 
-    await config.saveConfig({
+    await config.editConfig(() => ({
       projects: new Map([
         [
           projectPath,
@@ -16743,7 +17144,7 @@ describe("TaskService", () => {
         ],
       ]),
       taskSettings: { maxParallelAgentTasks: 3, maxTaskNestingDepth: 3 },
-    });
+    }));
 
     const isStreaming = mock(() => false);
     const remove = mock(async (workspaceId: string, _force?: boolean): Promise<Result<void>> => {
@@ -16783,7 +17184,7 @@ describe("TaskService", () => {
     const parentTaskId = "parent-222";
     const childTaskId = "child-a-333";
 
-    await config.saveConfig({
+    await config.editConfig(() => ({
       projects: new Map([
         [
           projectPath,
@@ -16814,7 +17215,7 @@ describe("TaskService", () => {
         ],
       ]),
       taskSettings: { maxParallelAgentTasks: 3, maxTaskNestingDepth: 3 },
-    });
+    }));
 
     const isStreaming = mock(() => false);
     const remove = mock(async (workspaceId: string, _force?: boolean): Promise<Result<void>> => {
@@ -16862,7 +17263,7 @@ describe("TaskService", () => {
     const childTaskId = "child-a-333";
     const completedAt = "2026-03-09T11:05:58.780Z";
 
-    await config.saveConfig({
+    await config.editConfig(() => ({
       projects: new Map([
         [
           projectPath,
@@ -16896,7 +17297,7 @@ describe("TaskService", () => {
         ],
       ]),
       taskSettings: { maxParallelAgentTasks: 3, maxTaskNestingDepth: 3 },
-    });
+    }));
 
     const isStreaming = mock(() => false);
     const remove = mock(async (workspaceId: string, _force?: boolean): Promise<Result<void>> => {
@@ -17341,7 +17742,7 @@ describe("TaskService", () => {
       const rootWorkspaceId = "root-resume-111";
       const childTaskId = "child-resume-222";
 
-      await config.saveConfig({
+      await config.editConfig(() => ({
         projects: new Map([
           [
             projectPath,
@@ -17362,7 +17763,7 @@ describe("TaskService", () => {
           ],
         ]),
         taskSettings: { maxParallelAgentTasks: 3, maxTaskNestingDepth: 3 },
-      });
+      }));
 
       const { aiService } = createAIServiceMocks(config);
       const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
@@ -17440,7 +17841,7 @@ describe("TaskService", () => {
       const rootWorkspaceId = "root-workflow-budget";
       const firstRunId = "wfr_budget_first";
       const secondRunId = "wfr_budget_second";
-      await config.saveConfig({
+      await config.editConfig(() => ({
         projects: new Map([
           [
             projectPath,
@@ -17451,7 +17852,7 @@ describe("TaskService", () => {
           ],
         ]),
         taskSettings: { maxParallelAgentTasks: 3, maxTaskNestingDepth: 3 },
-      });
+      }));
 
       const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(rootWorkspaceId) });
       await runStore.createRun({
@@ -17554,7 +17955,7 @@ describe("TaskService", () => {
       const childA = "child-A";
       const childB = "child-B";
 
-      await config.saveConfig({
+      await config.editConfig(() => ({
         projects: new Map([
           [
             projectPath,
@@ -17582,7 +17983,7 @@ describe("TaskService", () => {
           ],
         ]),
         taskSettings: { maxParallelAgentTasks: 5, maxTaskNestingDepth: 3 },
-      });
+      }));
 
       const { aiService } = createAIServiceMocks(config);
       const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
