@@ -4,10 +4,19 @@ import { DuckDBInstance, type DuckDBConnection } from "@duckdb/node-api";
 import { getErrorMessage } from "@/common/utils/errors";
 import { decideSyncPlan, type SyncAction } from "./backfillDecision";
 import { shouldCheckpointAfterSync } from "./checkpointDecision";
-import { clearWorkspaceAnalyticsState, ingestWorkspace, rebuildAll } from "./etl";
+import {
+  clearWorkspaceAnalyticsState,
+  getCurrentPricingFingerprint,
+  ingestWorkspace,
+  readStoredPricingFingerprint,
+  rebuildAll,
+  statSessionChatHistory,
+  storePricingFingerprint,
+} from "./etl";
 import {
   CREATE_DELEGATION_ROLLUPS_TABLE_SQL,
   CREATE_EVENTS_TABLE_SQL,
+  CREATE_INGEST_META_TABLE_SQL,
   CREATE_WATERMARK_TABLE_SQL,
 } from "./schemaSql";
 import { discoverAllWorkspaces } from "./workspaceDiscovery";
@@ -131,6 +140,7 @@ async function handleInit(data: InitData): Promise<void> {
   await activeConn.run(CREATE_EVENTS_TABLE_SQL);
   await activeConn.run(CREATE_WATERMARK_TABLE_SQL);
   await activeConn.run(CREATE_DELEGATION_ROLLUPS_TABLE_SQL);
+  await activeConn.run(CREATE_INGEST_META_TABLE_SQL);
   for (const migrationSql of EVENTS_COLUMN_MIGRATIONS_SQL) {
     await activeConn.run(migrationSql);
   }
@@ -155,7 +165,11 @@ async function handleRebuildAll(data: RebuildAllData): Promise<{ workspacesInges
     );
   }
 
-  return rebuildAll(getConn(), data.sessionsDir, data.workspaceMetaById ?? {});
+  const result = await rebuildAll(getConn(), data.sessionsDir, data.workspaceMetaById ?? {});
+  // A completed rebuild priced everything with the current tables; refresh the
+  // fingerprint so the next sync check does not schedule a redundant rebuild.
+  await storePricingFingerprint(getConn());
+  return result;
 }
 
 async function handleClearWorkspace(data: ClearWorkspaceData): Promise<void> {
@@ -226,21 +240,26 @@ function parseNonEmptyString(value: unknown): string | null {
   return value;
 }
 
-async function listWatermarkWorkspaceIds(): Promise<Set<string>> {
-  const result = await getConn().run("SELECT workspace_id FROM ingest_watermarks");
+/** Watermarked workspace IDs mapped to their stored change signal (last_modified). */
+async function listWatermarkSignalsById(): Promise<Map<string, number>> {
+  const result = await getConn().run("SELECT workspace_id, last_modified FROM ingest_watermarks");
   const rows = await result.getRowObjectsJS();
 
-  const watermarkWorkspaceIds = new Set<string>();
+  const watermarkSignalsById = new Map<string, number>();
   for (const row of rows) {
     const workspaceId = parseNonEmptyString(row.workspace_id);
     assert(
       workspaceId !== null,
       "syncCheck expected ingest_watermarks rows to have non-empty workspace_id"
     );
-    watermarkWorkspaceIds.add(workspaceId);
+    assert(
+      typeof row.last_modified === "number" && Number.isFinite(row.last_modified),
+      "syncCheck expected ingest_watermarks rows to have a finite last_modified"
+    );
+    watermarkSignalsById.set(workspaceId, row.last_modified);
   }
 
-  return watermarkWorkspaceIds;
+  return watermarkSignalsById;
 }
 
 async function checkpointIfNeeded(
@@ -296,11 +315,40 @@ async function handleSyncCheck(data: SyncCheckData): Promise<SyncCheckResult> {
   const discoveredWorkspacesById = await discoverAllWorkspaces(data.sessionsDir);
   const knownWorkspaceIds = new Set(discoveredWorkspacesById.keys());
 
-  const watermarkWorkspaceIds = await listWatermarkWorkspaceIds();
+  const watermarkSignalsById = await listWatermarkSignalsById();
+  const watermarkWorkspaceIds = new Set(watermarkSignalsById.keys());
   assert(
     watermarkWorkspaceIds.size === watermarkCount,
     "syncCheck expected watermark_count to match ingest_watermarks workspace IDs"
   );
+
+  // Watermarked workspaces whose on-disk signal drifted since the last ingest:
+  // writes (chat or headless-usage sidecar) that landed after the last worker
+  // pass but before an app exit. An ID-only diff would noop and strand that
+  // spend until an unrelated ingest touches the workspace.
+  const changedSignalWorkspaceIds = new Set<string>();
+  for (const [workspaceId, discovered] of discoveredWorkspacesById) {
+    const storedSignal = watermarkSignalsById.get(workspaceId);
+    if (storedSignal === undefined) {
+      continue; // No watermark — already covered by the ID diff below.
+    }
+    try {
+      const stat = await statSessionChatHistory(discovered.sessionDir);
+      if (stat !== null && stat.changeSignal !== storedSignal) {
+        changedSignalWorkspaceIds.add(workspaceId);
+      }
+    } catch (error) {
+      process.stderr.write(
+        `[analytics-worker] Failed to stat workspace during sync check (${workspaceId}): ${getErrorMessage(error)}\n`
+      );
+    }
+  }
+
+  // Event costs are computed at ingest time; when the bundled pricing tables
+  // change (app upgrade), rows priced under the old tables — typically $0 for
+  // then-unknown models — must be repriced via a full rebuild.
+  const storedPricingFingerprint = await readStoredPricingFingerprint(getConn());
+  const pricingFingerprintChanged = storedPricingFingerprint !== getCurrentPricingFingerprint();
 
   const plan = decideSyncPlan({
     eventCount,
@@ -308,7 +356,17 @@ async function handleSyncCheck(data: SyncCheckData): Promise<SyncCheckResult> {
     knownWorkspaceIds,
     watermarkWorkspaceIds,
     hasAnyWatermarkAtOrAboveZero,
+    pricingFingerprintChanged,
+    changedSignalWorkspaceIds,
   });
+
+  // Persist the current fingerprint for noop/incremental plans where nothing
+  // was stale (empty events table or unchanged pricing) so the mismatch does
+  // not linger. For full rebuilds, store only after the rebuild succeeds so a
+  // crashed repricing rebuild re-triggers on the next sync check.
+  if (pricingFingerprintChanged && plan.action !== "full_rebuild") {
+    await storePricingFingerprint(getConn());
+  }
 
   if (plan.action === "noop") {
     const elapsedMs = Math.round(performance.now() - syncStartMs);
@@ -329,11 +387,14 @@ async function handleSyncCheck(data: SyncCheckData): Promise<SyncCheckResult> {
       data.sessionsDir,
       data.workspaceMetaById
     );
+    if (pricingFingerprintChanged) {
+      await storePricingFingerprint(getConn());
+    }
     await checkpointIfNeeded(plan.action, workspacesIngested, 0);
 
     const elapsedMs = Math.round(performance.now() - syncStartMs);
     process.stderr.write(
-      `[analytics-worker] syncCheck: plan=full_rebuild, workspacesIngested=${workspacesIngested}, workspacesOnDisk=${knownWorkspaceIds.size} (${elapsedMs}ms)\n`
+      `[analytics-worker] syncCheck: plan=full_rebuild, workspacesIngested=${workspacesIngested}, workspacesOnDisk=${knownWorkspaceIds.size}, repricedForPricingChange=${pricingFingerprintChanged} (${elapsedMs}ms)\n`
     );
 
     return {

@@ -9,14 +9,19 @@ import {
   appendEvents,
   CHAT_FILE_NAME,
   clearWorkspaceAnalyticsState,
+  getCurrentPricingFingerprint,
   ingestWorkspace,
   parseWorkspaceFromDisk,
   readPersistedWorkspaceHeadSignature,
+  readStoredPricingFingerprint,
   rebuildAll,
+  statSessionChatHistory,
+  storePricingFingerprint,
 } from "./etl";
 import {
   CREATE_DELEGATION_ROLLUPS_TABLE_SQL,
   CREATE_EVENTS_TABLE_SQL,
+  CREATE_INGEST_META_TABLE_SQL,
   CREATE_WATERMARK_TABLE_SQL,
 } from "./schemaSql";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
@@ -189,6 +194,7 @@ async function createTestConn(
   }
   await conn.run(CREATE_WATERMARK_TABLE_SQL);
   await conn.run(CREATE_DELEGATION_ROLLUPS_TABLE_SQL);
+  await conn.run(CREATE_INGEST_META_TABLE_SQL);
 
   return conn;
 }
@@ -1177,7 +1183,9 @@ describe("ingestArchivedSubagentTranscripts", () => {
     await clearWorkspaceAnalyticsState(conn, childWorkspaceId);
     expect(await queryEventCount(conn, childWorkspaceId)).toBe(0);
 
-    await bumpChatMtime(parentSessionDir);
+    // Recovery must NOT require the parent's own chat files to change: child
+    // deletion archives the transcript without touching the parent's chat, so
+    // any subsequent ingest pass of the parent restores the child's rows.
     await ingestWorkspace(conn, parentWorkspaceId, parentSessionDir, { projectPath: "/test" });
 
     expect(await queryEventCount(conn, childWorkspaceId)).toBe(1);
@@ -1351,5 +1359,278 @@ describe("ingestDelegationRollups", () => {
     expect(parseInteger(rows[0].reasoning_tokens, "reasoning_tokens")).toBe(0);
     expect(parseInteger(rows[0].cached_tokens, "cached_tokens")).toBe(0);
     expect(parseInteger(rows[0].cache_create_tokens, "cache_create_tokens")).toBe(0);
+  });
+});
+
+describe("headless usage ingestion", () => {
+  async function writeHeadlessUsageJsonl(sessionDir: string, lines: string[]): Promise<void> {
+    await fs.writeFile(path.join(sessionDir, "headless-usage.jsonl"), `${lines.join("\n")}\n`);
+  }
+
+  function makeHeadlessLine(
+    opts: { source?: string; inputTokens?: number; outputTokens?: number } = {}
+  ): string {
+    return JSON.stringify({
+      timestamp: 1700000000000,
+      source: opts.source ?? "workspace_status",
+      model: "anthropic:claude-sonnet-4-20250514",
+      usage: {
+        inputTokens: opts.inputTokens ?? 500,
+        outputTokens: opts.outputTokens ?? 20,
+      },
+    });
+  }
+
+  test("ingests sidecar rows tagged headless:* alongside chat rows, idempotently", async () => {
+    const conn = await createTestConn();
+    const workspaceId = "headless-ws";
+    const sessionDir = await createTempSessionDir();
+    await writeBasicChatJsonl(sessionDir);
+    await writeHeadlessUsageJsonl(sessionDir, [makeHeadlessLine(), makeHeadlessLine()]);
+
+    await ingestWorkspace(conn, workspaceId, sessionDir, { projectPath: "/test" });
+    expect(await queryEventCount(conn, workspaceId)).toBe(3); // 1 chat + 2 headless
+
+    const headlessRows = await queryRows(
+      conn,
+      "SELECT tool_name, input_tokens, total_cost_usd FROM events WHERE workspace_id = ? AND tool_name LIKE 'headless:%'",
+      [workspaceId]
+    );
+    expect(headlessRows).toHaveLength(2);
+    expect(headlessRows[0].tool_name).toBe("headless:workspace_status");
+    expect(parseInteger(headlessRows[0].input_tokens, "input_tokens")).toBe(500);
+    expect(headlessRows[0].total_cost_usd as number).toBeGreaterThan(0);
+
+    // Second pass with unchanged files: delete+reinsert keeps counts stable
+    // and does not disturb chat-derived rows.
+    await ingestWorkspace(conn, workspaceId, sessionDir, { projectPath: "/test" });
+    expect(await queryEventCount(conn, workspaceId)).toBe(3);
+  });
+
+  test("clears stale headless rows when the sidecar disappears", async () => {
+    const conn = await createTestConn();
+    const workspaceId = "headless-ws-removed";
+    const sessionDir = await createTempSessionDir();
+    await writeBasicChatJsonl(sessionDir);
+    await writeHeadlessUsageJsonl(sessionDir, [makeHeadlessLine()]);
+
+    await ingestWorkspace(conn, workspaceId, sessionDir, { projectPath: "/test" });
+    expect(await queryEventCount(conn, workspaceId)).toBe(2); // 1 chat + 1 headless
+
+    // Sidecar deleted while chat.jsonl remains: the changed signal re-ingests
+    // and must drop the stale headless rows instead of reporting deleted
+    // spend forever (the watermark advances to the no-sidecar signal).
+    await fs.rm(path.join(sessionDir, "headless-usage.jsonl"));
+    await ingestWorkspace(conn, workspaceId, sessionDir, { projectPath: "/test" });
+    expect(await queryEventCount(conn, workspaceId)).toBe(1); // chat row only
+
+    const headlessRows = await queryRows(
+      conn,
+      "SELECT 1 FROM events WHERE workspace_id = ? AND tool_name LIKE 'headless:%'",
+      [workspaceId]
+    );
+    expect(headlessRows).toHaveLength(0);
+  });
+
+  test("unix-ms timestamps survive the incremental insert path un-truncated", async () => {
+    // Regression: @duckdb/node-api infers integral JS numbers as INT32 for
+    // untyped parameters, silently wrapping unix-ms timestamps (e.g.
+    // 1700000000000 → -807049216). Truncated persisted timestamps then break
+    // the head-signature comparison, forcing a full rebuild on every ingest.
+    const conn = await createTestConn();
+    const workspaceId = "bind-safe-ws";
+    const sessionDir = await createTempSessionDir();
+    await writeBasicChatJsonl(sessionDir); // timestamp 1700000000000
+
+    // First-pass ingest inserts via replaceEventsByResponseIndex (conn.run
+    // binding), not the rebuild appender.
+    await ingestWorkspace(conn, workspaceId, sessionDir, { projectPath: "/test" });
+
+    const rows = await queryRows(
+      conn,
+      "SELECT CAST(timestamp AS VARCHAR) AS ts FROM events WHERE workspace_id = ?",
+      [workspaceId]
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].ts).toBe("1700000000000");
+  });
+
+  test("headless rows do not fake chat truncation (incremental path preserved)", async () => {
+    const conn = await createTestConn();
+    const workspaceId = "headless-ws-truncation";
+    const sessionDir = await createTempSessionDir();
+    await writeChatJsonl(sessionDir, [
+      makeAssistantLine({ sequence: 1 }),
+      makeAssistantLine({ sequence: 2 }),
+      makeAssistantLine({ sequence: 3 }),
+    ]);
+    await ingestWorkspace(conn, workspaceId, sessionDir, { projectPath: "/test" });
+
+    // Sidecar rows land (NULL response_index) — total rows now exceed chat rows.
+    await writeHeadlessUsageJsonl(sessionDir, [makeHeadlessLine(), makeHeadlessLine()]);
+    await ingestWorkspace(conn, workspaceId, sessionDir, { projectPath: "/test" });
+    expect(await queryEventCount(conn, workspaceId)).toBe(5);
+
+    // Sentinel on a MIDDLE chat row (not the head, whose cost feeds the
+    // head-signature check; sequence < watermark so the incremental path
+    // skips it). A (spurious) truncation rebuild deletes + reprices
+    // everything: if headless rows leaked into the truncation count,
+    // 4 parsed chat rows < 5 persisted rows would force that rebuild and
+    // reset the sentinel.
+    await conn.run(
+      "UPDATE events SET total_cost_usd = 999 WHERE workspace_id = ? AND response_index = 1",
+      [workspaceId]
+    );
+
+    await writeChatJsonl(sessionDir, [
+      makeAssistantLine({ sequence: 1 }),
+      makeAssistantLine({ sequence: 2 }),
+      makeAssistantLine({ sequence: 3 }),
+      makeAssistantLine({ sequence: 4 }),
+    ]);
+    await ingestWorkspace(conn, workspaceId, sessionDir, { projectPath: "/test" });
+
+    expect(await queryEventCount(conn, workspaceId)).toBe(6); // 4 chat + 2 headless
+    const sentinelRows = await queryRows(
+      conn,
+      "SELECT total_cost_usd FROM events WHERE workspace_id = ? AND response_index = 1",
+      [workspaceId]
+    );
+    expect(sentinelRows).toHaveLength(1);
+    expect(sentinelRows[0].total_cost_usd as number).toBe(999);
+  });
+
+  test("failed headless ingestion stays retryable (watermark not advanced past it)", async () => {
+    const conn = await createTestConn();
+    const workspaceId = "headless-ws-retry";
+    const sessionDir = await createTempSessionDir();
+    await writeBasicChatJsonl(sessionDir);
+
+    // Unreadable sidecar (a directory → EISDIR, non-ENOENT): ingestion must
+    // throw BEFORE the watermark advances, or the next pass would see the
+    // change signal as current and permanently strand the sidecar spend.
+    await fs.mkdir(path.join(sessionDir, "headless-usage.jsonl"));
+    let threw = false;
+    try {
+      await ingestWorkspace(conn, workspaceId, sessionDir, { projectPath: "/test" });
+    } catch {
+      threw = true;
+    }
+    expect(threw).toBe(true);
+
+    // Repair the sidecar; the retry must ingest chat + headless rows.
+    await fs.rmdir(path.join(sessionDir, "headless-usage.jsonl"));
+    await writeHeadlessUsageJsonl(sessionDir, [makeHeadlessLine()]);
+    await ingestWorkspace(conn, workspaceId, sessionDir, { projectPath: "/test" });
+    expect(await queryEventCount(conn, workspaceId)).toBe(2); // 1 chat + 1 headless
+  });
+
+  test("sidecar appends shift the change signal so startup syncCheck detects them", async () => {
+    const sessionDir = await createTempSessionDir();
+    await writeBasicChatJsonl(sessionDir);
+
+    const before = await statSessionChatHistory(sessionDir);
+    expect(before).not.toBeNull();
+
+    // Crash scenario: recordHeadlessUsage appends a sidecar line but the app
+    // exits before the fire-and-forget ingest completes. The startup sync
+    // compares stored watermark signals against disk, so a sidecar-only write
+    // must shift the signal or the spend strands until an unrelated ingest.
+    await writeHeadlessUsageJsonl(sessionDir, [makeHeadlessLine()]);
+    const after = await statSessionChatHistory(sessionDir);
+    expect(after).not.toBeNull();
+    expect(after?.changeSignal).not.toBe(before?.changeSignal);
+    // mtimeMs stays chat-only (rebuild dedup recency).
+    expect(after?.mtimeMs).toBe(before!.mtimeMs);
+  });
+
+  test("prices mapped custom models via metadataModel while keeping raw attribution", async () => {
+    const conn = await createTestConn();
+    const workspaceId = "headless-ws-mapped";
+    const sessionDir = await createTempSessionDir();
+    await writeBasicChatJsonl(sessionDir);
+    await writeHeadlessUsageJsonl(sessionDir, [
+      JSON.stringify({
+        timestamp: 1700000000000,
+        source: "workspace_status",
+        model: "mycustom:my-alias",
+        metadataModel: "anthropic:claude-sonnet-4-20250514",
+        usage: { inputTokens: 500, outputTokens: 20 },
+      }),
+    ]);
+
+    await ingestWorkspace(conn, workspaceId, sessionDir, { projectPath: "/test" });
+
+    const rows = await queryRows(
+      conn,
+      "SELECT model, total_cost_usd FROM events WHERE workspace_id = ? AND tool_name LIKE 'headless:%'",
+      [workspaceId]
+    );
+    expect(rows).toHaveLength(1);
+    // Attribution keeps the custom ID; pricing resolves via metadataModel
+    // (raw "mycustom:my-alias" has no pricing entry and would cost $0).
+    expect(rows[0].model).toBe("mycustom:my-alias");
+    expect(rows[0].total_cost_usd as number).toBeGreaterThan(0);
+  });
+
+  test("restores archived sub-agent headless usage as sub-agent rows", async () => {
+    const conn = await createTestConn();
+    const parentWorkspaceId = "parent-headless";
+    const childWorkspaceId = "child-headless";
+
+    const parentSessionDir = await createTempSessionDir();
+    await writeBasicChatJsonl(parentSessionDir);
+    const childSessionDir = await createArchivedSubagentTranscript(
+      parentSessionDir,
+      childWorkspaceId,
+      { parentWorkspaceId, projectPath: "/test", projectName: "test" }
+    );
+    // Workspace removal archives the child's headless sidecar alongside its
+    // chat transcript; the ETL must restore that spend after clearWorkspace.
+    await writeHeadlessUsageJsonl(childSessionDir, [makeHeadlessLine()]);
+
+    await ingestWorkspace(conn, parentWorkspaceId, parentSessionDir, { projectPath: "/test" });
+
+    const childHeadlessRows = await queryRows(
+      conn,
+      "SELECT CAST(is_sub_agent AS INTEGER) AS is_sub_agent_int, total_cost_usd FROM events WHERE workspace_id = ? AND tool_name LIKE 'headless:%'",
+      [childWorkspaceId]
+    );
+    expect(childHeadlessRows).toHaveLength(1);
+    // Headless rows match the chat-row is_sub_agent derivation.
+    expect(parseBooleanFromInteger(childHeadlessRows[0].is_sub_agent_int, "is_sub_agent_int")).toBe(
+      true
+    );
+    expect(childHeadlessRows[0].total_cost_usd as number).toBeGreaterThan(0);
+  });
+
+  test("ingests sidecar growth even when chat files are unchanged", async () => {
+    const conn = await createTestConn();
+    const workspaceId = "headless-ws-growth";
+    const sessionDir = await createTempSessionDir();
+    await writeBasicChatJsonl(sessionDir);
+
+    await ingestWorkspace(conn, workspaceId, sessionDir, { projectPath: "/test" });
+    expect(await queryEventCount(conn, workspaceId)).toBe(1);
+
+    // Headless usage lands without any chat.jsonl change (status generation).
+    await writeHeadlessUsageJsonl(sessionDir, [makeHeadlessLine()]);
+    await ingestWorkspace(conn, workspaceId, sessionDir, { projectPath: "/test" });
+    expect(await queryEventCount(conn, workspaceId)).toBe(2);
+  });
+});
+
+describe("pricing fingerprint", () => {
+  test("round-trips through ingest_meta and starts unset", async () => {
+    const conn = await createTestConn();
+
+    expect(await readStoredPricingFingerprint(conn)).toBeNull();
+
+    await storePricingFingerprint(conn);
+    expect(await readStoredPricingFingerprint(conn)).toBe(getCurrentPricingFingerprint());
+
+    // Idempotent upsert: storing again keeps a single row with the same value.
+    await storePricingFingerprint(conn);
+    expect(await readStoredPricingFingerprint(conn)).toBe(getCurrentPricingFingerprint());
   });
 });

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -7,9 +8,15 @@ import { DuckDBAppender, DuckDBDateValue, type DuckDBConnection } from "@duckdb/
 import { EventRowSchema, type EventRow } from "@/common/orpc/schemas/analytics";
 import { getErrorMessage } from "@/common/utils/errors";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
+import modelsData from "@/common/utils/tokens/models.json";
+import { modelsExtra } from "@/common/utils/tokens/models-extra";
 import { log } from "@/node/services/log";
 import { toUtcDateString } from "@/node/services/analytics/dateUtils";
-import { CHAT_FILE_NAME, CHAT_ARCHIVE_FILE_NAME } from "@/common/constants/paths";
+import {
+  CHAT_FILE_NAME,
+  CHAT_ARCHIVE_FILE_NAME,
+  HEADLESS_USAGE_FILE_NAME,
+} from "@/common/constants/paths";
 
 // Re-export the canonical chat history filename (defined in constants/paths.ts)
 // so existing analytics consumers (workspaceDiscovery, tests) can keep importing
@@ -30,8 +37,17 @@ export { CHAT_FILE_NAME };
  *   watermark staleness check still fires when a file disappears even if the
  *   surviving file's mtime equals the previously stored max (e.g. same-tick
  *   writes followed by deleting chat.jsonl).
+ * - The headless-usage sidecar also feeds `changeSignal` (but not `mtimeMs`,
+ *   which stays chat-only for rebuild dedup recency): startup syncCheck
+ *   compares stored watermark signals against disk, so a sidecar line
+ *   appended right before an app exit must shift the signal or that spend
+ *   strands until an unrelated ingest. Present-only (no missing-file marker):
+ *   the sidecar is append-only, and a marker would drift the signal for every
+ *   sidecar-less workspace on upgrade.
+ *
+ * Exported for the analytics worker's startup syncCheck.
  */
-async function statSessionChatHistory(
+export async function statSessionChatHistory(
   sessionDir: string
 ): Promise<{ mtimeMs: number; changeSignal: number } | null> {
   let mtimeMs: number | null = null;
@@ -46,6 +62,15 @@ async function statSessionChatHistory(
         throw error;
       }
       changeSignal -= 1; // presence marker: distinguishes a missing file
+    }
+  }
+
+  try {
+    const stat = await fs.stat(path.join(sessionDir, HEADLESS_USAGE_FILE_NAME));
+    changeSignal += stat.mtimeMs + stat.size;
+  } catch (error) {
+    if (!(isRecord(error) && error.code === "ENOENT")) {
+      throw error;
     }
   }
 
@@ -117,6 +142,62 @@ INSERT INTO events (
   ?, ?, ?, ?, ?, ?
 )
 `;
+
+/**
+ * Make a JS number safe for untyped DuckDB parameter binding.
+ *
+ * @duckdb/node-api's typeForValue() infers EVERY integral JS number as INT32,
+ * so binding unix-ms timestamps or change signals (> 2^31-1) via
+ * conn.run(sql, params) silently wraps them (e.g. 1700000000000 →
+ * -807049216) regardless of the target column type. Convert large integers
+ * to BigInt so inference picks a wide integer type and DuckDB casts to the
+ * target column (BIGINT or DOUBLE) losslessly. Fractional numbers already
+ * infer as DOUBLE and small integers fit INT32.
+ */
+function toBindableNumber(value: number | null): number | bigint | null {
+  if (value === null || !Number.isInteger(value) || Math.abs(value) <= 0x7fffffff) {
+    return value;
+  }
+  return BigInt(value);
+}
+
+/** Insert one events row via INSERT_EVENT_SQL with bind-safe numeric params. */
+async function insertEventRow(
+  conn: DuckDBConnection,
+  row: EventRow,
+  date: string | null
+): Promise<void> {
+  await conn.run(INSERT_EVENT_SQL, [
+    row.workspace_id,
+    row.project_path,
+    row.project_name,
+    row.workspace_name,
+    row.parent_workspace_id,
+    row.agent_id,
+    toBindableNumber(row.timestamp),
+    date,
+    row.model,
+    row.tool_name,
+    row.thinking_level,
+    row.input_tokens,
+    row.output_tokens,
+    row.reasoning_tokens,
+    row.cached_tokens,
+    row.cache_create_tokens,
+    row.input_cost_usd,
+    row.output_cost_usd,
+    row.reasoning_cost_usd,
+    row.cached_cost_usd,
+    row.total_cost_usd,
+    toBindableNumber(row.duration_ms),
+    toBindableNumber(row.ttft_ms),
+    toBindableNumber(row.streaming_ms),
+    toBindableNumber(row.tool_execution_ms),
+    row.output_tps,
+    row.response_index,
+    row.is_sub_agent,
+  ]);
+}
 
 function appendVarcharOrNull(appender: DuckDBAppender, value: string | null | undefined): void {
   if (value != null) {
@@ -252,7 +333,8 @@ interface IngestEventContext {
   workspaceMeta: WorkspaceMeta;
   agentId: string | null;
   thinkingLevel: string | null;
-  responseIndex: number;
+  /** Null for headless-usage rows so replaceEventsByResponseIndex never touches them. */
+  responseIndex: number | null;
   isSubAgent: boolean;
 }
 
@@ -745,9 +827,14 @@ async function readWorkspaceEventRowCount(
   conn: DuckDBConnection,
   workspaceId: string
 ): Promise<number> {
-  const result = await conn.run(`SELECT COUNT(*) AS row_count FROM events WHERE workspace_id = ?`, [
-    workspaceId,
-  ]);
+  // Chat-derived rows only (headless sidecar rows use a NULL response_index):
+  // the truncation check compares this count against parsed chat.jsonl events,
+  // so counting headless rows would fake a truncation after sidecar growth
+  // and force needless full-workspace rebuilds.
+  const result = await conn.run(
+    `SELECT COUNT(*) AS row_count FROM events WHERE workspace_id = ? AND response_index IS NOT NULL`,
+    [workspaceId]
+  );
   const rows = await result.getRowObjectsJS();
   assert(rows.length === 1, "readWorkspaceEventRowCount: expected exactly one COUNT(*) result row");
 
@@ -816,9 +903,9 @@ export async function readPersistedWorkspaceHeadSignature(
     `
     SELECT timestamp, model, total_cost_usd
     FROM events
-    WHERE workspace_id = ?
+    WHERE workspace_id = ? AND response_index IS NOT NULL
     ORDER BY
-      response_index ASC NULLS LAST,
+      response_index ASC,
       CASE WHEN tool_name IS NULL THEN 0 ELSE 1 END ASC,
       timestamp ASC
     LIMIT 1
@@ -879,7 +966,14 @@ async function writeWatermark(
       SET last_sequence = excluded.last_sequence,
           last_modified = excluded.last_modified
     `,
-    [workspaceId, watermark.lastSequence, watermark.lastModified]
+    // toBindableNumber: lastSequence targets BIGINT and lastModified (change
+    // signal, mtime+size sums > 2^31) targets DOUBLE — untyped binding would
+    // truncate both to int32.
+    [
+      workspaceId,
+      toBindableNumber(watermark.lastSequence),
+      toBindableNumber(watermark.lastModified),
+    ]
   );
 }
 
@@ -930,37 +1024,7 @@ async function replaceEventsByResponseIndex(
     );
 
     for (const event of events) {
-      const row = event.row;
-      await conn.run(INSERT_EVENT_SQL, [
-        row.workspace_id,
-        row.project_path,
-        row.project_name,
-        row.workspace_name,
-        row.parent_workspace_id,
-        row.agent_id,
-        row.timestamp,
-        event.date,
-        row.model,
-        row.tool_name,
-        row.thinking_level,
-        row.input_tokens,
-        row.output_tokens,
-        row.reasoning_tokens,
-        row.cached_tokens,
-        row.cache_create_tokens,
-        row.input_cost_usd,
-        row.output_cost_usd,
-        row.reasoning_cost_usd,
-        row.cached_cost_usd,
-        row.total_cost_usd,
-        row.duration_ms,
-        row.ttft_ms,
-        row.streaming_ms,
-        row.tool_execution_ms,
-        row.output_tps,
-        row.response_index,
-        row.is_sub_agent,
-      ]);
+      await insertEventRow(conn, event.row, event.date);
     }
 
     await conn.run("COMMIT");
@@ -980,41 +1044,11 @@ async function replaceWorkspaceEvents(
     await conn.run("DELETE FROM events WHERE workspace_id = ?", [workspaceId]);
 
     for (const event of events) {
-      const row = event.row;
       assert(
-        row.workspace_id === workspaceId,
+        event.row.workspace_id === workspaceId,
         "replaceWorkspaceEvents: all rows must belong to the target workspace"
       );
-      await conn.run(INSERT_EVENT_SQL, [
-        row.workspace_id,
-        row.project_path,
-        row.project_name,
-        row.workspace_name,
-        row.parent_workspace_id,
-        row.agent_id,
-        row.timestamp,
-        event.date,
-        row.model,
-        row.tool_name,
-        row.thinking_level,
-        row.input_tokens,
-        row.output_tokens,
-        row.reasoning_tokens,
-        row.cached_tokens,
-        row.cache_create_tokens,
-        row.input_cost_usd,
-        row.output_cost_usd,
-        row.reasoning_cost_usd,
-        row.cached_cost_usd,
-        row.total_cost_usd,
-        row.duration_ms,
-        row.ttft_ms,
-        row.streaming_ms,
-        row.tool_execution_ms,
-        row.output_tps,
-        row.response_index,
-        row.is_sub_agent,
-      ]);
+      await insertEventRow(conn, event.row, event.date);
     }
 
     await conn.run("COMMIT");
@@ -1082,11 +1116,25 @@ export async function ingestWorkspace(
   // Keep delegation rollups fresh even when chat.jsonl is unchanged.
   await ingestDelegationRollups(conn, workspaceId, sessionDir, workspaceMeta);
 
+  // Also ingest archived sub-agent transcripts stored in this workspace's
+  // session dir. This recovers sub-agent data that was cleared when the
+  // child workspace was removed (clearWorkspace deletes child rows, but
+  // the archived chat.jsonl in the parent dir is the source of truth).
+  // This must run BEFORE the changeSignal early-return below: child deletion
+  // archives the transcript without touching the parent's own chat files, so
+  // gating recovery on a parent chat change would strand the child's spend
+  // until the parent happens to stream again. Watermark dedup makes repeated
+  // calls cheap (stat + comparison only).
+  await ingestArchivedSubagentTranscripts(conn, sessionDir, workspaceMeta, workspaceId);
+
   // Skip only when the combined change signal (mtimes + sizes + presence) is
   // unchanged. Any append/rewrite/rotation/file-deletion changes the signal, so
   // ingestion re-runs and the rebuild path can drop stale rows — even when the
   // surviving file's mtime equals the previously stored value.
   if (stat.changeSignal === watermark.lastModified) {
+    // Headless usage (status generation, memory sweeps) accrues without
+    // touching chat files, so it must ingest even when chat is unchanged.
+    await ingestHeadlessUsage(conn, workspaceId, sessionDir, workspaceMeta);
     return;
   }
 
@@ -1151,16 +1199,12 @@ export async function ingestWorkspace(
     hasTruncation,
     hasHeadMismatch,
   });
-
+  let newLastSequence: number;
   if (shouldRebuild) {
     // Rebuild on truncation, head mismatch, or max-sequence rewinds. This removes
     // stale rows, including the zero-assistant-event truncation case.
     await replaceWorkspaceEvents(conn, workspaceId, parsedEvents);
-
-    await writeWatermark(conn, workspaceId, {
-      lastSequence: parsedMaxSequence ?? -1,
-      lastModified: stat.changeSignal,
-    });
+    newLastSequence = parsedMaxSequence ?? -1;
   } else {
     let maxSequence = watermark.lastSequence;
     const eventsToInsert: IngestEvent[] = [];
@@ -1177,23 +1221,135 @@ export async function ingestWorkspace(
     }
 
     await replaceEventsByResponseIndex(conn, workspaceId, eventsToInsert);
-
-    await writeWatermark(conn, workspaceId, {
-      lastSequence: maxSequence,
-      lastModified: stat.changeSignal,
-    });
+    newLastSequence = maxSequence;
   }
 
-  // Also ingest archived sub-agent transcripts stored in this workspace's
-  // session dir. This recovers sub-agent data that was cleared when the
-  // child workspace was removed (clearWorkspace deletes child rows, but
-  // the archived chat.jsonl in the parent dir is the source of truth).
-  // Watermark dedup makes repeated calls cheap (stat + comparison only).
-  const mergedMetaForChildren = mergeWorkspaceMeta(
-    await readWorkspaceMetaFromDisk(sessionDir),
-    meta
-  );
-  await ingestArchivedSubagentTranscripts(conn, sessionDir, mergedMetaForChildren, workspaceId);
+  // Headless ingestion runs AFTER the chat-row writes (the rebuild path
+  // deletes all of this workspace's rows, including headless ones) but
+  // BEFORE the watermark advances: the watermark's change signal covers the
+  // sidecar too, so a crash between watermark write and headless commit
+  // would make the next syncCheck see the sidecar as current and strand
+  // that spend. Failing before the watermark keeps ingestion retryable.
+  await ingestHeadlessUsage(conn, workspaceId, sessionDir, workspaceMeta);
+
+  await writeWatermark(conn, workspaceId, {
+    lastSequence: newLastSequence,
+    lastModified: stat.changeSignal,
+  });
+}
+
+/**
+ * Ingest the headless-usage.jsonl sidecar (status generation, memory sweeps —
+ * AI spend with no chat.jsonl assistant row) into the events table.
+ *
+ * Idempotent delete + reinsert scoped to `tool_name LIKE 'headless:%'`:
+ * headless rows use a NULL response_index, so the chat-row refresh paths
+ * (replaceEventsByResponseIndex) never touch them, and this function never
+ * touches chat-derived rows. The sidecar stays small (one line per background
+ * call), so a full re-read per ingest pass is cheap — mirroring how
+ * delegation rollups stay fresh on every pass.
+ */
+async function ingestHeadlessUsage(
+  conn: DuckDBConnection,
+  workspaceId: string,
+  sessionDir: string,
+  workspaceMeta: WorkspaceMeta
+): Promise<void> {
+  let contents: string;
+  try {
+    contents = await fs.readFile(path.join(sessionDir, HEADLESS_USAGE_FILE_NAME), "utf-8");
+  } catch (error) {
+    if (isRecord(error) && error.code === "ENOENT") {
+      // Sidecar gone: mirror the delete+reinsert idempotency below with an
+      // empty reinsert. Without this, a deleted sidecar (with chat.jsonl
+      // intact) leaves stale headless rows behind while the caller advances
+      // the watermark to the no-sidecar signal — permanently reporting
+      // deleted spend. Cheap no-op for the common never-had-a-sidecar case.
+      await conn.run("DELETE FROM events WHERE workspace_id = ? AND tool_name LIKE 'headless:%'", [
+        workspaceId,
+      ]);
+      return;
+    }
+    throw error;
+  }
+
+  const inheritedContext: IngestEventContext = {
+    workspaceId,
+    workspaceMeta,
+    agentId: null,
+    thinkingLevel: null,
+    responseIndex: null,
+    // Match chat-row derivation: archived sub-agent sidecars flow through
+    // here too (via ingestArchivedSubagentTranscripts → ingestWorkspace).
+    isSubAgent: (workspaceMeta.parentWorkspaceId ?? "").length > 0,
+  };
+
+  const rows: EventRow[] = [];
+  const lines = contents.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (line.length === 0) {
+      continue;
+    }
+    let record: unknown;
+    try {
+      record = JSON.parse(line);
+    } catch {
+      log.warn("[analytics-etl] Skipping malformed headless-usage line", {
+        workspaceId,
+        lineNumber: i + 1,
+      });
+      continue;
+    }
+    if (!isRecord(record)) {
+      continue;
+    }
+    const source = toOptionalString(record.source);
+    const model = toOptionalString(record.model);
+    const usage = parseUsage(record.usage);
+    if (!source || !model || !usage) {
+      continue;
+    }
+
+    const built = buildIngestEventRow({
+      inheritedContext,
+      model,
+      metadataModel: toOptionalString(record.metadataModel),
+      usage,
+      providerMetadata: isRecord(record.providerMetadata) ? record.providerMetadata : undefined,
+      toolName: `headless:${source}`,
+      timestamp: toFiniteNumber(record.timestamp) ?? null,
+      durationMs: null,
+      ttftMs: null,
+      outputTps: null,
+    });
+    if (!built.parsed.success) {
+      log.warn("[analytics-etl] Skipping invalid headless-usage row", {
+        workspaceId,
+        lineNumber: i + 1,
+      });
+      continue;
+    }
+    rows.push(built.parsed.data);
+  }
+
+  await conn.run("BEGIN TRANSACTION");
+  try {
+    await conn.run("DELETE FROM events WHERE workspace_id = ? AND tool_name LIKE 'headless:%'", [
+      workspaceId,
+    ]);
+    for (const row of rows) {
+      await insertEventRow(
+        conn,
+        row,
+        row.timestamp != null ? toUtcDateString(new Date(row.timestamp)) : null
+      );
+    }
+    await conn.run("COMMIT");
+  } catch (error) {
+    await conn.run("ROLLBACK");
+    throw error;
+  }
 }
 
 /**
@@ -1328,7 +1484,8 @@ async function writeDelegationRollupEntries(
         cacheCreateTokens,
         reportTokenEstimate,
         totalCostUsd,
-        rolledUpAtMs,
+        // Unix-ms value: untyped binding truncates large integers to int32.
+        toBindableNumber(rolledUpAtMs),
         dateBucket,
       ]);
     }
@@ -1591,6 +1748,43 @@ function collectAllEvents(parsed: ParsedWorkspaceData[]): CollectedEvents {
   return { eventsByWorkspace, winnerMtimes };
 }
 
+const PRICING_FINGERPRINT_META_KEY = "pricing_fingerprint";
+
+let cachedPricingFingerprint: string | undefined;
+
+/**
+ * Fingerprint of the bundled pricing tables. Event costs are computed at
+ * ingest time from these tables, so a fingerprint change means previously
+ * ingested rows may carry stale costs (typically $0 for models that were
+ * unknown at ingest time) and need a full rebuild to reprice.
+ *
+ * Cached per process: the tables are compiled into the bundle and cannot
+ * change while the worker is running.
+ */
+export function getCurrentPricingFingerprint(): string {
+  cachedPricingFingerprint ??= createHash("sha256")
+    .update(JSON.stringify(modelsExtra))
+    .update(JSON.stringify(modelsData))
+    .digest("hex");
+  return cachedPricingFingerprint;
+}
+
+export async function readStoredPricingFingerprint(conn: DuckDBConnection): Promise<string | null> {
+  const result = await conn.run("SELECT value FROM ingest_meta WHERE key = ?", [
+    PRICING_FINGERPRINT_META_KEY,
+  ]);
+  const rows = await result.getRowObjectsJS();
+  const value = rows[0]?.value;
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+export async function storePricingFingerprint(conn: DuckDBConnection): Promise<void> {
+  await conn.run("INSERT OR REPLACE INTO ingest_meta (key, value) VALUES (?, ?)", [
+    PRICING_FINGERPRINT_META_KEY,
+    getCurrentPricingFingerprint(),
+  ]);
+}
+
 export async function rebuildAll(
   conn: DuckDBConnection,
   sessionsDir: string,
@@ -1695,6 +1889,18 @@ export async function rebuildAll(
           isDedupeWinner && !failedWorkspaceIds.has(workspace.workspaceId);
 
         if (shouldWriteMetadata) {
+          // Rebuild wiped all events rows up front, so re-ingest the
+          // headless-usage sidecar for dedup winners. Must run BEFORE the
+          // watermark write: the watermark's change signal covers the sidecar,
+          // so a crash after the watermark but before this commit would strand
+          // the sidecar spend as "current" on the next syncCheck.
+          await ingestHeadlessUsage(
+            conn,
+            workspace.workspaceId,
+            workspace.sessionDir,
+            workspace.workspaceMeta
+          );
+
           const maxSequence = getMaxSequence(workspace.events) ?? -1;
           await writeWatermark(conn, workspace.workspaceId, {
             lastSequence: maxSequence,

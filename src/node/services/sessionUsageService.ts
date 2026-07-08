@@ -1,5 +1,6 @@
 import * as fs from "fs/promises";
 import * as path from "path";
+import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import writeFileAtomic from "write-file-atomic";
 import assert from "@/common/utils/assert";
 import type { Config } from "@/node/config";
@@ -10,8 +11,11 @@ import { sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import type { RolledUpChildEntry } from "@/common/orpc/schemas/chatStats";
 import type { TokenConsumer } from "@/common/types/chatStats";
+import { HEADLESS_USAGE_FILE_NAME } from "@/common/constants/paths";
 import type { MuxMessage, PersistedToolModelUsage } from "@/common/types/message";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
+import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { log } from "./log";
 
 export interface SessionUsageTokenStatsCacheV1 {
@@ -91,10 +95,22 @@ export class SessionUsageService {
   private readonly fileLocks = workspaceFileLocks;
   private readonly config: Config;
   private readonly historyService: HistoryService;
+  private readonly getProvidersConfig: () => ProvidersConfigMap | null;
 
-  constructor(config: Config, historyService: HistoryService) {
+  constructor(
+    config: Config,
+    historyService: HistoryService,
+    /**
+     * Providers config accessor for mappedToModel alias resolution (mirrors
+     * StreamManager). Without it, headless usage for custom provider models
+     * configured with mappedToModel is priced against the raw custom ID
+     * (unknown → $0).
+     */
+    getProvidersConfig?: () => ProvidersConfigMap | null
+  ) {
     this.config = config;
     this.historyService = historyService;
+    this.getProvidersConfig = getProvidersConfig ?? (() => null);
   }
   /**
    * Collect all messages from iterateFullHistory into an array.
@@ -143,15 +159,158 @@ export class SessionUsageService {
    * AND updates lastRequest in a single atomic write.
    * Model should already be normalized via normalizeToCanonical().
    */
-  async recordUsage(workspaceId: string, model: string, usage: ChatUsageDisplay): Promise<void> {
+  async recordUsage(
+    workspaceId: string,
+    model: string,
+    usage: ChatUsageDisplay,
+    options?: {
+      /**
+       * Accumulate into byModel without touching lastRequest. Used for
+       * headless telemetry (status generation, memory sweeps, /btw) so a tiny
+       * background call cannot replace the Costs tab's "Last request" data
+       * for the user's actual last agent turn.
+       */
+      skipLastRequestUpdate?: boolean;
+    }
+  ): Promise<void> {
     return this.fileLocks.withLock(workspaceId, async () => {
       const current = await this.readFile(workspaceId);
       const existing = current.byModel[model];
       // CRITICAL: Accumulate, don't overwrite
       current.byModel[model] = existing ? sumUsageHistory([existing, usage])! : usage;
-      current.lastRequest = { model, usage, timestamp: Date.now() };
+      if (options?.skipLastRequestUpdate !== true) {
+        current.lastRequest = { model, usage, timestamp: Date.now() };
+      }
       await this.writeFile(workspaceId, current);
     });
+  }
+
+  /**
+   * Best-effort usage recording for headless AI calls that bypass the
+   * StreamManager pipeline (side questions, memory consolidation/harvest,
+   * status/title generation). Without this, their spend is invisible to
+   * per-workspace cost displays even though the provider bills it.
+   *
+   * Never throws: cost telemetry must not fail the feature that spent the
+   * tokens.
+   */
+  async recordHeadlessUsage(
+    workspaceId: string,
+    modelString: string,
+    usage: LanguageModelV2Usage | undefined,
+    providerMetadata?: Record<string, unknown>,
+    options?: {
+      /**
+       * Subscription-covered routing (e.g. Codex OAuth). Stamps
+       * providerMetadata.mux.costsIncluded so createDisplayUsage prices the
+       * tokens at $0, mirroring the StreamManager path.
+       */
+      costsIncluded?: boolean;
+      /**
+       * When set, also append the raw usage to the workspace's
+       * headless-usage.jsonl sidecar so the analytics ETL can ingest it into
+       * dashboard totals. Only for callers whose spend produces NO chat.jsonl
+       * assistant row (status generation, memory sweeps) — callers that
+       * persist usage on a chat row (/btw) must omit this or the spend would
+       * be double-counted.
+       */
+      analyticsSource?: string;
+      /**
+       * Skip the session-usage.json byModel update. For callers that already
+       * recorded this turn's usage into the ledger through another path
+       * (StreamManager's abort handler) and only need the analytics sidecar.
+       */
+      skipSessionLedger?: boolean;
+    }
+  ): Promise<{ model: string; usage: ChatUsageDisplay } | undefined> {
+    if (!usage) return undefined;
+    try {
+      const canonicalModel = normalizeToCanonical(modelString);
+      // Resolve mappedToModel aliases for pricing (mirrors StreamManager's
+      // resolveMetadataModel): custom provider models would otherwise price
+      // against the raw custom ID (unknown → $0).
+      let metadataModel: string;
+      try {
+        metadataModel = resolveModelForMetadata(modelString, this.getProvidersConfig());
+      } catch {
+        metadataModel = modelString;
+      }
+      const existingMux = providerMetadata?.mux;
+      const effectiveProviderMetadata = options?.costsIncluded
+        ? {
+            ...(providerMetadata ?? {}),
+            mux: {
+              ...(typeof existingMux === "object" && existingMux !== null ? existingMux : {}),
+              costsIncluded: true,
+            },
+          }
+        : providerMetadata;
+      const displayUsage = createDisplayUsage(
+        usage,
+        canonicalModel,
+        effectiveProviderMetadata,
+        metadataModel
+      );
+      if (!displayUsage) return undefined;
+      // Sidecar append runs FIRST: it is the only source the analytics ETL
+      // can replay (there is no chat-row fallback for headless spend), so a
+      // crash between the two writes must leave the sidecar — a recorded
+      // ledger with a missing sidecar row would strand the spend out of the
+      // events table forever (startup sync would see no change to detect).
+      // The ledger is merely display state and self-heals via rebuilds.
+      if (options?.analyticsSource) {
+        // Raw usage + provider metadata (not display costs) so the ETL prices
+        // with the current tables — repricing rebuilds then cover these rows.
+        // metadataModel mirrors chat rows: model stays the canonical ID for
+        // attribution while pricing uses the resolved alias target.
+        const line = JSON.stringify({
+          timestamp: Date.now(),
+          source: options.analyticsSource,
+          model: canonicalModel,
+          metadataModel,
+          usage,
+          ...(effectiveProviderMetadata !== undefined
+            ? { providerMetadata: effectiveProviderMetadata }
+            : {}),
+        });
+        const sidecarPath = path.join(
+          path.dirname(this.getFilePath(workspaceId)),
+          HEADLESS_USAGE_FILE_NAME
+        );
+        await fs.mkdir(path.dirname(sidecarPath), { recursive: true });
+        await fs.appendFile(sidecarPath, `${line}\n`);
+      }
+      // Ledger update is isolated: a corrupt session-usage.json (readFile
+      // throws on bad JSON) must not fail the whole call once the sidecar
+      // line is durable.
+      let ledgerRecorded = false;
+      if (options?.skipSessionLedger !== true) {
+        try {
+          await this.recordUsage(workspaceId, canonicalModel, displayUsage, {
+            skipLastRequestUpdate: true,
+          });
+          ledgerRecorded = true;
+        } catch (error) {
+          log.warn("Failed to update session-usage ledger for headless usage", {
+            workspaceId,
+            modelString,
+            error,
+          });
+        }
+      }
+      if (options?.analyticsSource) {
+        // Sidecar callers consume the return value to trigger an analytics
+        // ingest pass, so signal success once the sidecar line is durable
+        // even if the ledger update failed.
+        return { model: canonicalModel, usage: displayUsage };
+      }
+      // No sidecar (/btw): the return value feeds a session-usage-delta event
+      // that must mirror the on-disk ledger, so require ledger success.
+      return ledgerRecorded ? { model: canonicalModel, usage: displayUsage } : undefined;
+    } catch (error) {
+      log.warn("Failed to record headless usage", { workspaceId, modelString, error });
+      return undefined;
+    }
   }
 
   /**

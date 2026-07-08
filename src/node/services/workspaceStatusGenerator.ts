@@ -1,4 +1,6 @@
 import { streamText, tool } from "ai";
+import type { LanguageModelV2Usage } from "@ai-sdk/provider";
+import { modelCostsIncluded } from "./providerModelFactory";
 import type { AIService } from "./aiService";
 import { log } from "./log";
 import { runLanguageModelCleanup } from "./languageModelCleanup";
@@ -10,6 +12,7 @@ import {
   TOOL_DEFINITIONS,
   ProposeStatusToolArgsSchema,
 } from "@/common/utils/tools/toolDefinitions";
+import { accumulateStepsProviderMetadata } from "@/common/utils/tokens/usageHelpers";
 
 /**
  * AI-generated sidebar status: emoji + short verb-led phrase, matching
@@ -129,7 +132,28 @@ export async function generateWorkspaceStatus(
   transcript: string,
   candidates: readonly string[],
   aiService: AIService,
-  options: BuildWorkspaceStatusPromptOptions = {}
+  options: BuildWorkspaceStatusPromptOptions & {
+    /**
+     * Best-effort cost telemetry: status generation bypasses StreamManager,
+     * so the caller records the successful candidate's usage into
+     * session-usage.json. costsIncluded reflects subscription-covered routing
+     * (Codex OAuth) so those tokens are priced at $0.
+     */
+    recordUsage?: (
+      modelString: string,
+      usage: LanguageModelV2Usage,
+      options: {
+        costsIncluded: boolean;
+        /**
+         * Step-accumulated provider metadata. Anthropic reports billed
+         * cache-write tokens only here (cacheCreationInputTokens), not in
+         * LanguageModelV2Usage — without it the recorder prices cache writes
+         * as ordinary input.
+         */
+        providerMetadata?: Record<string, unknown>;
+      }
+    ) => Promise<void>;
+  } = {}
 ): Promise<Result<GenerateWorkspaceStatusResult, GenerateWorkspaceStatusFailure>> {
   if (candidates.length === 0) {
     return Err({
@@ -187,6 +211,30 @@ export async function generateWorkspaceStatus(
       }
 
       const { emoji, message } = toolResult.output;
+
+      if (options.recordUsage) {
+        try {
+          // Guard totalUsage with a short timeout (like the stream-end and
+          // /btw usage reads): a slow-settling SDK promise must not block the
+          // already-produced status — AgentStatusService.runTick() awaits
+          // in-flight generations, so a stuck read would wedge the workspace's
+          // sidebar status loop. The recorder itself never throws.
+          const settled = await Promise.race([
+            Promise.all([currentStream.totalUsage, currentStream.steps]),
+            new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 2000)),
+          ]);
+          if (settled !== undefined) {
+            const [usage, steps] = settled;
+            await options.recordUsage(modelString, usage, {
+              costsIncluded: modelCostsIncluded(modelResult.data),
+              providerMetadata: accumulateStepsProviderMetadata(steps),
+            });
+          }
+        } catch {
+          // Usage promise rejection must not fail an otherwise good status.
+        }
+      }
+
       return Ok({
         status: { emoji: emoji.trim(), message: message.trim() },
         modelUsed: modelString,

@@ -52,7 +52,11 @@ import {
 import { getWorkspacePathHintForProject } from "@/node/services/workspaceProjectRepos";
 import { validateWorkspaceName } from "@/common/utils/validation/workspaceValidation";
 import { ensurePrivateDir, isErrnoWithCode } from "@/node/utils/fs";
-import { CHAT_FILE_NAME, CHAT_ARCHIVE_FILE_NAME } from "@/common/constants/paths";
+import {
+  CHAT_FILE_NAME,
+  CHAT_ARCHIVE_FILE_NAME,
+  HEADLESS_USAGE_FILE_NAME,
+} from "@/common/constants/paths";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { getProjects, isMultiProject } from "@/common/utils/multiProject";
 import { generateGitStatusScript, parseGitStatusScriptOutput } from "@/common/utils/git/gitStatus";
@@ -1206,6 +1210,24 @@ async function archiveChildSessionArtifactsIntoParentSessionDir(params: {
         },
       });
 
+      // Headless usage (status generation, memory sweeps) has no chat row;
+      // the archived sidecar is the only way the analytics ETL can restore
+      // that spend after clearWorkspace deletes the child's event rows.
+      await copyFileBestEffort({
+        srcPath: path.join(params.childSessionDir, HEADLESS_USAGE_FILE_NAME),
+        destPath: path.join(
+          params.parentSessionDir,
+          "subagent-transcripts",
+          params.childWorkspaceId,
+          HEADLESS_USAGE_FILE_NAME
+        ),
+        logContext: {
+          parentWorkspaceId: params.parentWorkspaceId,
+          childWorkspaceId: params.childWorkspaceId,
+          artifact: HEADLESS_USAGE_FILE_NAME,
+        },
+      });
+
       if (didCopyChat || didCopyPartial) {
         const nowMs = Date.now();
 
@@ -1528,8 +1550,24 @@ async function forEachWithConcurrencyLimit<T>(
 
 export interface WorkspaceServiceEvents {
   chat: (event: { workspaceId: string; message: WorkspaceChatMessage }) => void;
-  metadata: (event: { workspaceId: string; metadata: FrontendWorkspaceMetadata | null }) => void;
+  metadata: (event: {
+    workspaceId: string;
+    metadata: FrontendWorkspaceMetadata | null;
+    /**
+     * Set on removal (metadata === null) when the removed workspace was a
+     * sub-agent/task child: its transcript was archived into this parent's
+     * session dir, so analytics can re-ingest the parent to restore the
+     * child's spend after clearing the child's live rows.
+     */
+    removedParentWorkspaceId?: string;
+  }) => void;
   activity: (event: { workspaceId: string; activity: WorkspaceActivitySnapshot | null }) => void;
+  /**
+   * Request an incremental analytics ingest for a workspace whose chat.jsonl
+   * gained billable usage outside the StreamManager stream-end path (e.g. a
+   * /btw side question). ServiceContainer routes this to AnalyticsService.
+   */
+  analyticsIngest: (event: { workspaceId: string }) => void;
 }
 
 // eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
@@ -4380,7 +4418,11 @@ export class WorkspaceService extends EventEmitter {
       await this.config.removeWorkspace(workspaceId);
       this.autoTitlingWorkspaces.delete(workspaceId);
 
-      this.emit("metadata", { workspaceId, metadata: null });
+      this.emit("metadata", {
+        workspaceId,
+        metadata: null,
+        ...(parentWorkspaceId ? { removedParentWorkspaceId: parentWorkspaceId } : {}),
+      });
 
       return Ok(undefined);
     } catch (error) {
@@ -5382,6 +5424,28 @@ export class WorkspaceService extends EventEmitter {
       emitChatEvent: (wsId, message) => {
         this.sessions.get(wsId)?.emitChatEvent(message);
       },
+      // /btw bypasses StreamManager, so record its spend explicitly or it
+      // never reaches session-usage.json / cost displays.
+      recordUsage: async (modelString, usage, providerMetadata) => {
+        const recorded = await this.sessionUsageService?.recordHeadlessUsage(
+          workspaceId,
+          modelString,
+          usage,
+          providerMetadata
+        );
+        // The renderer's session-usage cache only updates from stream-end
+        // usage metadata (absent for /btw) or delta events, so emit a delta —
+        // otherwise an open Costs tab shows stale totals until reload.
+        if (recorded) {
+          this.sessions.get(workspaceId)?.emitChatEvent({
+            type: "session-usage-delta",
+            workspaceId,
+            sourceWorkspaceId: workspaceId,
+            byModelDelta: { [recorded.model]: recorded.usage },
+            timestamp: Date.now(),
+          });
+        }
+      },
     });
     if (!result.success) {
       return {
@@ -5389,6 +5453,11 @@ export class WorkspaceService extends EventEmitter {
         error: result.error.raw ?? `Side question failed: ${result.error.type}`,
       };
     }
+    // The persisted answer row now carries metadata.usage, but incremental
+    // analytics ingest is normally driven by StreamManager stream-end (which
+    // /btw bypasses). Request an ingest pass so the spend reaches dashboard
+    // totals without waiting for the next real stream or an app restart.
+    this.emit("analyticsIngest", { workspaceId });
     return { success: true, modelUsed: result.data.modelUsed };
   }
 

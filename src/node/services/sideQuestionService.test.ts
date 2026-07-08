@@ -42,11 +42,16 @@ function createFakeAIService(
   return {
     createModel: () => Promise.resolve(Ok(model)),
     getStreamInfo: () => streamInfo,
+    // Identity resolution: no custom-provider mappedToModel aliases in tests.
+    resolveMetadataModel: (modelString: string) => modelString,
   };
 }
 
 /** Fake textStream that emits a fixed sequence of chunks. */
-function fakeTextStream(chunks: readonly string[]) {
+function fakeTextStream(
+  chunks: readonly string[],
+  opts?: { usage?: { inputTokens: number; outputTokens: number; totalTokens: number } }
+) {
   async function* gen() {
     for (const c of chunks) {
       // The await is purely formal — bun-test's async generator typing
@@ -59,6 +64,7 @@ function fakeTextStream(chunks: readonly string[]) {
   }
   return {
     textStream: gen(),
+    ...(opts?.usage !== undefined ? { totalUsage: Promise.resolve(opts.usage) } : {}),
   } as unknown as ReturnType<typeof aiSdk.streamText>;
 }
 
@@ -101,19 +107,30 @@ describe("askSideQuestion (persisted, streaming)", () => {
       await historyService.appendToHistory(workspaceId, createMuxMessage("m2", "assistant", "4"));
 
       let receivedTools: unknown;
+      const streamUsage = { inputTokens: 100, outputTokens: 5, totalTokens: 105 };
       spyOn(aiSdk, "streamText").mockImplementation(((opts: unknown) => {
         receivedTools = (opts as { tools?: unknown }).tools;
-        return fakeTextStream(["Yes — ", "**4**", ", as I said."]);
+        return fakeTextStream(["Yes — ", "**4**", ", as I said."], { usage: streamUsage });
       }) as unknown as typeof aiSdk.streamText);
 
+      const recordUsageCalls: Array<{ modelString: string; usage: unknown }> = [];
       const emitted: WorkspaceChatMessage[] = [];
       const result = await askSideQuestion({
         workspaceId,
         question: "are you sure?",
         candidates: ["openai:gpt-4.1-mini"],
-        aiService: createFakeAIService(createFakeModel()),
+        aiService: {
+          ...createFakeAIService(createFakeModel()),
+          // Distinct mapped target proves the RESOLVED model is persisted
+          // (custom-provider mappedToModel aliases price via metadataModel).
+          resolveMetadataModel: () => "openai:mapped-target",
+        },
         historyService,
         emitChatEvent: (_wsId, message) => emitted.push(message),
+        recordUsage: (modelString, usage) => {
+          recordUsageCalls.push({ modelString, usage });
+          return Promise.resolve();
+        },
       });
 
       expect(result.success).toBe(true);
@@ -154,6 +171,16 @@ describe("askSideQuestion (persisted, streaming)", () => {
           ? (terminalEvent.metadata.muxMetadata as { type?: string } | undefined)
           : undefined;
       expect(terminalMuxMeta?.type).toBe("side-question-answer");
+      // Double-count guard: the live Costs cache gets this turn's spend from
+      // the recordUsage callback (session-usage-delta); WorkspaceStore ALSO
+      // accumulates stream-end metadata.usage, so the terminal stream-end
+      // must not carry usage or open workspaces would count the turn twice.
+      expect(recordUsageCalls).toEqual([
+        { modelString: "openai:gpt-4.1-mini", usage: streamUsage },
+      ]);
+      expect(
+        terminalEvent?.type === "stream-end" ? terminalEvent.metadata.usage : null
+      ).toBeUndefined();
 
       // History: m1, m2, user /btw, assistant /btw answer.
       const after = await historyService.getLastMessages(workspaceId, 10);
@@ -167,6 +194,10 @@ describe("askSideQuestion (persisted, streaming)", () => {
       expect(user.metadata?.muxMetadata?.commandPrefix).toBe("/btw");
       expect(assistant.role).toBe("assistant");
       expect(assistant.metadata?.muxMetadata?.type).toBe("side-question-answer");
+      // The answer row stores both the raw model (attribution) and the
+      // resolved metadata model (ETL pricing for mapped custom models).
+      expect(assistant.metadata?.model).toBe("openai:gpt-4.1-mini");
+      expect(assistant.metadata?.metadataModel).toBe("openai:mapped-target");
       // The assistant's text part should contain the full streamed answer.
       const textPart = assistant.parts.find(
         (p): p is Extract<typeof p, { type: "text" }> => p.type === "text"
@@ -580,6 +611,7 @@ describe("askSideQuestion (persisted, streaming)", () => {
         aiService: {
           createModel,
           getStreamInfo: () => undefined,
+          resolveMetadataModel: (modelString: string) => modelString,
         } as unknown as AIService,
         historyService,
         emitChatEvent: () => undefined,

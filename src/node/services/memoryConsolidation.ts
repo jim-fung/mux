@@ -26,6 +26,7 @@
  * MemoryService; until then the journal is the only post-run signal.
  */
 import { tool, streamText, stepCountIs, type LanguageModel, type Tool } from "ai";
+import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 
 import assert from "@/common/utils/assert";
 import {
@@ -36,6 +37,7 @@ import type { MemoryToolResult } from "@/common/types/tools";
 import type { MemoryConsolidationOp } from "@/common/orpc/schemas/memory";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { getErrorMessage } from "@/common/utils/errors";
+import { accumulateStepsProviderMetadata } from "@/common/utils/tokens/usageHelpers";
 import { memoryLogicalKey, type MemoryMetaService } from "@/node/services/memoryMeta";
 import { parseMemoryPath, type MemoryScopeContext } from "@/node/services/memoryService";
 import type { MemoryService } from "@/node/services/memoryService";
@@ -207,6 +209,18 @@ export async function runMemoryConsolidation(args: {
    */
   finalPass?: boolean;
   abortSignal?: AbortSignal;
+  /**
+   * Best-effort cost telemetry: headless consolidation bypasses the chat cost
+   * pipeline, so the caller records the full stream usage (with cache-token
+   * breakdown) into session-usage.json. Invoked only after a clean stream.
+   * providerMetadata is step-accumulated — Anthropic reports billed
+   * cache-write tokens only there, so dropping it would price cache writes
+   * as ordinary input.
+   */
+  recordUsage?: (
+    usage: LanguageModelV2Usage,
+    providerMetadata?: Record<string, unknown>
+  ) => Promise<void>;
 }): Promise<MemoryConsolidationResult> {
   assert(args.agentBody.trim().length > 0, "dream agent body must not be empty");
   const journal: MemoryConsolidationOp[] = [];
@@ -261,6 +275,7 @@ export async function runMemoryConsolidation(args: {
         inputTokens: totalUsage.inputTokens ?? 0,
         outputTokens: totalUsage.outputTokens ?? 0,
       };
+      await args.recordUsage?.(totalUsage, accumulateStepsProviderMetadata(await stream.steps));
     } catch {
       usage = undefined;
     }
