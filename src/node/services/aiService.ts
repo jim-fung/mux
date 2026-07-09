@@ -123,6 +123,13 @@ import type {
   StreamEndEvent,
 } from "@/common/types/stream";
 import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
+import {
+  computeActiveToolNames,
+  prepareToolSearch,
+  rebuildToolSearchState,
+  seedToolSearchActivationsFromMessages,
+  type ToolSearchRuntime,
+} from "@/common/utils/tools/toolCatalog";
 import type { PTCEventWithParent } from "@/node/services/tools/code_execution";
 import { MockAiStreamPlayer } from "./mock/mockAiStreamPlayer";
 import { DEVTOOLS_RUN_METADATA_ID_HEADER } from "./devToolsHeaderCapture";
@@ -1383,6 +1390,9 @@ export class AIService extends EventEmitter {
       const workspaceHeartbeatsExperimentEnabled =
         experiments?.workspaceHeartbeats ??
         this.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS) === true;
+      const toolSearchExperimentEnabled =
+        experiments?.toolSearch ??
+        this.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.TOOL_SEARCH) === true;
       const memoryHotSetExperimentEnabled =
         this.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY_HOT_SET) === true;
       // Once final tool policy keeps the memory tool, upgrade the index-only
@@ -1638,6 +1648,14 @@ export class AIService extends EventEmitter {
           startupPhaseTimingsMs.mcpToolSetupMs = mcpSetupDurationMs;
         }
       }
+
+      // Tool search (tool-search experiment): assembly-time gate. The runtime
+      // holder makes getToolsForModel create the tool_search tool; its `state`
+      // is assigned only after policy filtering builds the deferred catalog
+      // (see prepareToolSearch below). Without MCP tools there is nothing to
+      // defer, so the feature stays fully inactive.
+      const toolSearchRuntime: ToolSearchRuntime | undefined =
+        toolSearchExperimentEnabled && Object.keys(mcpTools ?? {}).length > 0 ? {} : undefined;
 
       const createTempDirForStreamStartedAt = Date.now();
       const runtimeTempDir = await this.streamManager.createTempDirForStream(streamToken, runtime);
@@ -1999,6 +2017,7 @@ export class AIService extends EventEmitter {
               },
             }
           : {}),
+        ...(toolSearchRuntime ? { toolSearchRuntime } : {}),
         openaiWireFormat: effectiveMuxProviderOptions?.openai?.wireFormat,
         backgroundProcessManager: this.backgroundProcessManager,
         // Plan agent configuration for plan file access.
@@ -2121,6 +2140,7 @@ export class AIService extends EventEmitter {
           dynamicWorkflows: dynamicWorkflowsExperimentEnabled,
           memory: memoryExperimentEnabled,
           workspaceHeartbeats: workspaceHeartbeatsExperimentEnabled,
+          toolSearch: toolSearchExperimentEnabled,
         },
         // Dynamic context for tool descriptions (moved from system prompt for better model attention)
         availableSubagents: agentDefinitions,
@@ -2157,7 +2177,7 @@ export class AIService extends EventEmitter {
 
       // Apply tool policy and PTC experiments (lazy-loads PTC dependencies only when needed).
       const applyToolPolicyAndExperimentsStartedAt = Date.now();
-      const tools = await applyToolPolicyAndExperiments({
+      let tools = await applyToolPolicyAndExperiments({
         allTools: toolsWithDelegation,
         extraTools: this.extraTools,
         effectiveToolPolicy,
@@ -2168,6 +2188,30 @@ export class AIService extends EventEmitter {
         "applyToolPolicyAndExperimentsMs",
         applyToolPolicyAndExperimentsStartedAt
       );
+
+      // Tool search (tool-search experiment): post-policy gate. Classification
+      // must consume the policy-filtered record so policy-disabled tools never
+      // enter the deferred catalog. This runs before every downstream consumer
+      // of `tools` (system-prompt rebuild, sentinel tool names, telemetry,
+      // streaming) so a dropped tool_search cannot leak anywhere.
+      // PTC gate uses the same condition toolAssembly uses to add code_execution:
+      // presence-sniffing the record would misfire on an MCP tool named
+      // code_execution (see prepareToolSearch).
+      const ptcEnabled =
+        experiments?.programmaticToolCalling === true ||
+        experiments?.programmaticToolCallingExclusive === true;
+      if (toolSearchRuntime) {
+        const toolSearchPrep = prepareToolSearch({
+          tools,
+          mcpToolNames: Object.keys(mcpTools ?? {}),
+          toolPolicy: effectiveToolPolicy,
+          ptcEnabled,
+        });
+        tools = toolSearchPrep.tools;
+        if (toolSearchPrep.state) {
+          toolSearchRuntime.state = toolSearchPrep.state;
+        }
+      }
 
       const advisorToolAvailable = tools.advisor !== undefined;
       const memoryToolAvailable = tools.memory !== undefined;
@@ -2222,7 +2266,20 @@ export class AIService extends EventEmitter {
         systemMessageTokens = await tokenizer.countTokens(systemMessage);
       }
 
-      const toolNamesForSentinel = Object.keys(tools).sort();
+      // Re-activate deferred tools discovered by tool_search in earlier turns
+      // without requiring a new search. Must run before the sentinel list is
+      // computed so pre-activated tools are advertised in agent transitions.
+      if (toolSearchRuntime?.state) {
+        seedToolSearchActivationsFromMessages(toolSearchRuntime.state, messagesWithSentinel);
+      }
+
+      // Agent-transition sentinels must list only tools the model can actually
+      // see on the first step: deferred, not-yet-activated MCP tools are
+      // hidden by activeTools scoping, so advertising them would steer the
+      // model toward unavailable tool calls.
+      const toolNamesForSentinel = (
+        computeActiveToolNames(toolSearchRuntime?.state) ?? Object.keys(tools)
+      ).sort();
 
       // Run the full message preparation pipeline (inject context, transform, validate).
       // This is a purely functional pipeline with no service dependencies.
@@ -2541,7 +2598,7 @@ export class AIService extends EventEmitter {
                     toolInstructions,
                     mcpTools
                   );
-                  const nextTools = await applyToolPolicyAndExperiments({
+                  let nextTools = await applyToolPolicyAndExperiments({
                     allTools: this.wrapToolsForDelegation(
                       workspaceId,
                       nextAllTools,
@@ -2552,7 +2609,34 @@ export class AIService extends EventEmitter {
                     experiments,
                     emitNestedToolEvent: emitNestedPtcToolEvent,
                   });
-                  const nextToolNamesForSentinel = Object.keys(nextTools).sort();
+                  // Tool search: keep the per-stream state consistent with the
+                  // fallback model's re-assembled toolset. rebuildToolSearchState
+                  // mutates the state object in place — StreamManager's request
+                  // holds a reference to it, so prepareStep reads current state.
+                  if (toolSearchRuntime) {
+                    if (toolSearchRuntime.state) {
+                      nextTools = rebuildToolSearchState(toolSearchRuntime.state, {
+                        tools: nextTools,
+                        mcpToolNames: Object.keys(mcpTools ?? {}),
+                        toolPolicy: effectiveToolPolicy,
+                        ptcEnabled,
+                      }).tools;
+                    } else if (!(mcpTools && "tool_search" in mcpTools)) {
+                      // The primary-path gate deactivated deferral (e.g. every
+                      // MCP tool was policy-disabled). StreamManager was never
+                      // handed scoping state, so tool_search must not appear in
+                      // the fallback toolset either. Skipped when an MCP tool
+                      // collides with the name: that record entry is a
+                      // legitimate MCP tool, not our search tool.
+                      const { tool_search: _removed, ...rest } = nextTools;
+                      nextTools = rest;
+                    }
+                  }
+                  // Same active-set scoping as the primary sentinel: never
+                  // advertise deferred, not-yet-activated MCP tools.
+                  const nextToolNamesForSentinel = (
+                    computeActiveToolNames(toolSearchRuntime?.state) ?? Object.keys(nextTools)
+                  ).sort();
                   const nextMemoryToolAvailable = nextTools.memory !== undefined;
                   const nextMemoryContext = await upgradeMemoryContextForModel(
                     nextMemoryToolAvailable,
@@ -2739,7 +2823,8 @@ export class AIService extends EventEmitter {
             }
           : undefined,
         runtimeTempDir,
-        modelFallback
+        modelFallback,
+        toolSearchRuntime?.state
       );
       recordStartupPhaseTiming("startStreamMs", startStreamStartedAt);
 
