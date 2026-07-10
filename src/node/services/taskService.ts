@@ -78,7 +78,12 @@ import { getWorkspaceProjectRepos } from "@/node/services/workspaceProjectRepos"
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 import { getTotalCost, sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
-import type { ParsedThinkingInput, ThinkingLevel } from "@/common/types/thinking";
+import {
+  coerceOpenAIReasoningMode,
+  type OpenAIReasoningMode,
+  type ParsedThinkingInput,
+  type ThinkingLevel,
+} from "@/common/types/thinking";
 import type { ErrorEvent, StreamAbortEvent, StreamEndEvent } from "@/common/types/stream";
 import {
   isActiveWorkflowRunStatus,
@@ -164,6 +169,8 @@ export type AgentTaskStatus = NonNullable<WorkspaceConfigEntry["taskStatus"]>;
 interface ResolvedWorkspaceAiSettings {
   model: string;
   thinkingLevel?: ThinkingLevel;
+  /** OpenAI pro reasoning mode; per-workspace choice inherited by spawned tasks. */
+  reasoningMode?: OpenAIReasoningMode;
 }
 
 export interface AgentTaskStatusLookup {
@@ -569,6 +576,7 @@ interface TaskLaunchPlan {
   taskModelString: string;
   canonicalModel: string;
   effectiveThinkingLevel?: ThinkingLevel;
+  effectiveReasoningMode?: OpenAIReasoningMode;
   skipInitHook: boolean;
   preferredTrunkBranch?: string;
   workflowTask?: TaskCreateArgs["workflowTask"];
@@ -1578,6 +1586,8 @@ export class TaskService {
   private resolveTaskAISettings(params: {
     cfg: ReturnType<Config["loadConfigOrDefault"]>;
     parentMeta: {
+      /** Parent's persisted selected agent (see persistSelectedAgentId). */
+      agentId?: string;
       aiSettingsByAgent?: Record<string, ResolvedWorkspaceAiSettings>;
       aiSettings?: ResolvedWorkspaceAiSettings;
     };
@@ -1589,6 +1599,7 @@ export class TaskService {
     taskModelString: string;
     canonicalModel: string;
     effectiveThinkingLevel: ThinkingLevel;
+    effectiveReasoningMode?: OpenAIReasoningMode;
   } {
     const parentAiSettings = this.resolveWorkspaceAISettings(params.parentMeta, params.agentId);
     // Sub-agent defaults take priority over UI agent defaults per field for any agent invoked as a sub-agent.
@@ -1608,9 +1619,13 @@ export class TaskService {
 
     // Resolve an explicit override first so numeric thinking indices map into the
     // chosen model's allowed levels (named levels pass through unchanged).
+    // Providers config threads through so mapped aliases (mappedToModel, e.g.
+    // openai:team-sol -> gpt-5.6-sol) keep their target's native levels instead
+    // of being clamped to the default four-level ladder.
+    const providersConfig = this.aiService.getProvidersConfig();
     const overrideThinkingLevel =
       params.thinkingLevel != null
-        ? resolveThinkingInput(params.thinkingLevel, canonicalModel)
+        ? resolveThinkingInput(params.thinkingLevel, canonicalModel, providersConfig)
         : undefined;
     const requestedThinkingLevel: ThinkingLevel =
       overrideThinkingLevel ??
@@ -1619,9 +1634,34 @@ export class TaskService {
       parentRuntimeAiSettings?.thinkingLevel ??
       parentAiSettings?.thinkingLevel ??
       "off";
-    const effectiveThinkingLevel = enforceThinkingPolicy(canonicalModel, requestedThinkingLevel);
+    const effectiveThinkingLevel = enforceThinkingPolicy(
+      canonicalModel,
+      requestedThinkingLevel,
+      undefined,
+      providersConfig
+    );
 
-    return { taskModelString, canonicalModel, effectiveThinkingLevel };
+    // Pro reasoning mode is a per-workspace choice (agent/subagent defaults do
+    // not carry it), so tasks inherit it from the parent's persisted settings.
+    // The user toggles pro on the parent's ACTIVE agent, so the target agent's
+    // bucket rarely carries one — fall back to the parent's active-agent bucket
+    // (persisted selected agent, defaulting to exec), then legacy settings.
+    // Safe to pass through unconditionally: the send path re-gates per model
+    // (buildRequestHeaders is inert for unsupported models/routes).
+    const activeParentAiSettings = this.resolveWorkspaceAISettings(
+      params.parentMeta,
+      normalizeAgentId(params.parentMeta.agentId)
+    );
+    const effectiveReasoningMode = coerceOpenAIReasoningMode(
+      parentAiSettings?.reasoningMode ?? activeParentAiSettings?.reasoningMode
+    );
+
+    return {
+      taskModelString,
+      canonicalModel,
+      effectiveThinkingLevel,
+      ...(effectiveReasoningMode != null ? { effectiveReasoningMode } : {}),
+    };
   }
 
   /**
@@ -1640,7 +1680,12 @@ export class TaskService {
     },
     fallbackModel: string,
     hint?: ParentAutoResumeHint
-  ): Promise<{ model: string; agentId: string; thinkingLevel?: ThinkingLevel }> {
+  ): Promise<{
+    model: string;
+    agentId: string;
+    thinkingLevel?: ThinkingLevel;
+    reasoningMode?: OpenAIReasoningMode;
+  }> {
     // 1) Try stream-end hint metadata (available in handleStreamEnd path)
     let agentId = hint?.agentId;
 
@@ -1668,10 +1713,14 @@ export class TaskService {
     agentId = agentId ?? TASK_RECOVERY_FALLBACK_AGENT_ID;
 
     const aiSettings = this.resolveWorkspaceAISettings(parentEntry.workspace, agentId);
+    const reasoningMode = coerceOpenAIReasoningMode(aiSettings?.reasoningMode);
     return {
       model: aiSettings?.model ?? fallbackModel,
       agentId,
       thinkingLevel: aiSettings?.thinkingLevel,
+      // Per-workspace pro mode carries into synthetic auto-resumes; the send
+      // path re-gates per model/route so this is inert for unsupported models.
+      ...(reasoningMode != null ? { reasoningMode } : {}),
     };
   }
 
@@ -2017,6 +2066,7 @@ export class TaskService {
           model,
           agentId,
           thinkingLevel: task.taskThinkingLevel,
+          reasoningMode: coerceOpenAIReasoningMode(task.aiSettings?.reasoningMode),
           experiments: task.taskExperiments,
         },
         { synthetic: true, agentInitiated: true }
@@ -2292,7 +2342,7 @@ export class TaskService {
         );
       }
 
-      const { taskModelString, canonicalModel, effectiveThinkingLevel } =
+      const { taskModelString, canonicalModel, effectiveThinkingLevel, effectiveReasoningMode } =
         this.resolveTaskAISettings({
           cfg,
           parentMeta,
@@ -2424,6 +2474,7 @@ export class TaskService {
         taskModelString,
         canonicalModel,
         effectiveThinkingLevel,
+        effectiveReasoningMode,
         skipInitHook,
         workflowTask: args.workflowTask,
         bestOf: normalizedBestOf,
@@ -2480,7 +2531,13 @@ export class TaskService {
           runtimeConfig: plan.taskRuntimeConfig,
           aiSettings:
             plan.effectiveThinkingLevel !== undefined
-              ? { model: plan.canonicalModel, thinkingLevel: plan.effectiveThinkingLevel }
+              ? {
+                  model: plan.canonicalModel,
+                  thinkingLevel: plan.effectiveThinkingLevel,
+                  ...(plan.effectiveReasoningMode != null
+                    ? { reasoningMode: plan.effectiveReasoningMode }
+                    : {}),
+                }
               : undefined,
           parentWorkspaceId: plan.parentWorkspaceId,
           agentId: plan.agentId,
@@ -2890,6 +2947,9 @@ export class TaskService {
       model: plan.taskModelString,
       agentId: plan.agentId,
       thinkingLevel: plan.effectiveThinkingLevel,
+      // Inherited pro mode: the send path re-gates per model/route, so this is
+      // inert for non-GPT-5.6 task models.
+      reasoningMode: plan.effectiveReasoningMode,
       experiments: plan.experiments,
     };
     const sendResult =
@@ -3044,10 +3104,31 @@ export class TaskService {
       defaultModel;
     const thinkingLevel =
       args.thinkingLevel != null
-        ? resolveThinkingInput(args.thinkingLevel, normalizeToCanonical(model))
+        ? // Providers config keeps mapped aliases on their target's ladder
+          // (see resolveTaskAISettings).
+          resolveThinkingInput(
+            args.thinkingLevel,
+            normalizeToCanonical(model),
+            this.aiService.getProvidersConfig()
+          )
         : (args.parentRuntimeAiSettings?.thinkingLevel ??
           parentMeta.aiSettingsByAgent?.exec?.thinkingLevel ??
           parentMeta.aiSettings?.thinkingLevel);
+    // Per-workspace pro mode inherits alongside model/thinking; the send path
+    // re-gates per model/route so this is inert for non-GPT-5.6 models.
+    // The user toggles pro on the parent's ACTIVE agent, so after the exec
+    // bucket fall back to the active-agent bucket (then legacy settings) —
+    // mirroring resolveTaskAISettings — or a workspace turn launched from a
+    // non-exec parent agent would silently drop back to standard mode.
+    const activeParentAiSettings = this.resolveWorkspaceAISettings(
+      parentMeta,
+      normalizeAgentId(parentMeta.agentId)
+    );
+    const reasoningMode = coerceOpenAIReasoningMode(
+      parentMeta.aiSettingsByAgent?.exec?.reasoningMode ??
+        activeParentAiSettings?.reasoningMode ??
+        parentMeta.aiSettings?.reasoningMode
+    );
 
     const record: WorkspaceTurnTaskHandleRecord = {
       kind: "workspace_turn",
@@ -3107,6 +3188,7 @@ export class TaskService {
         model,
         agentId: "exec",
         ...(thinkingLevel != null ? { thinkingLevel } : {}),
+        ...(reasoningMode != null ? { reasoningMode } : {}),
         muxMetadata: this.buildWorkspaceTurnMuxMetadata(record),
         experiments: args.experiments,
         ...(mode === "existing" ? { queueDispatchMode } : {}),
@@ -3301,14 +3383,15 @@ export class TaskService {
       );
     }
 
-    const { taskModelString, canonicalModel, effectiveThinkingLevel } = this.resolveTaskAISettings({
-      cfg,
-      parentMeta,
-      agentId,
-      modelString: args.modelString,
-      thinkingLevel: args.thinkingLevel,
-      parentRuntimeAiSettings: args.parentRuntimeAiSettings,
-    });
+    const { taskModelString, canonicalModel, effectiveThinkingLevel, effectiveReasoningMode } =
+      this.resolveTaskAISettings({
+        cfg,
+        parentMeta,
+        agentId,
+        modelString: args.modelString,
+        thinkingLevel: args.thinkingLevel,
+        parentRuntimeAiSettings: args.parentRuntimeAiSettings,
+      });
 
     const parentRuntimeConfig = parentMeta.runtimeConfig;
     const taskRuntimeConfig: RuntimeConfig = parentRuntimeConfig;
@@ -3488,7 +3571,11 @@ export class TaskService {
           title: args.title,
           createdAt,
           runtimeConfig: taskRuntimeConfig,
-          aiSettings: { model: canonicalModel, thinkingLevel: effectiveThinkingLevel },
+          aiSettings: {
+            model: canonicalModel,
+            thinkingLevel: effectiveThinkingLevel,
+            ...(effectiveReasoningMode != null ? { reasoningMode: effectiveReasoningMode } : {}),
+          },
           parentWorkspaceId,
           agentId,
           agentType,
@@ -3648,7 +3735,11 @@ export class TaskService {
         title: args.title,
         createdAt,
         runtimeConfig: forkedRuntimeConfig,
-        aiSettings: { model: canonicalModel, thinkingLevel: effectiveThinkingLevel },
+        aiSettings: {
+          model: canonicalModel,
+          thinkingLevel: effectiveThinkingLevel,
+          ...(effectiveReasoningMode != null ? { reasoningMode: effectiveReasoningMode } : {}),
+        },
         agentId,
         parentWorkspaceId,
         agentType,
@@ -3707,6 +3798,7 @@ export class TaskService {
         model: taskModelString,
         agentId,
         thinkingLevel: effectiveThinkingLevel,
+        reasoningMode: effectiveReasoningMode,
         experiments: args.experiments,
       },
       { agentInitiated: true }
@@ -4801,6 +4893,7 @@ export class TaskService {
       model: resumeOptions.model,
       agentId: resumeOptions.agentId,
       thinkingLevel: resumeOptions.thinkingLevel,
+      reasoningMode: resumeOptions.reasoningMode,
     };
     let sendResult = await this.workspaceService.sendMessage(
       ownerWorkspaceId,
@@ -5308,6 +5401,7 @@ export class TaskService {
         model,
         agentId,
         thinkingLevel: freshEntry.workspace.taskThinkingLevel,
+        reasoningMode: coerceOpenAIReasoningMode(freshEntry.workspace.aiSettings?.reasoningMode),
         experiments: freshEntry.workspace.taskExperiments,
         toolPolicy: [{ regex_match: `^${completionToolName}$`, action: "require" }],
       },
@@ -7416,6 +7510,9 @@ export class TaskService {
           taskModelString: task.taskModelString ?? defaultModel,
           canonicalModel,
           effectiveThinkingLevel: task.taskThinkingLevel,
+          // Durable pro-mode source: the task record's aiSettings (written at
+          // creation, kept current by subsequent sends' persistence merge).
+          effectiveReasoningMode: coerceOpenAIReasoningMode(task.aiSettings?.reasoningMode),
           skipInitHook,
           preferredTrunkBranch: task.taskTrunkBranch,
           workflowTask: task.workflowTask,
@@ -7685,6 +7782,7 @@ export class TaskService {
         model,
         agentId,
         thinkingLevel: entry.workspace.taskThinkingLevel,
+        reasoningMode: coerceOpenAIReasoningMode(entry.workspace.aiSettings?.reasoningMode),
         experiments: entry.workspace.taskExperiments,
         toolPolicy: [{ regex_match: `^${completionToolName}$`, action: "require" }],
       },
@@ -7746,6 +7844,7 @@ export class TaskService {
         model,
         agentId,
         thinkingLevel: entry.workspace.taskThinkingLevel,
+        reasoningMode: coerceOpenAIReasoningMode(entry.workspace.aiSettings?.reasoningMode),
         experiments: entry.workspace.taskExperiments,
       },
       { synthetic: true, agentInitiated: true }
@@ -8291,6 +8390,7 @@ export class TaskService {
         model: resumeOptions.model,
         agentId: resumeOptions.agentId,
         thinkingLevel: resumeOptions.thinkingLevel,
+        reasoningMode: resumeOptions.reasoningMode,
         ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
       };
       let sendResult = await this.workspaceService.sendMessage(
@@ -9111,10 +9211,26 @@ export class TaskService {
           },
         });
 
+      // Plan -> Exec continues in the same workspace, so its own persisted pro
+      // choice carries over (resolveTaskAISettings sees an empty parentMeta here).
+      // A PRO toggle during the plan phase persists under the plan agent's
+      // bucket (aiSettingsByAgent), so read the still-current plan agent's
+      // settings first and only then fall back to legacy aiSettings.
+      const planAgentSettings = this.resolveWorkspaceAISettings(
+        args.entry.workspace,
+        normalizeAgentId(args.entry.workspace.agentId, "plan")
+      );
+      const planPhaseReasoningMode = coerceOpenAIReasoningMode(
+        planAgentSettings?.reasoningMode ?? args.entry.workspace.aiSettings?.reasoningMode
+      );
       await this.editWorkspaceEntry(args.workspaceId, (workspace) => {
         workspace.agentId = targetAgentId;
         workspace.agentType = targetAgentId;
-        workspace.aiSettings = { model: canonicalModel, thinkingLevel: effectiveThinkingLevel };
+        workspace.aiSettings = {
+          model: canonicalModel,
+          thinkingLevel: effectiveThinkingLevel,
+          ...(planPhaseReasoningMode != null ? { reasoningMode: planPhaseReasoningMode } : {}),
+        };
         workspace.taskModelString = taskModelString;
         workspace.taskThinkingLevel = effectiveThinkingLevel;
         // A successful propose_plan is a successful completion-tool outcome: the
@@ -9133,6 +9249,7 @@ export class TaskService {
             model: taskModelString,
             agentId: targetAgentId,
             thinkingLevel: effectiveThinkingLevel,
+            ...(planPhaseReasoningMode != null ? { reasoningMode: planPhaseReasoningMode } : {}),
             experiments: args.entry.workspace.taskExperiments,
           },
           { synthetic: true, agentInitiated: true }

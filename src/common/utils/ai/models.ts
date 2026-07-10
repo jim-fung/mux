@@ -79,6 +79,30 @@ export function getExplicitGatewayPrefix(modelString: string): ProviderName | un
 }
 
 /**
+ * Resolve which providerOptions namespace a request will use for a given
+ * canonical origin and route provider. Passthrough gateways (mux-gateway)
+ * keep the origin namespace; transforming gateways (openrouter,
+ * github-copilot, bedrock) use their own.
+ */
+export function resolveProviderOptionsNamespaceKey(
+  canonicalProviderName: string,
+  routeProvider?: ProviderName
+): string {
+  const routeDefinition = routeProvider ? PROVIDER_DEFINITIONS[routeProvider] : undefined;
+  if (
+    !routeProvider ||
+    routeProvider === canonicalProviderName ||
+    (routeDefinition != null &&
+      "passthrough" in routeDefinition &&
+      routeDefinition.passthrough === true)
+  ) {
+    return canonicalProviderName;
+  }
+
+  return routeProvider;
+}
+
+/**
  * Normalize a selected model while preserving explicit gateway routing choices.
  * User-selected gateway identities like openrouter:openai/gpt-5 should stay intact.
  */

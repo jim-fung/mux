@@ -196,6 +196,62 @@ describe("getThinkingPolicyForModel", () => {
     ]);
   });
 
+  test("returns 6 levels including max for gpt-5.6-sol", () => {
+    expect(getThinkingPolicyForModel("openai:gpt-5.6-sol")).toEqual([
+      "off",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+    expect(getThinkingPolicyForModel("mux-gateway:openai/gpt-5.6-sol-2026-07-09")).toEqual([
+      "off",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+  });
+
+  // Native max is family-wide at GA (Sol/Terra/Luna and the bare alias).
+  test("returns 6 levels including max for gpt-5.6-terra and gpt-5.6-luna", () => {
+    expect(getThinkingPolicyForModel("openai:gpt-5.6-terra")).toEqual([
+      "off",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+    expect(getThinkingPolicyForModel("openai:gpt-5.6-luna")).toEqual([
+      "off",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+    expect(getThinkingPolicyForModel("mux-gateway:openai/gpt-5.6-terra-2026-07-09")).toEqual([
+      "off",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+  });
+
+  test("gpt-5.6-sol named variants fall through to the default policy", () => {
+    expect(getThinkingPolicyForModel("openai:gpt-5.6-sol-mini")).toEqual([
+      "off",
+      "low",
+      "medium",
+      "high",
+    ]);
+  });
+
   test("returns 5 levels including xhigh for gpt-5.4-mini", () => {
     expect(getThinkingPolicyForModel("openai:gpt-5.4-mini")).toEqual([
       "off",
@@ -426,6 +482,36 @@ describe("getThinkingPolicyForModel", () => {
     );
     // Without providers config the alias is unknown and keeps legacy off behavior.
     expect(resolveEffectiveThinkingLevel("anthropic:internal-fable", undefined)).toBe("off");
+  });
+
+  test("policy path resolves mappedToModel aliases to the target's capability", () => {
+    // An alias mapped to a GPT-5.6 model must expose the target's 6-level
+    // ladder (incl. native max) and clamp against it — otherwise AgentSession
+    // strips "max" before buildProviderOptions can resolve the alias.
+    const providersConfig: ProvidersConfigMap = {
+      openai: {
+        apiKeySet: true,
+        isEnabled: true,
+        isConfigured: true,
+        models: [{ id: "team-sol", mappedToModel: "openai:gpt-5.6-sol" }],
+      },
+    };
+    expect(getThinkingPolicyForModel("openai:team-sol", providersConfig)).toEqual([
+      "off",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+    expect(getAvailableThinkingLevels("openai:team-sol", null, providersConfig)).toContain("max");
+    expect(enforceThinkingPolicy("openai:team-sol", "max", null, providersConfig)).toBe("max");
+    // Aliases inherit the target's default medium floor (recognized reasoning model).
+    expect(getDefaultMinimumThinkingLevel("openai:team-sol", providersConfig)).toBe("medium");
+    expect(resolveMinimumThinkingLevel("openai:team-sol", null, providersConfig)).toBe("medium");
+    // Without providers config the alias is unknown: default 4-level policy clamps max down.
+    expect(enforceThinkingPolicy("openai:team-sol", "max")).toBe("high");
+    expect(getDefaultMinimumThinkingLevel("openai:team-sol")).toBe("off");
   });
 
   test("returns all 6 levels for Sonnet 5 (native xhigh)", () => {

@@ -5,7 +5,14 @@ import type { ConfirmDialogOptions } from "@/browser/contexts/ConfirmDialogConte
 import { getContextResetSuccessMessage } from "@/browser/utils/contextResetFeedback";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import type { PinnedMoveDirection } from "@/browser/utils/ui/pinnedReorder";
-import { THINKING_LEVELS, type ThinkingLevel } from "@/common/types/thinking";
+import {
+  THINKING_LEVELS,
+  type OpenAIReasoningMode,
+  type ThinkingLevel,
+} from "@/common/types/thinking";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
+import { normalizeToCanonical } from "@/common/utils/ai/models";
+import { openaiProModeAvailable } from "@/common/utils/ai/proMode";
 import {
   enforceThinkingPolicy,
   getAvailableThinkingLevels,
@@ -81,6 +88,12 @@ export interface BuildSourcesParams {
   // UI actions
   getThinkingLevel: (workspaceId: string) => ThinkingLevel;
   onSetThinkingLevel: (workspaceId: string, level: ThinkingLevel) => void;
+  getReasoningMode: (workspaceId: string) => OpenAIReasoningMode;
+  onToggleReasoningMode: (workspaceId: string) => void;
+  /** Providers config for pro-mode availability (wire format + Codex OAuth detection). */
+  providersConfig?: ProvidersConfigMap | null;
+  /** Settings-resolved route for a canonical model ("direct" = no gateway). */
+  getRouteForModel?: (canonicalModel: string) => string;
   /**
    * Explicit per-model minimum thinking override (undefined → built-in default floor).
    * Used to hide off/low from the "Set Thinking Effort" picker, matching the slider.
@@ -1201,14 +1214,18 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       // medium floor reads as "medium").
       const currentModelString = p.selectedWorkspaceState?.currentModel;
       const rawCurrentLevel = p.getThinkingLevel(workspaceId);
+      // Pass providersConfig so mapped aliases (mappedToModel -> e.g. GPT-5.6)
+      // resolve to the target's ladder, matching the slider and send path.
       const currentLevel = currentModelString
         ? enforceThinkingPolicy(
             currentModelString,
             rawCurrentLevel,
             resolveMinimumThinkingLevel(
               currentModelString,
-              p.getMinThinkingOverride?.(currentModelString)
-            )
+              p.getMinThinkingOverride?.(currentModelString),
+              p.providersConfig
+            ),
+            p.providersConfig
           )
         : rawCurrentLevel;
 
@@ -1238,8 +1255,10 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                       modelString,
                       resolveMinimumThinkingLevel(
                         modelString,
-                        p.getMinThinkingOverride?.(modelString)
-                      )
+                        p.getMinThinkingOverride?.(modelString),
+                        p.providersConfig
+                      ),
+                      p.providersConfig
                     )
                   : THINKING_LEVELS;
                 return allowedLevels.map((level) => ({
@@ -1264,6 +1283,41 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           },
         },
       });
+
+      // Pro reasoning mode is only meaningful for models that support it
+      // (GPT-5.6 family) on routes that emit the pro-mode header (direct
+      // OpenAI) with the Responses wire format; hide the action elsewhere to
+      // avoid inert toggles. Gate on the chat input's persisted selection —
+      // that is the model the NEXT send will use — and only fall back to the
+      // activity snapshot's currentModel (last streamed model, stale after a
+      // model switch) when no selection exists. The mobile layout hides the
+      // PRO chip and relies on this palette action being reachable before the
+      // first send with the newly selected model.
+      const persistedSelectionModel =
+        typeof window === "undefined"
+          ? undefined
+          : getSendOptionsFromStorage(workspaceId).model || undefined;
+      const proGateModelString = persistedSelectionModel ?? currentModelString;
+      const currentModelRoute = proGateModelString
+        ? p.getRouteForModel?.(normalizeToCanonical(proGateModelString))
+        : undefined;
+      if (
+        openaiProModeAvailable(proGateModelString ?? "", {
+          providersConfig: p.providersConfig,
+          resolvedRouteProvider: currentModelRoute,
+        })
+      ) {
+        const proActive = p.getReasoningMode(workspaceId) === "pro";
+        list.push({
+          id: CommandIds.toggleProReasoning(),
+          title: "Toggle Pro Reasoning Mode",
+          subtitle: `Current: ${proActive ? "Pro — slower, more thorough" : "Standard"}`,
+          section: section.mode,
+          run: () => {
+            p.onToggleReasoningMode(workspaceId);
+          },
+        });
+      }
     }
 
     return list;

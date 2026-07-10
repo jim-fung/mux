@@ -38,8 +38,12 @@ export function getThinkingDisplayLabel(level: ThinkingLevel, modelString?: stri
     const normalized = modelString.trim().toLowerCase();
     const withoutPrefix = normalized.replace(/^[a-z0-9_-]+:\s*/, "");
 
-    // OpenAI: both xhigh and max resolve to "xhigh" reasoning effort
-    if (normalized.startsWith("openai:") || withoutPrefix.startsWith("openai/")) return "XHIGH";
+    // OpenAI: both xhigh and max resolve to "xhigh" reasoning effort — except
+    // GPT-5.6 Sol, where "max" is a distinct native effort above xhigh.
+    if (normalized.startsWith("openai:") || withoutPrefix.startsWith("openai/")) {
+      if (level === "max" && openaiSupportsNativeMaxEffort(modelString)) return "MAX";
+      return "XHIGH";
+    }
 
     // Anthropic Opus 4.7+: xhigh is a distinct effort level from max
     if (level === "xhigh" && anthropicSupportsNativeXhigh(modelString)) return "XHIGH";
@@ -238,6 +242,59 @@ export function anthropicSupportsNativeXhigh(modelString: string): boolean {
 }
 
 /**
+ * GPT-5.6 family matcher: the bare `gpt-5.6` alias (OpenAI routes it to Sol)
+ * plus the Sol/Terra/Luna tiers. The `\b` + lookaheads tolerate version-date
+ * suffixes (e.g. gpt-5.6-sol-2026-07-09) while rejecting hypothetical named
+ * variants (e.g. gpt-5.6-sol-mini) and other ids (e.g. gpt-5.61).
+ */
+function isGpt56FamilyModel(modelString: string): boolean {
+  const withoutPrefix = stripModelProviderPrefixes(modelString);
+  return /^gpt-5\.6(?:-(?:sol|terra|luna))?\b(?!\.)(?!-[a-z])/.test(withoutPrefix);
+}
+
+/**
+ * Whether the given OpenAI model supports the native "max" reasoning effort.
+ *
+ * The GPT-5.6 GA launch (July 9, 2026) added a top reasoning effort above
+ * xhigh for the whole family — Sol, Terra, Luna, and the bare `gpt-5.6` alias
+ * (see the OpenAI changelog: "GPT-5.6 adds ... max reasoning effort, and Pro
+ * mode"). Earlier preview coverage described it as Sol-only, which is stale.
+ */
+export function openaiSupportsNativeMaxEffort(modelString: string): boolean {
+  return isGpt56FamilyModel(modelString);
+}
+
+/**
+ * OpenAI Responses API reasoning mode (orthogonal to reasoning effort).
+ * Absent/"standard" is the API default; "pro" enables the slower, more
+ * thorough pro-mode serving introduced with the GPT-5.6 family.
+ */
+export const OPENAI_REASONING_MODES = ["standard", "pro"] as const;
+export type OpenAIReasoningMode = (typeof OPENAI_REASONING_MODES)[number];
+export const OpenAIReasoningModeSchema = z.enum(OPENAI_REASONING_MODES);
+
+/** Coerce an untrusted persisted value to an OpenAIReasoningMode (or undefined). */
+export function coerceOpenAIReasoningMode(value: unknown): OpenAIReasoningMode | undefined {
+  return OPENAI_REASONING_MODES.includes(value as OpenAIReasoningMode)
+    ? (value as OpenAIReasoningMode)
+    : undefined;
+}
+
+/**
+ * Whether the given OpenAI model supports `reasoning.mode: "pro"` on the
+ * Responses API.
+ *
+ * "GPT-5.6 Sol Pro" is not a separate model id: the same GPT-5.6 ids are
+ * served with `reasoning.mode: "pro"`. Per the Responses API reasoning guide,
+ * pro mode is available on every GPT-5.6 model (Sol, Terra, Luna, and the bare
+ * `gpt-5.6` alias) — the Sol/Terra-only restriction came from stale preview
+ * coverage.
+ */
+export function openaiSupportsProMode(modelString: string): boolean {
+  return isGpt56FamilyModel(modelString);
+}
+
+/**
  * Whether the given Anthropic model rejects `thinking: { type: "disabled" }`.
  *
  * Mythos-class models (Fable/Mythos) cannot turn thinking off: the API errors with
@@ -278,6 +335,29 @@ export const OPENAI_REASONING_EFFORT: Record<ThinkingLevel, string | undefined> 
   xhigh: "xhigh", // Maps 1:1 to OpenAI's reasoning effort value
   max: "xhigh",
 };
+
+/**
+ * Model-aware OpenAI reasoning effort resolution.
+ *
+ * Most OpenAI models top out at "xhigh", so the ThinkingLevel "max" downgrades to
+ * "xhigh" (see OPENAI_REASONING_EFFORT). The GPT-5.6 family ships a distinct native
+ * effort above xhigh with the wire value "max" on the Responses API (live-verified:
+ * the response echoes `effort: max`; not yet in the SDK's typed union).
+ *
+ * GPT-5.6 "off" maps to the explicit "none" effort: omitting the field defaults
+ * the request to medium (live-verified 2026-07-10 — an effort-less request echoed
+ * `effort: medium`), which would silently ignore the user's off selection.
+ */
+export function getOpenAIReasoningEffort(
+  level: ThinkingLevel,
+  modelString: string
+): string | undefined {
+  if (isGpt56FamilyModel(modelString)) {
+    if (level === "max") return "max";
+    if (level === "off") return "none";
+  }
+  return OPENAI_REASONING_EFFORT[level];
+}
 
 /**
  * OpenRouter reasoning effort mapping

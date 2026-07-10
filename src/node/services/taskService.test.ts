@@ -57,6 +57,7 @@ import {
   WORKFLOW_RUN_CARD_DISPLAY_METADATA_TYPE,
 } from "@/common/utils/workflowRunMessages";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { AIService } from "@/node/services/aiService";
 import type { WorkspaceService } from "@/node/services/workspaceService";
 import type { InitStateManager } from "@/node/services/initStateManager";
@@ -293,6 +294,7 @@ function createAIServiceMocks(
     stopStream: ReturnType<typeof mock>;
     createModel: ReturnType<typeof mock>;
     getStreamInfo: ReturnType<typeof mock>;
+    getProvidersConfig: ReturnType<typeof mock>;
     on: ReturnType<typeof mock>;
     off: ReturnType<typeof mock>;
   }>
@@ -303,6 +305,7 @@ function createAIServiceMocks(
   stopStream: ReturnType<typeof mock>;
   createModel: ReturnType<typeof mock>;
   getStreamInfo: ReturnType<typeof mock>;
+  getProvidersConfig: ReturnType<typeof mock>;
   on: ReturnType<typeof mock>;
   off: ReturnType<typeof mock>;
 } {
@@ -321,6 +324,7 @@ function createAIServiceMocks(
     overrides?.createModel ??
     mock((): Promise<Result<never>> => Promise.resolve(Err("createModel not mocked")));
   const getStreamInfo = overrides?.getStreamInfo ?? mock(() => undefined);
+  const getProvidersConfig = overrides?.getProvidersConfig ?? mock(() => null);
 
   const on = overrides?.on ?? mock(() => undefined);
   const off = overrides?.off ?? mock(() => undefined);
@@ -332,6 +336,7 @@ function createAIServiceMocks(
       stopStream,
       createModel,
       getStreamInfo,
+      getProvidersConfig,
       on,
       off,
     } as unknown as AIService,
@@ -340,6 +345,7 @@ function createAIServiceMocks(
     stopStream,
     createModel,
     getStreamInfo,
+    getProvidersConfig,
     on,
     off,
   };
@@ -1168,6 +1174,76 @@ describe("TaskService", () => {
       requireIdle: true,
       agentInitiated: true,
     });
+  });
+
+  test("createWorkspaceTurn inherits pro mode from the parent's active non-exec agent", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["childworkspace", "turnhandle"]);
+    const projectPath = await createTestProject(rootDir, "repo", { initGit: false });
+    const parentId = "1111111111";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        {
+          path: projectPath,
+          id: parentId,
+          name: "parent",
+          createdAt: new Date().toISOString(),
+          runtimeConfig: { type: "local" },
+          // Pro was toggled while a custom agent was active — no exec bucket
+          // exists, so inheritance must read the active-agent bucket.
+          agentId: "researcher",
+          aiSettingsByAgent: {
+            researcher: {
+              model: "openai:gpt-5.6-sol",
+              thinkingLevel: "high",
+              reasoningMode: "pro",
+            },
+          },
+        },
+      ],
+      testTaskSettings()
+    );
+
+    const createWorkspace = mock(
+      async (...args: unknown[]): Promise<Result<{ metadata: WorkspaceMetadata }>> => {
+        const tags = args[7] as Record<string, string> | undefined;
+        await config.editConfig((cfg) => {
+          const project = cfg.projects.get(projectPath);
+          assert(project, "test project must exist");
+          project.workspaces.push({
+            path: path.join(projectPath, "workspace-turn"),
+            id: "childworkspace",
+            name: "workspace-turn",
+            title: "Workspace turn",
+            createdAt: "2026-06-19T00:00:00.000Z",
+            runtimeConfig: { type: "local" },
+            tags,
+          });
+          return cfg;
+        });
+        return Ok({ metadata: createWorkspaceTurnMetadata(projectPath) });
+      }
+    );
+    const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
+    const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    const result = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      prompt: "Summarize the repo",
+      title: "Workspace turn",
+      workspace: { mode: "new" },
+    });
+
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    const sendMessageCall = sendMessage.mock.calls[0] as unknown[];
+    expect(sendMessageCall[2]).toMatchObject({ reasoningMode: "pro" });
   });
 
   test("createWorkspaceTurn rejects multi-project owners instead of dropping secondary repos", async () => {
@@ -5759,6 +5835,167 @@ describe("TaskService", () => {
     expect(childEntry).toBeTruthy();
     expect(childEntry?.taskModelString).toBe("openai:gpt-5.3-codex");
     expect(childEntry?.taskThinkingLevel).toBe("xhigh");
+  }, 20_000);
+
+  test("inherits the parent's pro reasoning mode into task sends and child settings", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["aaaaaaaaaa"], "bbbbbbbbbb");
+
+    const projectPath = await createTestProject(rootDir, "repo", { initGit: false });
+
+    const parentId = "1111111111";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        {
+          path: projectPath,
+          id: parentId,
+          name: "parent",
+          createdAt: new Date().toISOString(),
+          runtimeConfig: { type: "local" },
+          aiSettings: { model: "openai:gpt-5.6-sol", thinkingLevel: "high", reasoningMode: "pro" },
+        },
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    const created = await createAgentTask(taskService, parentId, "run task inheriting pro mode");
+    expect(created.success).toBe(true);
+    if (!created.success) return;
+
+    // The child's kickoff send must carry the parent's pro mode (the send path
+    // re-gates per model, so this is safe even for non-GPT-5.6 task models).
+    expect(sendMessage).toHaveBeenCalledWith(
+      created.data.taskId,
+      "run task inheriting pro mode",
+      {
+        model: "openai:gpt-5.6-sol",
+        agentId: "explore",
+        thinkingLevel: "high",
+        reasoningMode: "pro",
+        experiments: undefined,
+      },
+      { agentInitiated: true }
+    );
+
+    // Persisted child settings carry it too, so queued/restart resumes
+    // (which rebuild options from the record) keep pro mode.
+    const postCfg = config.loadConfigOrDefault();
+    const childEntry = Array.from(postCfg.projects.values())
+      .flatMap((p) => p.workspaces)
+      .find((w) => w.id === created.data.taskId);
+    expect(childEntry?.aiSettings).toEqual({
+      model: "openai:gpt-5.6-sol",
+      thinkingLevel: "high",
+      reasoningMode: "pro",
+    });
+  }, 20_000);
+
+  test("falls back to the parent's active-agent pro mode when spawning another agent type", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["aaaaaaaaaa"], "bbbbbbbbbb");
+
+    const projectPath = await createTestProject(rootDir, "repo", { initGit: false });
+
+    const parentId = "1111111111";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        {
+          path: projectPath,
+          id: parentId,
+          name: "parent",
+          createdAt: new Date().toISOString(),
+          runtimeConfig: { type: "local" },
+          // Pro was toggled while the exec agent was active; the spawned
+          // explore agent has no per-agent bucket of its own, so inheritance
+          // must fall back to the parent's active-agent settings.
+          agentId: "exec",
+          aiSettingsByAgent: {
+            exec: { model: "openai:gpt-5.6-sol", thinkingLevel: "high", reasoningMode: "pro" },
+          },
+        },
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    const created = await createAgentTask(
+      taskService,
+      parentId,
+      "run explore with parent pro mode"
+    );
+    expect(created.success).toBe(true);
+    if (!created.success) return;
+
+    expect(sendMessage).toHaveBeenCalledWith(
+      created.data.taskId,
+      "run explore with parent pro mode",
+      expect.objectContaining({ agentId: "explore", reasoningMode: "pro" }),
+      { agentInitiated: true }
+    );
+  }, 20_000);
+
+  test("keeps a mapped alias's native max thinking level when spawning a task", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["aaaaaaaaaa"], "bbbbbbbbbb");
+
+    const projectPath = await createTestProject(rootDir, "repo", { initGit: false });
+
+    const parentId = "1111111111";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        {
+          path: projectPath,
+          id: parentId,
+          name: "parent",
+          createdAt: new Date().toISOString(),
+          runtimeConfig: { type: "local" },
+          // A configured alias mapped to GPT-5.6: without the providers config
+          // threaded into the task-path clamp, "max" would be downgraded to
+          // "high" against the default four-level ladder.
+          aiSettings: { model: "openai:team-sol", thinkingLevel: "max" },
+        },
+      ],
+      testTaskSettings()
+    );
+
+    const providersConfig: ProvidersConfigMap = {
+      openai: {
+        apiKeySet: true,
+        isEnabled: true,
+        isConfigured: true,
+        models: [{ id: "team-sol", mappedToModel: "openai:gpt-5.6-sol" }],
+      },
+    };
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const aiMocks = createAIServiceMocks(config, {
+      getProvidersConfig: mock(() => providersConfig),
+    });
+    const { taskService } = createTaskServiceHarness(config, {
+      aiService: aiMocks.aiService,
+      workspaceService,
+    });
+
+    const created = await createAgentTask(taskService, parentId, "run with mapped alias max");
+    expect(created.success).toBe(true);
+    if (!created.success) return;
+
+    expect(sendMessage).toHaveBeenCalledWith(
+      created.data.taskId,
+      "run with mapped alias max",
+      expect.objectContaining({ model: "openai:team-sol", thinkingLevel: "max" }),
+      { agentInitiated: true }
+    );
   }, 20_000);
 
   test("resolves a numeric thinking override against the inherited model's policy", async () => {
@@ -15540,6 +15777,7 @@ describe("TaskService", () => {
   async function setupPlanModeStreamEndHarness(options?: {
     childAgentId?: string;
     childTaskStatus?: WorkspaceConfigEntry["taskStatus"];
+    childAiSettingsByAgent?: WorkspaceConfigEntry["aiSettingsByAgent"];
     workflowTask?: WorkspaceConfigEntry["workflowTask"];
     projectName?: string;
     maxTaskNestingDepth?: number;
@@ -15603,6 +15841,7 @@ describe("TaskService", () => {
           taskStatus: options?.childTaskStatus ?? "running",
           workflowTask: options?.workflowTask,
           aiSettings: { model: "anthropic:claude-opus-4-6", thinkingLevel: "max" },
+          aiSettingsByAgent: options?.childAiSettingsByAgent,
           taskModelString: "openai:gpt-4o-mini",
           runtimeConfig,
         },
@@ -15706,6 +15945,33 @@ describe("TaskService", () => {
 
     expect(updatedTask?.agentId).toBe("exec");
     expect(updatedTask?.taskStatus).toBe("running");
+  });
+
+  test("plan handoff preserves a pro mode persisted under the plan agent bucket", async () => {
+    // A PRO toggle during the plan phase lands in aiSettingsByAgent.plan;
+    // legacy workspace.aiSettings still holds the original standard setting.
+    const { config, childId, sendMessage, internal } = await setupPlanModeStreamEndHarness({
+      childAiSettingsByAgent: {
+        plan: { model: "openai:gpt-5.6-sol", thinkingLevel: "high", reasoningMode: "pro" },
+      },
+    });
+
+    await internal.handleStreamEnd(makeSuccessfulProposePlanStreamEndEvent(childId));
+
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage).toHaveBeenCalledWith(
+      childId,
+      expect.stringContaining("Implement the plan"),
+      expect.objectContaining({ agentId: "exec", reasoningMode: "pro" }),
+      expect.objectContaining({ synthetic: true })
+    );
+
+    // The rewritten exec-phase settings persist it too.
+    const postCfg = config.loadConfigOrDefault();
+    const updatedTask = Array.from(postCfg.projects.values())
+      .flatMap((project) => project.workspaces)
+      .find((workspace) => workspace.id === childId);
+    expect(updatedTask?.aiSettings?.reasoningMode).toBe("pro");
   });
 
   test("stream-end with propose_plan success uses global exec defaults for handoff", async () => {

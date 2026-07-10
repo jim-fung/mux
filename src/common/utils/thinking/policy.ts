@@ -19,6 +19,7 @@ import {
   THINKING_LEVEL_OFF,
   anthropicRejectsDisabledThinking,
   anthropicSupportsNativeXhigh,
+  openaiSupportsNativeMaxEffort,
   stripModelProviderPrefixes,
   type ThinkingLevel,
   type ParsedThinkingInput,
@@ -54,6 +55,8 @@ export function isGeminiFlashThinkingLevelModelName(modelName: string): boolean 
  * - openai:gpt-5.3-codex / Spark variants →
  *   ["off", "low", "medium", "high", "xhigh"] (5 levels including xhigh)
  * - openai:gpt-5.2 / openai:gpt-5.5 → ["off", "low", "medium", "high", "xhigh"]
+ * - openai:gpt-5.6 family (Sol/Terra/Luna and the bare alias) →
+ *   ["off", "low", "medium", "high", "xhigh", "max"] (6 levels; native max at GA)
  * - openai:gpt-5.2-pro / openai:gpt-5.5-pro → ["medium", "high", "xhigh"] (3 levels)
  * - openai:gpt-5-pro → ["high"] (only supported level, legacy)
  * - Gemini Flash chat variants → ["off", "low", "medium", "high"]
@@ -62,9 +65,20 @@ export function isGeminiFlashThinkingLevelModelName(modelName: string): boolean 
  *
  * Tolerates version suffixes (e.g., gpt-5-pro-2025-10-06).
  * Does NOT match gpt-5-pro-mini (uses negative lookahead).
+ *
+ * Pass `providersConfig` so configured aliases (`mappedToModel`, e.g.
+ * `openai:team-sol` -> `openai:gpt-5.6-sol`) resolve to their capability model
+ * before rule matching — matching how `buildProviderOptions` /
+ * `openaiProModeAvailable` detect capabilities. Without it, mapped aliases fall
+ * through to the default 4-level policy and clamping strips levels (e.g. native
+ * max) the target model actually supports.
  */
-export function getThinkingPolicyForModel(modelString: string): ThinkingPolicy {
-  return getExplicitThinkingPolicy(modelString) ?? DEFAULT_THINKING_POLICY;
+export function getThinkingPolicyForModel(
+  modelString: string,
+  providersConfig?: ProvidersConfigMap | null
+): ThinkingPolicy {
+  const capabilityModel = resolveModelForMetadata(modelString, providersConfig ?? null);
+  return getExplicitThinkingPolicy(capabilityModel) ?? DEFAULT_THINKING_POLICY;
 }
 
 /**
@@ -120,6 +134,12 @@ function getExplicitThinkingPolicy(modelString: string): ThinkingPolicy | null {
     return ["off", "low", "medium", "high", "xhigh"];
   }
 
+  // The GPT-5.6 family (Sol/Terra/Luna and the bare gpt-5.6 alias) supports
+  // the native "max" reasoning effort introduced at GA.
+  if (openaiSupportsNativeMaxEffort(withoutProviderNamespace)) {
+    return ["off", "low", "medium", "high", "xhigh", "max"];
+  }
+
   // gpt-5.2-pro and gpt-5.5-pro support medium, high, xhigh reasoning levels
   if (/^gpt-5\.(?:2|5)-pro(?!-[a-z])/.test(withoutProviderNamespace)) {
     return ["medium", "high", "xhigh"];
@@ -172,8 +192,13 @@ function thinkingLevelIndex(level: ThinkingLevel): number {
  *
  * This is only a default; users can override it per-model on the Models settings page.
  */
-export function getDefaultMinimumThinkingLevel(modelString: string): ThinkingLevel {
-  return hasExplicitThinkingPolicy(modelString) ? DEFAULT_THINKING_LEVEL : THINKING_LEVEL_OFF;
+export function getDefaultMinimumThinkingLevel(
+  modelString: string,
+  providersConfig?: ProvidersConfigMap | null
+): ThinkingLevel {
+  return hasExplicitThinkingPolicy(modelString, providersConfig)
+    ? DEFAULT_THINKING_LEVEL
+    : THINKING_LEVEL_OFF;
 }
 
 /**
@@ -184,8 +209,14 @@ export function getDefaultMinimumThinkingLevel(modelString: string): ThinkingLev
  * expose a floor selector and default to medium. Unrecognized / non-reasoning models keep
  * the legacy off-default behavior.
  */
-export function hasExplicitThinkingPolicy(modelString: string): boolean {
-  return getExplicitThinkingPolicy(modelString) !== null;
+export function hasExplicitThinkingPolicy(
+  modelString: string,
+  providersConfig?: ProvidersConfigMap | null
+): boolean {
+  return (
+    getExplicitThinkingPolicy(resolveModelForMetadata(modelString, providersConfig ?? null)) !==
+    null
+  );
 }
 
 /**
@@ -196,9 +227,10 @@ export function hasExplicitThinkingPolicy(modelString: string): boolean {
  */
 export function resolveMinimumThinkingLevel(
   modelString: string,
-  override?: ThinkingLevel | null
+  override?: ThinkingLevel | null,
+  providersConfig?: ProvidersConfigMap | null
 ): ThinkingLevel {
-  return override ?? getDefaultMinimumThinkingLevel(modelString);
+  return override ?? getDefaultMinimumThinkingLevel(modelString, providersConfig);
 }
 
 /**
@@ -243,9 +275,10 @@ export function resolveEffectiveThinkingLevel(
  */
 export function getAvailableThinkingLevels(
   modelString: string,
-  minimum?: ThinkingLevel | null
+  minimum?: ThinkingLevel | null,
+  providersConfig?: ProvidersConfigMap | null
 ): ThinkingPolicy {
-  const capability = getThinkingPolicyForModel(modelString);
+  const capability = getThinkingPolicyForModel(modelString, providersConfig);
   if (minimum == null) {
     return capability;
   }
@@ -280,9 +313,10 @@ export function getAvailableThinkingLevels(
 export function enforceThinkingPolicy(
   modelString: string,
   requested: ThinkingLevel,
-  minimum?: ThinkingLevel | null
+  minimum?: ThinkingLevel | null,
+  providersConfig?: ProvidersConfigMap | null
 ): ThinkingLevel {
-  const allowed = getAvailableThinkingLevels(modelString, minimum);
+  const allowed = getAvailableThinkingLevels(modelString, minimum, providersConfig);
 
   if (allowed.includes(requested)) {
     return requested;
@@ -324,13 +358,16 @@ export function enforceThinkingPolicy(
  */
 export function resolveThinkingInput(
   input: ParsedThinkingInput,
-  modelString: string
+  modelString: string,
+  providersConfig?: ProvidersConfigMap | null
 ): ThinkingLevel {
   // Named levels pass through directly
   if (typeof input === "string") return input;
 
-  // Numeric: index into the model's allowed levels (sorted lowest → highest)
-  const policy = getThinkingPolicyForModel(modelString);
+  // Numeric: index into the model's allowed levels (sorted lowest → highest).
+  // providersConfig resolves mapped aliases (mappedToModel) to their target's
+  // policy so indices map into the real ladder (e.g. GPT-5.6 native max).
+  const policy = getThinkingPolicyForModel(modelString, providersConfig);
   const sorted = [...policy].sort(
     (a, b) => THINKING_LEVELS.indexOf(a) - THINKING_LEVELS.indexOf(b)
   );

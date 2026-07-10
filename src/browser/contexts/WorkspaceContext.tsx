@@ -13,7 +13,7 @@ import {
 import { useLocation } from "react-router-dom";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { ArchivePreflightResult, ArchiveWorkspaceResult } from "@/common/orpc/schemas/api";
-import type { ThinkingLevel } from "@/common/types/thinking";
+import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
 import type { WorkspaceSelection } from "@/browser/components/ProjectSidebar/ProjectSidebar";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import type { MuxDeepLinkPayload } from "@/common/types/deepLink";
@@ -27,6 +27,7 @@ import {
   getPendingScopeId,
   getRightSidebarLayoutKey,
   getTerminalTitlesKey,
+  getReasoningModeKey,
   getThinkingLevelKey,
   getWorkspaceAISettingsByAgentKey,
   getWorkspaceNameStateKey,
@@ -173,7 +174,10 @@ function shouldSeedWorkspaceAgentIdFromBackend(metadata: FrontendWorkspaceMetada
 function seedWorkspaceLocalStorageFromBackend(metadata: FrontendWorkspaceMetadata): void {
   // Cache keyed by agentId (string) - includes exec, plan, and custom agents
   type WorkspaceAISettingsByAgentCache = Partial<
-    Record<string, { model: string; thinkingLevel: ThinkingLevel }>
+    Record<
+      string,
+      { model: string; thinkingLevel: ThinkingLevel; reasoningMode?: OpenAIReasoningMode }
+    >
   >;
 
   const workspaceId = metadata.id;
@@ -215,6 +219,7 @@ function seedWorkspaceLocalStorageFromBackend(metadata: FrontendWorkspaceMetadat
       !shouldApplyWorkspaceAiSettingsFromBackend(workspaceId, agentKey, {
         model: entry.model,
         thinkingLevel: entry.thinkingLevel,
+        reasoningMode: entry.reasoningMode,
       })
     ) {
       continue;
@@ -223,6 +228,7 @@ function seedWorkspaceLocalStorageFromBackend(metadata: FrontendWorkspaceMetadat
     nextByAgent[agentKey] = {
       model: entry.model,
       thinkingLevel: entry.thinkingLevel,
+      ...(entry.reasoningMode != null ? { reasoningMode: entry.reasoningMode } : {}),
     };
   }
 
@@ -250,6 +256,21 @@ function seedWorkspaceLocalStorageFromBackend(metadata: FrontendWorkspaceMetadat
   const existingThinking = readPersistedState<ThinkingLevel | undefined>(thinkingKey, undefined);
   if (existingThinking !== active.thinkingLevel) {
     updatePersistedState(thinkingKey, active.thinkingLevel);
+  }
+
+  // Absent reasoningMode means "standard": seed it explicitly so switching to
+  // an agent whose settings never carried the field cannot inherit another
+  // agent's "pro" from the shared workspace-scoped key. Newer local choices
+  // are already protected by the pending-settings guard above
+  // (shouldApplyWorkspaceAiSettingsFromBackend).
+  const reasoningKey = getReasoningModeKey(workspaceId);
+  const nextReasoning = active.reasoningMode ?? "standard";
+  const existingReasoning = readPersistedState<OpenAIReasoningMode | undefined>(
+    reasoningKey,
+    undefined
+  );
+  if (existingReasoning !== nextReasoning) {
+    updatePersistedState(reasoningKey, nextReasoning);
   }
 }
 

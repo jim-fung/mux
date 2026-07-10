@@ -11,24 +11,35 @@ import type { GoogleGenerativeAIProviderOptions } from "@ai-sdk/google";
 import type { OpenAIResponsesProviderOptions } from "@ai-sdk/openai";
 import type { JSONValue } from "@ai-sdk/provider";
 import type { XaiProviderOptions } from "@ai-sdk/xai";
-import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
+import type { ProviderName } from "@/common/constants/providers";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
-import type { ThinkingLevel } from "@/common/types/thinking";
+import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
 import {
   getAnthropicEffort,
   anthropicRejectsDisabledThinking,
   anthropicSupportsNativeXhigh,
   ANTHROPIC_THINKING_BUDGETS,
   GEMINI_THINKING_BUDGETS,
-  OPENAI_REASONING_EFFORT,
+  getOpenAIReasoningEffort,
+  openaiSupportsProMode,
   OPENROUTER_REASONING_EFFORT,
 } from "@/common/types/thinking";
 import { isGeminiFlashThinkingLevelModelName } from "@/common/utils/thinking/policy";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { log } from "@/node/services/log";
 import type { MuxMessage } from "@/common/types/message";
-import { normalizeToCanonical, supports1MContext } from "./models";
+import {
+  normalizeToCanonical,
+  resolveProviderOptionsNamespaceKey,
+  supports1MContext,
+} from "./models";
+
+// Re-export for existing consumers (aiService, providerModelFactory, tests):
+// the implementations moved to browser-safe modules because this module
+// imports node-only logging.
+export { resolveProviderOptionsNamespaceKey } from "./models";
+export { openaiProModeAvailable } from "./proMode";
 
 /**
  * Request header used to override Anthropic's `output_config.effort` at the
@@ -38,6 +49,15 @@ import { normalizeToCanonical, supports1MContext } from "./models";
  * before the request reaches Anthropic).
  */
 export const MUX_ANTHROPIC_EFFORT_OVERRIDE_HEADER = "x-mux-anthropic-effort";
+
+/**
+ * Request header used to inject OpenAI's `reasoning.mode` at the wire level.
+ * @ai-sdk/openai only maps reasoningEffort/reasoningSummary into the wire
+ * `reasoning` object and drops unknown providerOptions keys, so pro mode for
+ * GPT-5.6 Sol/Terra is delivered via this Mux-internal header, which the
+ * OpenAI fetch wrapper strips and rewrites into `reasoning.mode` on the wire.
+ */
+export const MUX_OPENAI_REASONING_MODE_HEADER = "x-mux-openai-reasoning-mode";
 
 /**
  * OpenRouter reasoning options
@@ -77,24 +97,6 @@ const OPENAI_REASONING_SUMMARY_UNSUPPORTED_MODELS = new Set<string>([
 
 function supportsOpenAIReasoningSummary(modelName: string): boolean {
   return !OPENAI_REASONING_SUMMARY_UNSUPPORTED_MODELS.has(modelName);
-}
-
-export function resolveProviderOptionsNamespaceKey(
-  canonicalProviderName: string,
-  routeProvider?: ProviderName
-): string {
-  const routeDefinition = routeProvider ? PROVIDER_DEFINITIONS[routeProvider] : undefined;
-  if (
-    !routeProvider ||
-    routeProvider === canonicalProviderName ||
-    (routeDefinition != null &&
-      "passthrough" in routeDefinition &&
-      routeDefinition.passthrough === true)
-  ) {
-    return canonicalProviderName;
-  }
-
-  return routeProvider;
 }
 
 function resolveAnthropic1MCapabilityModel(
@@ -353,7 +355,23 @@ export function buildProviderOptions(
 
   // Build OpenAI-specific options
   if (formatProvider === "openai") {
-    const reasoningEffort = OPENAI_REASONING_EFFORT[effectiveThinking];
+    // Model-aware: the GPT-5.6 family maps ThinkingLevel "max" to the native
+    // "max" effort; other OpenAI models keep the max -> "xhigh" downgrade. Use
+    // capabilityModel so mapped aliases (mappedToModel) inherit their target's
+    // native effort. Live-verified (2026-07-10): the Responses API accepts
+    // reasoning.effort "max" on every GPT-5.6 tier (gpt-5.5 rejects it), but
+    // @ai-sdk/openai's Chat Completions schema caps reasoningEffort at xhigh
+    // (z.enum(["none", ..., "xhigh"]) — no "max"), so a native-max request
+    // over the chatCompletions wire format would fail client-side Zod
+    // validation — degrade it to xhigh there instead. "none" needs no such
+    // handling: it is a first-class member of that enum with dedicated
+    // chat-model handling, and omitting it would default GPT-5.6 back to
+    // medium reasoning (the exact bug the explicit "none" mapping fixes).
+    const nativeReasoningEffort = getOpenAIReasoningEffort(effectiveThinking, capabilityModel);
+    const chatCompletionsWire =
+      (muxProviderOptions?.openai?.wireFormat ?? "responses") === "chatCompletions";
+    const reasoningEffort =
+      chatCompletionsWire && nativeReasoningEffort === "max" ? "xhigh" : nativeReasoningEffort;
 
     // Mux always sends the latest conversation history explicitly. OpenAI's
     // previous_response_id is an alternative state-management path, not an additive one.
@@ -507,7 +525,17 @@ export function buildProviderOptions(
   }
 
   if (origin === "openai" && formatProvider !== origin) {
-    const reasoningEffort = OPENAI_REASONING_EFFORT[effectiveThinking];
+    // capabilityModel keeps mapped aliases consistent with raw ids on the same route.
+    // Copilot's Chat Completions upstream has not published native-max or
+    // explicit-none support, so degrade GPT-5.6 "max" to xhigh (the pre-5.6 top
+    // effort) and "none" back to omission instead of risking a rejection.
+    const nativeReasoningEffort = getOpenAIReasoningEffort(effectiveThinking, capabilityModel);
+    const reasoningEffort =
+      nativeReasoningEffort === "max"
+        ? "xhigh"
+        : nativeReasoningEffort === "none"
+          ? undefined
+          : nativeReasoningEffort;
     if (!reasoningEffort) {
       log.debug(
         "buildProviderOptions: OpenAI-compatible gateway (thinking off, no provider options)",
@@ -582,7 +610,8 @@ export function buildRequestHeaders(
   workspaceId?: string,
   providersConfig?: ProvidersConfigMap | null,
   routeProvider?: ProviderName,
-  thinkingLevel?: ThinkingLevel
+  thinkingLevel?: ThinkingLevel,
+  reasoningMode?: OpenAIReasoningMode
 ): Record<string, string> | undefined {
   const headers: Record<string, string> = {};
 
@@ -620,6 +649,35 @@ export function buildRequestHeaders(
     anthropicSupportsNativeXhigh(modelString)
   ) {
     headers[MUX_ANTHROPIC_EFFORT_OVERRIDE_HEADER] = "xhigh";
+  }
+
+  // OpenAI pro reasoning mode (GPT-5.6 Sol/Terra). The @ai-sdk/openai responses
+  // model drops unknown providerOptions keys, so `reasoning.mode` cannot ride
+  // providerOptions — emit a Mux-internal header that the OpenAI fetch wrapper
+  // strips and rewrites into the wire body. Mode is orthogonal to effort, so
+  // this is independent of thinkingLevel.
+  //
+  // Pro mode is direct-route-only: mux-gateway currently drops the rewritten
+  // providerOptions.openai.reasoningMode server-side (verified — the Responses
+  // API echoed mode "standard"), so passthrough gateways don't get the header
+  // either until the gateway forwards the field. Direct-only emission also
+  // scopes the wireFormat gate to the one config that actually applies here:
+  // the direct OpenAI provider's (config wins over request-level options,
+  // mirroring providerModelFactory). Pro mode is Responses-only — with
+  // wireFormat "chatCompletions" the wrapper never injects (it only rewrites
+  // /responses bodies), so skip the header to keep header state honest.
+  const routeIsDirect = routeProvider == null || routeProvider === origin;
+  const openaiWireFormat =
+    providersConfig?.openai?.wireFormat ?? muxProviderOptions?.openai?.wireFormat ?? "responses";
+  if (
+    origin === "openai" &&
+    routeIsDirect &&
+    reasoningMode === "pro" &&
+    openaiWireFormat === "responses" &&
+    // Mapped aliases (mappedToModel) inherit pro capability from their target.
+    openaiSupportsProMode(resolveModelForMetadata(normalized, providersConfig ?? null))
+  ) {
+    headers[MUX_OPENAI_REASONING_MODE_HEADER] = "pro";
   }
 
   return Object.keys(headers).length > 0 ? headers : undefined;

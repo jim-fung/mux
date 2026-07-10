@@ -55,7 +55,11 @@ import {
 } from "@/node/services/utils/fileChangeTracker";
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
-import { coerceThinkingLevel, type ThinkingLevel } from "@/common/types/thinking";
+import {
+  coerceOpenAIReasoningMode,
+  coerceThinkingLevel,
+  type ThinkingLevel,
+} from "@/common/types/thinking";
 import { enforceThinkingPolicy, resolveMinimumThinkingLevel } from "@/common/utils/thinking/policy";
 import {
   createMuxMessage,
@@ -1416,6 +1420,17 @@ export class AgentSession {
       ? (agentSettingsThinkingLevel ?? persistedThinkingLevel ?? assistantThinkingLevel)
       : (persistedThinkingLevel ?? assistantThinkingLevel ?? agentSettingsThinkingLevel);
 
+    // Pro reasoning mode threads alongside thinkingLevel from the same sources
+    // (assistant message metadata does not carry it), so startup retries do not
+    // silently downgrade a pro-mode turn to standard.
+    const persistedReasoningMode = coerceOpenAIReasoningMode(
+      persistedRetrySendOptions?.reasoningMode
+    );
+    const agentSettingsReasoningMode = coerceOpenAIReasoningMode(agentSettings?.reasoningMode);
+    const baseReasoningMode = isChildTaskWorkspace
+      ? (agentSettingsReasoningMode ?? persistedReasoningMode)
+      : (persistedReasoningMode ?? agentSettingsReasoningMode);
+
     const persistedToolPolicy =
       lastUserMessage?.metadata?.toolPolicy ?? persistedRetrySendOptions?.toolPolicy;
     const persistedDisableWorkspaceAgents =
@@ -1438,10 +1453,19 @@ export class AgentSession {
       const requestedThinkingLevel =
         baseThinkingLevel ?? coerceThinkingLevel(compactSettings?.thinkingLevel) ?? "off";
 
+      const requestedReasoningMode =
+        baseReasoningMode ?? coerceOpenAIReasoningMode(compactSettings?.reasoningMode);
+
       const compactionRequest: StartupRetrySendOptions = {
         model: compactionModel,
         agentId: "compact",
-        thinkingLevel: enforceThinkingPolicy(compactionModel, requestedThinkingLevel),
+        thinkingLevel: enforceThinkingPolicy(
+          compactionModel,
+          requestedThinkingLevel,
+          undefined,
+          this.getProvidersConfigSafe()
+        ),
+        ...(requestedReasoningMode != null ? { reasoningMode: requestedReasoningMode } : {}),
         maxOutputTokens:
           typeof lastUserMuxMetadata.parsed.maxOutputTokens === "number"
             ? lastUserMuxMetadata.parsed.maxOutputTokens
@@ -1476,6 +1500,9 @@ export class AgentSession {
     };
     if (baseThinkingLevel) {
       retryRequest.thinkingLevel = baseThinkingLevel;
+    }
+    if (baseReasoningMode) {
+      retryRequest.reasoningMode = baseReasoningMode;
     }
     if (persistedToolPolicy) {
       retryRequest.toolPolicy = persistedToolPolicy;
@@ -2646,7 +2673,7 @@ export class AgentSession {
       // stream events have populated lastUsageState.
       await this.seedUsageStateFromHistory();
 
-      const providersConfigForCompaction = this.getProvidersConfigForCompaction();
+      const providersConfigForCompaction = this.getProvidersConfigSafe();
       const compactionResult = this.compactionMonitor.checkBeforeSend({
         model: modelForStream,
         usage: this.getUsageState(),
@@ -2989,7 +3016,7 @@ export class AgentSession {
     return this.lastUsageState;
   }
 
-  private getProvidersConfigForCompaction(): ProvidersConfigMap | null {
+  private getProvidersConfigSafe(): ProvidersConfigMap | null {
     try {
       // Prefer ProviderService's safe config view: it includes env/file API-key source
       // metadata plus the Codex OAuth presence bit, which context-limit resolution needs
@@ -3284,7 +3311,9 @@ export class AgentSession {
       // stream's level was chosen for its model, not the compaction model.
       thinkingLevel: enforceThinkingPolicy(
         compactionModel,
-        compactSettings.thinkingLevel ?? params.baseOptions.thinkingLevel ?? "off"
+        compactSettings.thinkingLevel ?? params.baseOptions.thinkingLevel ?? "off",
+        undefined,
+        this.getProvidersConfigSafe()
       ),
       maxOutputTokens: undefined,
       toolPolicy: [{ regex_match: ".*", action: "disable" }],
@@ -3492,14 +3521,14 @@ export class AgentSession {
     this.activeStreamErrorEventReceived = false;
     this.activeStreamFailureHandled = false;
     this.activeStreamHadPostCompactionInjection = false;
-    const providersConfigForCompaction = this.getProvidersConfigForCompaction();
+    const providersConfig = this.getProvidersConfigSafe();
     this.activeStreamContext = {
       modelString,
       options,
       agentInitiated,
       openaiTruncationModeOverride,
       ...(goalKind != null ? { goalKind } : {}),
-      providersConfig: providersConfigForCompaction,
+      providersConfig,
     };
     this.activeStreamUserMessageId = undefined;
 
@@ -3597,9 +3626,17 @@ export class AgentSession {
             normalizeToCanonical(modelString)
           ]
         : undefined;
-    const minThinkingLevel = resolveMinimumThinkingLevel(modelString, minThinkingOverride);
+    // Pass providersConfig so mapped aliases (mappedToModel -> e.g. GPT-5.6)
+    // clamp against the target model's policy — otherwise a capability level
+    // like native max would be stripped here before buildProviderOptions can
+    // resolve the alias.
+    const minThinkingLevel = resolveMinimumThinkingLevel(
+      modelString,
+      minThinkingOverride,
+      providersConfig
+    );
     const effectiveThinkingLevel = options?.thinkingLevel
-      ? enforceThinkingPolicy(modelString, options.thinkingLevel, minThinkingLevel)
+      ? enforceThinkingPolicy(modelString, options.thinkingLevel, minThinkingLevel, providersConfig)
       : undefined;
 
     // Bind recordFileState to this session for the propose_plan tool
@@ -3625,6 +3662,8 @@ export class AgentSession {
       modelString,
       abortSignal,
       thinkingLevel: effectiveThinkingLevel,
+      // Orthogonal to thinking level; buildRequestHeaders gates it per model.
+      reasoningMode: options?.reasoningMode,
       toolPolicy: options?.toolPolicy,
       additionalSystemContext: options?.additionalSystemContext,
       additionalSystemInstructions: options?.additionalSystemInstructions,
@@ -5479,6 +5518,7 @@ export class AgentSession {
       model: effectiveModel,
       agentId: effectiveAgentId,
       thinkingLevel: followUp.thinkingLevel,
+      reasoningMode: followUp.reasoningMode,
       additionalSystemInstructions: followUp.additionalSystemInstructions,
       providerOptions: followUp.providerOptions,
       experiments: followUp.experiments,
