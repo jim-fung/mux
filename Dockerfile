@@ -58,6 +58,11 @@ RUN git init && \
     git add -A && \
     (git commit -m "docker build" --allow-empty || true)
 
+# Vite's transform phase can exceed V8's default ~1 GB old-space ceiling inside the
+# constrained container VM (host builds complete fine). dev-server already sets this;
+# mirror it here so production Docker builds don't OOM on the renderer bundle.
+ENV NODE_OPTIONS="--max-old-space-size=4096"
+
 # Build Docker runtime artifacts through Makefile so local/CI/Docker share one pipeline.
 # This runs version generation, builtin content generation, main+renderer builds,
 # server bundle creation, worker bundle creation, and runtime artifact assertions.
