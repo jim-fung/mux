@@ -82,6 +82,7 @@ async function buildSystemContextForTest(args: {
   effectiveAdditionalInstructions?: string;
   planFilePath?: string;
   memoryToolAvailable?: boolean;
+  codeOutlineToolAvailable?: boolean;
 }) {
   return buildStreamSystemContext({
     runtime: args.runtime,
@@ -100,6 +101,7 @@ async function buildSystemContextForTest(args: {
     providersConfig: null,
     mcpServers: {},
     memoryToolAvailable: args.memoryToolAvailable,
+    codeOutlineToolAvailable: args.codeOutlineToolAvailable,
   });
 }
 
@@ -298,6 +300,41 @@ describe("buildStreamSystemContext", () => {
     // not steer the agent toward a tool the toolset does not have.
     const withoutMemory = await buildSystemContextForTest(buildArgs);
     expect(withoutMemory.systemMessage).not.toContain("<memory-tool-guidance>");
+  });
+
+  test("requires code outlines only when the tool is available", async () => {
+    using tempRoot = new DisposableTempDir("stream-system-context-code-outline-guidance");
+
+    const projectPath = path.join(tempRoot.path, "project");
+    const muxHome = path.join(tempRoot.path, "mux-home");
+    await fs.mkdir(projectPath, { recursive: true });
+    await fs.mkdir(muxHome, { recursive: true });
+
+    const metadata = createWorkspaceMetadata({
+      id: "code-outline-guidance-ws",
+      name: "code-outline-guidance-workspace",
+      projectName: "project",
+      projectPath,
+    });
+    const buildArgs = {
+      runtime: new TestRuntime(projectPath, muxHome),
+      metadata,
+      workspacePath: projectPath,
+      cfg: createProjectsConfig({
+        projectPath,
+        workspaces: [{ id: metadata.id, name: metadata.name }],
+      }),
+      isSubagentWorkspace: false,
+    };
+
+    const withCodeOutline = await buildSystemContextForTest({
+      ...buildArgs,
+      codeOutlineToolAvailable: true,
+    });
+    expect(withCodeOutline.systemMessage).toContain("<code-outline-tool-guidance>");
+
+    const withoutCodeOutline = await buildSystemContextForTest(buildArgs);
+    expect(withoutCodeOutline.systemMessage).not.toContain("<code-outline-tool-guidance>");
   });
 
   test("uses the resolved agent discovery runtime for parent-only subagent prompts", async () => {

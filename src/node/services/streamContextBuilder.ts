@@ -262,6 +262,8 @@ export interface BuildStreamSystemContextOptions {
    * disappears with the tool.
    */
   memoryToolAvailable?: boolean;
+  /** Whether the code_outline tool is in the final agent toolset. */
+  codeOutlineToolAvailable?: boolean;
   /**
    * Pre-rendered hot-memories block (pinned + frequently used memory files;
    * memory-hot-set sub-experiment). Computed and cached by AgentSession per
@@ -487,6 +489,14 @@ function buildMemoryGuidanceSection(): string {
   ].join("\n");
 }
 
+function buildCodeOutlineGuidanceSection(): string {
+  return [
+    "<code-outline-tool-guidance>",
+    "For every codebase investigation, start with `code_outline` on the relevant source file or directory. Use its symbols and ranges to focus later `file_read` or `bash` calls. Only skip it for non-code content or source already provided in the conversation.",
+    "</code-outline-tool-guidance>",
+  ].join("\n");
+}
+
 /**
  * Build the agent system prompt, system message, and discover available agents/skills.
  *
@@ -567,6 +577,9 @@ export async function buildStreamSystemContext(
     // Same lockstep rule: the post-policy system-context rebuild strips this
     // section when tool policy removes the memory tool.
     agentSystemPromptSections.push(buildMemoryGuidanceSection());
+  }
+  if (opts.codeOutlineToolAvailable) {
+    agentSystemPromptSections.push(buildCodeOutlineGuidanceSection());
   }
 
   // Discover available agent definitions for sub-agent context (only for top-level workspaces).

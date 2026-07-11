@@ -1554,7 +1554,11 @@ export class AIService extends EventEmitter {
       // below so the prompt never advertises an absent tool.
       const memoryToolEligible = memoryExperimentEnabled && this.memoryService !== undefined;
       const buildStreamSystemContextForToolset = (
-        toolset: { advisorToolAvailable: boolean; memoryToolAvailable: boolean },
+        toolset: {
+          advisorToolAvailable: boolean;
+          memoryToolAvailable: boolean;
+          codeOutlineToolAvailable: boolean;
+        },
         modelStringForSystem: string = modelString,
         contextForModel: MemorySessionContext | undefined = memoryContext
       ) =>
@@ -1578,6 +1582,7 @@ export class AIService extends EventEmitter {
           loadDesktopCapability,
           advisorToolAvailable: toolset.advisorToolAvailable,
           memoryToolAvailable: toolset.memoryToolAvailable,
+          codeOutlineToolAvailable: toolset.codeOutlineToolAvailable,
           hotMemoriesBlock: contextForModel?.hotMemoriesBlock ?? undefined,
         });
 
@@ -1588,6 +1593,7 @@ export class AIService extends EventEmitter {
       const prePolicyStreamSystemContext = await buildStreamSystemContextForToolset({
         advisorToolAvailable: advisorToolEligible,
         memoryToolAvailable: memoryToolEligible,
+        codeOutlineToolAvailable: astGrepOutlineExperimentEnabled,
       });
       recordStartupPhaseTiming("buildStreamSystemContextMs", buildStreamSystemContextStartedAt);
       const {
@@ -2167,6 +2173,7 @@ export class AIService extends EventEmitter {
 
       const advisorToolAvailable = tools.advisor !== undefined;
       const memoryToolAvailable = tools.memory !== undefined;
+      const codeOutlineToolAvailable = tools.code_outline !== undefined;
       const finalMemoryContext = await upgradeMemoryContextForModel(
         memoryToolAvailable,
         modelString
@@ -2174,6 +2181,7 @@ export class AIService extends EventEmitter {
       const finalStreamSystemContext =
         advisorToolAvailable === advisorToolEligible &&
         memoryToolAvailable === memoryToolEligible &&
+        codeOutlineToolAvailable === astGrepOutlineExperimentEnabled &&
         finalMemoryContext === memoryContext
           ? prePolicyStreamSystemContext
           : await (async () => {
@@ -2187,6 +2195,7 @@ export class AIService extends EventEmitter {
                 {
                   advisorToolAvailable,
                   memoryToolAvailable,
+                  codeOutlineToolAvailable,
                 },
                 modelString,
                 finalMemoryContext
@@ -2562,6 +2571,7 @@ export class AIService extends EventEmitter {
                     {
                       advisorToolAvailable: nextTools.advisor !== undefined,
                       memoryToolAvailable: nextMemoryToolAvailable,
+                      codeOutlineToolAvailable: nextTools.code_outline !== undefined,
                     },
                     next.canonicalModelString,
                     nextMemoryContext
