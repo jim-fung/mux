@@ -2,7 +2,9 @@
 node_modules/
 
 # Build outputs
-dist/
+# Note: dist/ is allowed through for the prebuilt Dockerfile variant.
+# The in-container build Dockerfile regenerates dist/ itself, so excluding it
+# only saves context upload for that path; allowing it is harmless.
 build/
 *.tsbuildinfo
 

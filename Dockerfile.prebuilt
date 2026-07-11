@@ -1,0 +1,68 @@
+# Slim Dockerfile that uses pre-built dist/ from the host.
+# Avoids running Vite inside the container, which OOMs under Apple Container's
+# constrained VM. Native modules are still compiled in the deps stage for Linux.
+#
+# Build: container build -f Dockerfile.prebuilt -t mux-server .
+
+# ==============================================================================
+# Stage 1: Install native module dependencies for Linux
+# ==============================================================================
+FROM node:22-slim AS deps
+WORKDIR /app
+
+# hadolint ignore=DL3008
+RUN apt-get update && apt-get install -y --no-install-recommends git python3 make g++ bzip2 && rm -rf /var/lib/apt/lists/*
+RUN npm install -g bun@1.2
+
+COPY package.json bun.lock bunfig.toml ./
+COPY scripts/postinstall.sh scripts/
+RUN bun install --frozen-lockfile
+
+# ==============================================================================
+# Stage 2: Runtime
+# ==============================================================================
+FROM node:22-slim
+
+ARG VERSION=dev
+LABEL org.opencontainers.image.source="https://github.com/coder/mux"
+LABEL org.opencontainers.image.version="${VERSION}"
+LABEL org.opencontainers.image.description="Mux server (prebuilt dist)"
+LABEL org.opencontainers.image.licenses="AGPL-3.0"
+
+WORKDIR /app
+
+# Runtime system deps: git for workspace ops, openssh-client for SSH runtime, ca-certificates for HTTPS.
+# hadolint ignore=DL3008
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends git openssh-client ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# Externalized native modules (compiled for linux/arm64 in the deps stage).
+# These must match ESBUILD_SERVER_FLAGS --external list in the Makefile.
+COPY --from=deps /app/node_modules/@lydell ./node_modules/@lydell
+COPY --from=deps /app/node_modules/ssh2 ./node_modules/ssh2
+COPY --from=deps /app/node_modules/asn1 ./node_modules/asn1
+COPY --from=deps /app/node_modules/safer-buffer ./node_modules/safer-buffer
+COPY --from=deps /app/node_modules/bcrypt-pbkdf ./node_modules/bcrypt-pbkdf
+COPY --from=deps /app/node_modules/tweetnacl ./node_modules/tweetnacl
+COPY --from=deps /app/node_modules/sharp ./node_modules/sharp
+COPY --from=deps /app/node_modules/@img ./node_modules/@img
+COPY --from=deps /app/node_modules/detect-libc ./node_modules/detect-libc
+COPY --from=deps /app/node_modules/semver ./node_modules/semver
+COPY --from=deps /app/node_modules/@1password ./node_modules/@1password
+
+# Pre-built artifacts from host (renderer, runtime bundle, static assets).
+COPY dist ./dist
+
+RUN mkdir -p /root/.mux
+
+ENV NODE_ENV=production
+ENV MUX_HOME=/root/.mux
+
+EXPOSE 3000
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD node -e "fetch('http://localhost:3000/health').then(r => r.ok ? process.exit(0) : process.exit(1)).catch(() => process.exit(1))"
+
+ENTRYPOINT ["node", "dist/runtime/server-bundle.js"]
+CMD ["--host", "0.0.0.0", "--port", "3000"]
