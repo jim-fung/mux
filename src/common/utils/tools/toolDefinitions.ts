@@ -3073,7 +3073,7 @@ export function getAvailableTools(
     enableMemory?: boolean;
     /**
      * Whether the code_outline tool is available (ast-grep-outline experiment
-     * enabled). Off => no tool, no context cost; the tool is read-only and
+     * enabled). On by default; off => no tool or context cost. The tool is read-only and
      * depends only on the external ast-grep binary being on PATH.
      */
     enableAstGrepOutline?: boolean;
@@ -3094,7 +3094,7 @@ export function getAvailableTools(
   const enableAdvisor = options?.enableAdvisor ?? false;
   const enableDynamicWorkflows = options?.enableDynamicWorkflows ?? false;
   const enableMemory = options?.enableMemory ?? false;
-  const enableAstGrepOutline = options?.enableAstGrepOutline ?? false;
+  const enableAstGrepOutline = options?.enableAstGrepOutline ?? true;
   const enableReviewPane = options?.enableReviewPane ?? true;
 
   // Base tools available for all models

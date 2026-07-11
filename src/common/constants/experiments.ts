@@ -182,7 +182,7 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     name: "Code Outline Tool",
     description:
       "Enable the code_outline tool so agents can fetch structural symbol summaries via ast-grep",
-    enabledByDefault: false,
+    enabledByDefault: true,
     userOverridable: true,
     showInSettings: true,
   },

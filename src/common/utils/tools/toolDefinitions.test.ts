@@ -746,13 +746,11 @@ describe("TOOL_DEFINITIONS", () => {
     expect(enabledTools).toContain("workflow_resume");
   });
 
-  it("only includes code_outline when astGrepOutline experiment is enabled", () => {
-    // Default + explicitly-disabled: tool absent (gated off experiment).
-    expect(getAvailableTools("openai:gpt-4o")).not.toContain("code_outline");
+  it("includes code_outline by default and respects an explicit experiment override", () => {
+    expect(getAvailableTools("openai:gpt-4o")).toContain("code_outline");
     expect(getAvailableTools("openai:gpt-4o", { enableAstGrepOutline: false })).not.toContain(
       "code_outline"
     );
-    // Enabled: tool present.
     expect(getAvailableTools("openai:gpt-4o", { enableAstGrepOutline: true })).toContain(
       "code_outline"
     );
