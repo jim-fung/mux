@@ -8,6 +8,7 @@ import {
   type LanguageModel,
   type Tool,
   LoadAPIKeyError,
+  NoSuchToolError,
   APICallError,
   RetryError,
 } from "ai";
@@ -2672,6 +2673,20 @@ export class StreamManager extends EventEmitter {
                 // Capture the error and immediately throw to trigger error handling
                 // Error parts are structured errors from the AI SDK
                 const errorPart = part as { error: unknown };
+
+                // gpt-5.6-sol and gpt-5.6-terra can emit this spurious call while
+                // otherwise continuing the stream. It has no usable side effect, so
+                // do not let it terminate an otherwise valid response.
+                if (
+                  NoSuchToolError.isInstance(errorPart.error) &&
+                  errorPart.error.toolName === "invalid"
+                ) {
+                  workspaceLog.warn("Ignoring spurious unavailable 'invalid' tool call", {
+                    messageId: streamInfo.messageId,
+                    model: streamInfo.model,
+                  });
+                  break;
+                }
 
                 // Try to extract error message from various possible structures
                 let errorMessage: string | undefined;

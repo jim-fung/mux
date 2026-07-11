@@ -14,6 +14,7 @@ import {
 import * as aiSdk from "ai";
 import {
   APICallError,
+  NoSuchToolError,
   RetryError,
   tool,
   type LanguageModel,
@@ -1640,6 +1641,63 @@ describe("StreamManager - Concurrent Stream Prevention", () => {
 
 describe("StreamManager - empty stream completions", () => {
   const runtime = createRuntime({ type: "local", srcBaseDir: "/tmp" });
+
+  test("continues after a spurious unavailable invalid tool error", async () => {
+    const streamManager = new StreamManager(historyService);
+    const errorEvents: unknown[] = [];
+    const streamEndEvents: unknown[] = [];
+
+    streamManager.on("error", (data) => errorEvents.push(data));
+    streamManager.on("stream-end", (data) => streamEndEvents.push(data));
+    Reflect.set(streamManager, "tokenTracker", {
+      setModel: () => Promise.resolve(undefined),
+      countTokens: () => Promise.resolve(0),
+    });
+
+    const workspaceId = "spurious-invalid-tool-workspace";
+    const messageId = "spurious-invalid-tool-message";
+    const historySequence = 1;
+    await appendPartialAssistantForTests(workspaceId, messageId, historySequence);
+
+    const streamInfo = createStreamInfoForTests({
+      streamResult: createStreamResultForTests(
+        (async function* () {
+          yield {
+            type: "error",
+            error: new NoSuchToolError({
+              toolName: "invalid",
+              availableTools: ["bash", "glob", "grep", "read", "webfetch"],
+            }),
+          };
+          yield { type: "text-delta", text: "The response continues." };
+          yield { type: "finish", finishReason: "stop", rawFinishReason: "stop" };
+        })(),
+        { inputTokens: 3, outputTokens: 4, totalTokens: 7 }
+      ),
+      messageId,
+      historySequence,
+      initialMetadata: { agentId: "exec" },
+      runtime,
+    });
+
+    await getProcessStreamWithCleanupForTests(streamManager).call(
+      streamManager,
+      workspaceId,
+      streamInfo,
+      historySequence
+    );
+
+    expect(errorEvents).toEqual([]);
+    expect(streamEndEvents).toHaveLength(1);
+    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    expect(history.success).toBe(true);
+    if (!history.success) {
+      throw new Error(history.error);
+    }
+    expect(history.data.find((message) => message.id === messageId)?.parts).toMatchObject([
+      { type: "text", text: "The response continues." },
+    ]);
+  });
 
   test("retries one empty stream internally before persisting a retryable empty-output error", async () => {
     const streamManager = new StreamManager(historyService);
