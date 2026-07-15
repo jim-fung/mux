@@ -99,6 +99,19 @@ See [the official Mux documentation](https://mux.coder.com) for the upstream pro
 
 See [AGENTS.md](./AGENTS.md) for development setup and guidelines.
 
+### Server image with Apple Container
+
+On Apple Silicon macOS, build and run the server image with Apple's native OCI CLI:
+
+```bash
+make container-run
+curl --fail http://127.0.0.1:3000/health
+```
+
+The server remains available as `mux-server` and its state is stored in the named `mux-data` volume. Use `make container-logs`, `make container-stop`, and `make container-rm` to manage it. `make container-volume-rm` also deletes the persisted server state.
+
+The repository `Dockerfile` is the portable OCI recipe consumed by `container build`; `docker-compose.yml` is not used by Apple Container because it has no Docker socket or Compose support.
+
 ## License
 
 Copyright (C) 2026 Coder Technologies, Inc.

@@ -16,8 +16,8 @@ WORKDIR /app
 # Optional release tag passed by CI to stamp src/version.ts in Docker builds.
 ARG RELEASE_TAG
 
-# Install bun (used for package management and build tooling)
-RUN npm install -g bun@1.2
+# Match the repository's pinned Bun version for reproducible dependency resolution.
+RUN npm install -g bun@1.3.5
 
 # Install git (needed for version generation) and build tools for native modules
 # bzip2 is required for lzma-native to extract its bundled xz source tarball

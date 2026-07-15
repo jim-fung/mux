@@ -70,16 +70,24 @@ include fmt.mk
 .PHONY: build-renderer version build-icons build-static build-docker-runtime verify-docker-runtime-artifacts
 .PHONY: lint lint-fix typecheck typecheck-react-native mobile-web mobile-cors-proxy mobile-sandbox static-check static-check-full
 .PHONY: test test-unit test-integration test-watch test-coverage test-e2e test-e2e-perf smoke-test
-.PHONY: dist dist-mac dist-win dist-linux install-mac-arm64 check-appimage-icons check-mac-attach-file-runtime
+.PHONY: dist dist-mac dist-mac-release dist-win dist-win-release dist-linux dist-linux-release dist-linux-arm64 install-mac-arm64 check-appimage-icons check-mac-attach-file-runtime
 .PHONY: vscode-ext vscode-ext-install
 .PHONY: docs-server check-docs-links
 .PHONY: storybook storybook-run storybook-build test-storybook chromatic
 .PHONY: benchmark-terminal
-.PHONY: ensure-deps rebuild-native mux
+.PHONY: ensure-deps rebuild-native mux container-build container-run container-logs container-stop container-rm container-volume-rm
 .PHONY: check-eager-imports check-bundle-size check-startup
 
 # Build tools
 TSGO := bun run node_modules/@typescript/native-preview/bin/tsgo.js
+
+# Apple Container defaults for local OCI server development on Apple Silicon.
+CONTAINER ?= container
+CONTAINER_IMAGE ?= mux-server:local
+CONTAINER_NAME ?= mux-server
+CONTAINER_VOLUME ?= mux-data
+CONTAINER_PLATFORM ?= linux/arm64
+CONTAINER_PORT ?= 3000
 
 # Node.js version check
 REQUIRED_NODE_VERSION := 20
@@ -210,7 +218,7 @@ dev-server-sandbox: ## Start an isolated dev-server instance (fresh MUX_ROOT + f
 	@bun scripts/dev-server-sandbox.ts $(DEV_SERVER_SANDBOX_ARGS)
 
 start: node_modules/.installed build-main build-preload build-static ## Build and start Electron app
-	@NODE_ENV=development MUX_PROFILE_REACT=$(MUX_PROFILE_REACT) bunx electron --remote-debugging-port=9222 .
+	@NODE_ENV=development MUX_PROFILE_REACT=$(MUX_PROFILE_REACT) bun x electron --remote-debugging-port=9222 .
 
 ## Build targets (can run in parallel)
 build: node_modules/.installed src/version.ts build-renderer build-main build-preload build-icons build-static ## Build all targets
@@ -528,11 +536,38 @@ dist-linux: build ## Build Linux distributable
 dist-linux-arm64: build ## Build Linux arm64 distributable
 	@bun x electron-builder --linux --arm64 --publish never
 
+dist-linux-release: build ## Build and publish Linux distributable
+	@bun x electron-builder --linux --publish always
+
+dist-win-release: build ## Build and publish Windows distributable
+	@bun x electron-builder --win --publish always
+
 check-mac-attach-file-runtime: ## Validate packaged macOS attach_file runtime assets (requires prior dist-mac build)
 	@bun scripts/checkMacAttachFileRuntime.ts
 
 check-appimage-icons: ## Validate AppImage icon structure (requires prior dist-linux build)
 	@./scripts/check-appimage-icons.sh
+
+## Apple Container
+container-build: ## Build the local OCI server image with Apple Container
+	@$(CONTAINER) build --platform $(CONTAINER_PLATFORM) --tag $(CONTAINER_IMAGE) --memory 4G .
+
+container-run: container-build ## Run the local server with Apple Container
+	@$(CONTAINER) rm --force $(CONTAINER_NAME) >/dev/null 2>&1 || true
+	@$(CONTAINER) volume inspect $(CONTAINER_VOLUME) >/dev/null 2>&1 || $(CONTAINER) volume create $(CONTAINER_VOLUME)
+	@$(CONTAINER) run --detach --name $(CONTAINER_NAME) --publish $(CONTAINER_PORT):3000 --volume $(CONTAINER_VOLUME):/root/.mux $(CONTAINER_IMAGE)
+
+container-logs: ## Follow Apple Container server logs
+	@$(CONTAINER) logs --follow $(CONTAINER_NAME)
+
+container-stop: ## Stop the Apple Container server
+	@$(CONTAINER) stop $(CONTAINER_NAME)
+
+container-rm: ## Remove the Apple Container server (keeps its data volume)
+	@$(CONTAINER) rm --force $(CONTAINER_NAME)
+
+container-volume-rm: ## Remove the Apple Container server data volume
+	@$(CONTAINER) volume rm $(CONTAINER_VOLUME)
 
 ## VS Code Extension (delegates to vscode/Makefile)
 
