@@ -701,11 +701,45 @@ export class Config {
 
   loadConfigOrDefault(): ProjectsConfig {
     try {
+      const headroomRuntimePath = path.join(this.rootDir, "headroom");
+      try {
+        fs.rmSync(headroomRuntimePath, { recursive: true, force: true });
+      } catch (error) {
+        log.debug("Failed to remove legacy Headroom runtime", { error });
+      }
+
       if (fs.existsSync(this.configFile)) {
         const data = fs.readFileSync(this.configFile, "utf-8");
         const parsed = JSON.parse(data) as Partial<AppConfigOnDisk> & Record<string, unknown>;
         let configModified = false;
         let shouldInvalidateSessionUsageCaches = false;
+
+        if ("headroom" in parsed) {
+          delete parsed.headroom;
+          configModified = true;
+        }
+
+        if (Array.isArray(parsed.projects)) {
+          for (const entry of parsed.projects) {
+            if (!Array.isArray(entry) || entry.length < 2) {
+              continue;
+            }
+            const projectConfig = entry[1];
+            if (!projectConfig || typeof projectConfig !== "object") {
+              continue;
+            }
+            const workspaces = (projectConfig as { workspaces?: unknown }).workspaces;
+            if (!Array.isArray(workspaces)) {
+              continue;
+            }
+            for (const workspace of workspaces) {
+              if (workspace && typeof workspace === "object" && "headroom" in workspace) {
+                delete (workspace as { headroom?: unknown }).headroom;
+                configModified = true;
+              }
+            }
+          }
+        }
 
         const normalizeNestedModelStrings = (value: unknown): boolean => {
           if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -1101,7 +1135,6 @@ export class Config {
           defaultRuntime,
           runtimeEnablement,
           onePasswordAccountName: parseOptionalNonEmptyString(parsed.onePasswordAccountName),
-          headroom: parsed.headroom,
         };
       }
     } catch (error) {
@@ -1378,13 +1411,6 @@ export class Config {
       const onePasswordAccountName = parseOptionalNonEmptyString(config.onePasswordAccountName);
       if (onePasswordAccountName) {
         data.onePasswordAccountName = onePasswordAccountName;
-      }
-
-      // Persist the headroom integration config so it survives config round-trips.
-      // Without this, saveConfig rewrites config.json from a hand-picked field set
-      // and silently drops the headroom block (see loadConfigOrDefault headroom pass-through).
-      if (config.headroom !== undefined) {
-        data.headroom = config.headroom;
       }
 
       await writeFileAtomic(this.configFile, JSON.stringify(data, null, 2), "utf-8");

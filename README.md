@@ -12,7 +12,7 @@
 
 </div>
 
-This repository is a fork of [Coder's official Mux](https://github.com/coder/mux), a desktop and browser app for parallel agentic development. It keeps the core Mux workflow and UX, while extending it with additional provider and model support plus deeper Headroom integration.
+This repository is a fork of [Coder's official Mux](https://github.com/coder/mux), a desktop and browser app for parallel agentic development. It keeps the core Mux workflow and UX while extending it with additional provider and model support.
 
 <p><img src="./docs/img/mux-demo.gif" alt="mux product demo" width="100%" /></p>
 
@@ -37,22 +37,6 @@ Compared with the official Mux repo, this fork adds:
 - **Built-in local LLM providers** (OpenAI-compatible, no API key required)
   - LM Studio (`http://localhost:1234/v1`)
   - oMLX (`http://localhost:8000/v1`)
-- **Headroom integration with an extensive configuration UI**
-  - Provisioning and runtime controls
-  - Proxy mode (Anthropic + OpenAI chat-completions providers)
-  - Per-provider routing controls
-  - Advanced tuning and presets
-  - Workspace-level overrides
-- **SharedContext for subagent report compression**
-  - Auto-compresses background subagent reports at delivery time via the Headroom proxy
-  - In-process store with TTL and LRU eviction
-  - Reduces parent context footprint across long delegation chains
-  - Fail-open: full report delivered uncompressed if the proxy is unavailable
-- **Dedicated Headroom Stats section in Settings**
-  - Live compression totals
-  - Tokens saved
-  - Reduction percentage
-  - Persistent usage totals
 
 ## Base Mux Features
 
@@ -78,13 +62,10 @@ This fork is aimed at users who want the Mux experience but need:
 
 - Better support for Chinese AI providers without custom provider setup
 - Built-in access to popular Chinese model families from the model picker
-- Stronger Headroom-based context compression controls
-- Lower token cost on multi-agent delegation via automatic report compression
-- Better visibility into Headroom behavior through a dedicated stats section
 
 ## Install
 
-Use this fork if you want the added provider, model, and Headroom capabilities described above.
+Use this fork if you want the added provider and model capabilities described above.
 
 If you are looking for upstream Mux releases and documentation, see:
 

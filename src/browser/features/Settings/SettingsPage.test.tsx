@@ -31,20 +31,4 @@ describe("SettingsPage", () => {
     expect(getSettingsSectionRedirect("memory", false, false)).toEqual({ section: "general" });
     expect(getSettingsSectionRedirect("memory", false, true)).toBeNull();
   });
-
-  test("shows the Headroom Stats section only while Headroom is enabled", () => {
-    expect(getSettingsSections(false, false, true).map((section) => section.id)).toContain(
-      "headroom-stats"
-    );
-    expect(getSettingsSections(false, false, false).map((section) => section.id)).not.toContain(
-      "headroom-stats"
-    );
-  });
-
-  test("redirects the headroom-stats route away while Headroom is disabled", () => {
-    expect(getSettingsSectionRedirect("headroom-stats", false, false, false)).toEqual({
-      section: "general",
-    });
-    expect(getSettingsSectionRedirect("headroom-stats", false, false, true)).toBeNull();
-  });
 });

@@ -105,6 +105,45 @@ describe("Config", () => {
     });
   });
 
+  describe("legacy Headroom cleanup", () => {
+    it("removes legacy config and runtime state while loading", () => {
+      const runtimeDir = path.join(tempDir, "headroom");
+      fs.mkdirSync(runtimeDir);
+      fs.writeFileSync(path.join(runtimeDir, "pyvenv.cfg"), "legacy runtime");
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          headroom: { enabled: true },
+          projects: [
+            [
+              "/repo",
+              {
+                workspaces: [
+                  {
+                    id: "workspace-1",
+                    path: "/repo/workspace",
+                    name: "workspace",
+                    headroom: { enabled: true },
+                  },
+                ],
+              },
+            ],
+          ],
+        })
+      );
+
+      config.loadConfigOrDefault();
+
+      expect(fs.existsSync(runtimeDir)).toBe(false);
+      const persisted = JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
+        headroom?: unknown;
+        projects: Array<[string, { workspaces: Array<{ headroom?: unknown }> }]>;
+      };
+      expect(persisted.headroom).toBeUndefined();
+      expect(persisted.projects[0]?.[1].workspaces[0]?.headroom).toBeUndefined();
+    });
+  });
+
   describe("editConfig", () => {
     it("serializes concurrent edits so no update is lost", async () => {
       // Regression: editConfig used to be a non-serialized read-modify-write

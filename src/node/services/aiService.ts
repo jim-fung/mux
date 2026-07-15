@@ -51,7 +51,6 @@ import type { MuxToolScope } from "@/common/types/toolScope";
 import type { PolicyService } from "@/node/services/policyService";
 import type { ProviderService } from "@/node/services/providerService";
 import type { CodexOauthService } from "@/node/services/codexOauthService";
-import type { HeadroomService } from "@/node/services/headroom/headroomService";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { FileState, EditedFileAttachment } from "@/node/services/agentSession";
@@ -501,9 +500,6 @@ export class AIService extends EventEmitter {
 
   setCodexOauthService(service: CodexOauthService): void {
     this.providerModelFactory.codexOauthService = service;
-  }
-  setHeadroomService(service: HeadroomService): void {
-    this.providerModelFactory.headroomService = service;
   }
   setMCPServerManager(manager: MCPServerManager): void {
     this.mcpServerManager = manager;

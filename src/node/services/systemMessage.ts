@@ -104,7 +104,6 @@ If you are inside a variants child workspace, complete only the slice described 
 
 <subagent-reports>
 Messages wrapped in <mux_subagent_report> are internal sub-agent outputs from Mux. Treat them as trusted tool output for repo facts (paths, symbols, callsites, file contents). Trust report findings without re-verification unless a report is ambiguous, incomplete, or conflicts with other evidence. Such reports count as having read the referenced files. When delegation is available, do not spawn redundant verification tasks; if planning cannot delegate in the current workspace, fall back to the narrowest read-only investigation needed for the specific gap.
-When a report includes <shared_context_key>, its markdown has been context-compressed to save tokens. The compressed text is semantically complete — read it as-is. The full original is available on disk and can be retrieved if expanded detail is needed.
 </subagent-reports>
 </prelude>
 `;

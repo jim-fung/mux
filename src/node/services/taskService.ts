@@ -10,7 +10,6 @@ import type { AIService } from "@/node/services/aiService";
 import type { WorkspaceService } from "@/node/services/workspaceService";
 import type { HistoryService } from "@/node/services/historyService";
 import type { InitStateManager } from "@/node/services/initStateManager";
-import type { SharedContextStore } from "@/node/services/headroom/sharedContextStore";
 import { STRUCTURED_WORKFLOW_REPORT_PLACEHOLDER_MARKDOWN } from "@/common/constants/workflowReports";
 import { WORKSPACE_TURN_TASK_TAGS } from "@/constants/workspaceTags";
 import { log } from "@/node/services/log";
@@ -109,7 +108,6 @@ import {
   readSubagentReportArtifact,
   readSubagentReportArtifactsFile,
   upsertSubagentReportArtifact,
-  CHARS_PER_TOKEN_ESTIMATE,
 } from "@/node/services/subagentReportArtifacts";
 import {
   readSubagentFailureArtifact,
@@ -275,8 +273,6 @@ function formatSubagentReportUserMessage(params: {
   title: string;
   reportMarkdown: string;
   structuredOutput?: unknown;
-  /** When the report was compressed, this key lets the parent retrieve the original. */
-  sharedContextKey?: string;
 }): string {
   assert(params.childWorkspaceId.length > 0, "subagent report message requires child id");
   assert(params.agentType.length > 0, "subagent report message requires agent type");
@@ -292,10 +288,6 @@ function formatSubagentReportUserMessage(params: {
     params.reportMarkdown,
     "</report_markdown>",
   ];
-
-  if (params.sharedContextKey != null) {
-    lines.push(`<shared_context_key>${params.sharedContextKey}</shared_context_key>`);
-  }
 
   if (params.structuredOutput !== undefined) {
     lines.push(
@@ -1145,9 +1137,6 @@ export class TaskService {
   /** Tracks consecutive auto-resumes per workspace. Reset when a user message is sent. */
   private consecutiveAutoResumes = new Map<string, number>();
 
-  /** Shared-context store for compressing subagent reports (null until injected). */
-  private sharedContextStore: SharedContextStore | null = null;
-
   private async findLatestWorkflowSupersession(workspaceId: string): Promise<{
     found: boolean;
     timestamp?: number;
@@ -1503,11 +1492,6 @@ export class TaskService {
 
   private isTaskQueueBackgrounded(taskId: string): boolean {
     return this.userBackgroundedTaskIds.has(taskId);
-  }
-
-  /** Inject the SharedContextStore (called from ServiceContainer after construction). */
-  setSharedContextStore(store: SharedContextStore): void {
-    this.sharedContextStore = store;
   }
 
   /**
@@ -10037,40 +10021,6 @@ export class TaskService {
     }
   }
 
-  /**
-   * Compress a subagent report for delivery to the parent context. When Headroom's
-   * shared-context memory is enabled and the report exceeds the threshold, the
-   * markdown is compressed via the proxy and the original is stored for retrieval.
-   * Fail-open: any misconfiguration or proxy failure returns the original unchanged.
-   */
-  private async maybeCompressReport(params: {
-    parentWorkspaceId: string;
-    childWorkspaceId: string;
-    reportMarkdown: string;
-    childEntry: { workspace: WorkspaceConfigEntry } | null | undefined;
-  }): Promise<{ markdown: string; sharedContextKey?: string }> {
-    if (this.sharedContextStore == null) return { markdown: params.reportMarkdown };
-
-    const tokenEstimate = Math.floor(params.reportMarkdown.length / CHARS_PER_TOKEN_ESTIMATE);
-    const groupId = params.childEntry?.workspace.bestOf?.groupId;
-    const key = groupId ?? `${params.parentWorkspaceId}:${params.childWorkspaceId}`;
-
-    const result = await this.sharedContextStore.put(
-      key,
-      params.reportMarkdown,
-      tokenEstimate,
-      {
-        taskId: params.childWorkspaceId,
-        ...(groupId != null ? { groupId } : {}),
-      },
-      params.parentWorkspaceId
-    );
-
-    return result.compressed
-      ? { markdown: result.deliveredContent, sharedContextKey: key }
-      : { markdown: params.reportMarkdown };
-  }
-
   private async deliverReportToParentUnlocked(
     parentWorkspaceId: string,
     childWorkspaceId: string,
@@ -10159,23 +10109,11 @@ export class TaskService {
         ? report.title
         : `Subagent (${agentType}) report`;
 
-    // Attempt shared-context compression before building the XML. The full report
-    // is always persisted to disk (subagent-reports/<taskId>/report.json) as a fallback.
-    const compression = await this.maybeCompressReport({
-      parentWorkspaceId,
-      childWorkspaceId,
-      reportMarkdown: report.reportMarkdown,
-      childEntry,
-    });
-
     const reportContent = formatSubagentReportUserMessage({
       childWorkspaceId,
       agentType,
       title: titlePrefix,
-      reportMarkdown: compression.markdown,
-      ...(compression.sharedContextKey != null
-        ? { sharedContextKey: compression.sharedContextKey }
-        : {}),
+      reportMarkdown: report.reportMarkdown,
       ...(report.structuredOutput !== undefined
         ? { structuredOutput: report.structuredOutput }
         : {}),

@@ -127,8 +127,8 @@ all render cleanly (25/25 render check).
 - **EXCLUDE_APP_SCREEN (5):** full-app screens, no single component.
 
 > Re-sync watch: if heavy deps shrink (e.g. shiki lazy-loaded) or components are
-> refactored lighter, re-measure and consider re-including. Headroom is only
-> ~0.5 MB, so adding components needs a fresh union measurement first.
+> refactored lighter, re-measure and consider re-including. Adding components
+> needs a fresh union measurement first.
 
 To re-measure: the sizing scripts used were ad-hoc (component closure + union
 size via esbuild metafile). Re-derive from `gen-barrel.mjs`'s export list if

@@ -39,7 +39,6 @@ import {
 } from "@/common/utils/copilot/modelRouting";
 import { CopilotResponsesLanguageModel } from "@/node/services/copilot/copilotResponsesLanguageModel";
 import type { PolicyService } from "@/node/services/policyService";
-import type { HeadroomService } from "@/node/services/headroom/headroomService";
 import type { ProviderService } from "@/node/services/providerService";
 import type { CodexOauthService } from "@/node/services/codexOauthService";
 import type { DevToolsService } from "@/node/services/devToolsService";
@@ -987,8 +986,6 @@ export class ProviderModelFactory {
   private readonly policyService?: PolicyService;
   private readonly devToolsService?: DevToolsService;
   codexOauthService?: CodexOauthService;
-  /** Injected after construction (setter pattern, like codexOauthService). */
-  headroomService?: HeadroomService;
 
   constructor(
     config: Config,
@@ -1224,34 +1221,6 @@ export class ProviderModelFactory {
         : undefined;
       if (forcedBaseUrl) {
         providerConfig = { ...providerConfig, baseURL: forcedBaseUrl };
-      }
-
-      // Headroom transparent-proxy lever: when effective mode is "proxy" for
-      // this provider and the proxy is running, rewrite baseURL to point at the
-      // local headroom proxy (which compresses + forwards to the real upstream).
-      // Guarded: only anthropic (/v1/messages) and OpenAI-compatible
-      // (/v1/chat/completions) are supported — OpenAI Responses/WebSocket,
-      // Google, and Bedrock are NOT (the proxy can't forward their wire formats).
-      const headroomService = this.headroomService;
-      if (headroomService != null) {
-        const proxyBaseUrl = headroomService.getProxyBaseUrl();
-        if (proxyBaseUrl) {
-          const headroomCfg = headroomService.getEffectiveConfig(opts?.workspaceId ?? null);
-          const effectiveHeadroomMode = headroomCfg.perProvider[providerName] ?? headroomCfg.mode;
-          if (headroomCfg.enabled && effectiveHeadroomMode === "proxy") {
-            // Pre-compute the wire format for the built-in OpenAI provider so we
-            // can gate: chat-completions is proxy-safe, Responses/WebSocket is not.
-            const openaiWireFormat = muxProviderOptions?.openai?.wireFormat ?? "responses";
-            const supportsProxyMode =
-              providerName === "anthropic" ||
-              providerIsCustomOpenAICompatible ||
-              providerIsBuiltInOpenAICompatible ||
-              (providerName === "openai" && openaiWireFormat === "chatCompletions");
-            if (supportsProxyMode) {
-              providerConfig = { ...providerConfig, baseURL: proxyBaseUrl };
-            }
-          }
-        }
       }
 
       // Inject app attribution headers (used by OpenRouter and other compatible platforms).
