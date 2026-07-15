@@ -27,6 +27,7 @@ import {
 import { getErrorMessage } from "@/common/utils/errors";
 import {
   isWorkspaceTurnTaskId,
+  type WorkspaceTurnTaskHandleRecord,
   type WorkspaceTurnTaskStatus,
 } from "@/node/services/taskHandleStore";
 import { buildWorkflowProgressSummary, formatWorkflowProgressNote } from "./workflowProgress";
@@ -548,22 +549,38 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
               activeTaskIds,
             };
           }
+          const markWorkspaceTurnTerminalAttentionConsumed = async (
+            status: WorkspaceTurnTaskStatus
+          ): Promise<void> => {
+            await taskService.markWorkspaceTurnTerminalAttentionConsumed?.({
+              ownerWorkspaceId: workspaceId,
+              handleId: taskId,
+              status,
+            });
+          };
+          // task_await returns the terminal "completed" workspace-turn result from
+          // several await paths (immediate snapshot, task-signal abort race, timeout
+          // race, and generic wait rejection). Build the shared shape once so those
+          // paths cannot drift on the reported fields or fallback copy.
+          const completedWorkspaceTurnResult = (record: WorkspaceTurnTaskHandleRecord) => ({
+            status: "completed" as const,
+            taskId,
+            handleKind: "workspace_turn" as const,
+            workspaceId: record.workspaceId,
+            reportMarkdown:
+              record.reportMarkdown ?? "Workspace turn completed without final text output.",
+            title: record.title,
+            messageId: record.messageId,
+            finalMessageRef: record.finalMessageRef,
+            note: COMPLETED_REPORT_REFETCH_NOTE,
+          });
           if (timeoutMs === 0 || !isWorkspaceTurnActiveStatus(snapshot.status)) {
             if (snapshot.status === "completed") {
-              return {
-                status: "completed" as const,
-                taskId,
-                handleKind: "workspace_turn" as const,
-                workspaceId: snapshot.workspaceId,
-                reportMarkdown:
-                  snapshot.reportMarkdown ?? "Workspace turn completed without final text output.",
-                title: snapshot.title,
-                messageId: snapshot.messageId,
-                finalMessageRef: snapshot.finalMessageRef,
-                note: COMPLETED_REPORT_REFETCH_NOTE,
-              };
+              await markWorkspaceTurnTerminalAttentionConsumed(snapshot.status);
+              return completedWorkspaceTurnResult(snapshot);
             }
             if (snapshot.status === "interrupted") {
+              await markWorkspaceTurnTerminalAttentionConsumed(snapshot.status);
               return {
                 status: "interrupted" as const,
                 taskId,
@@ -573,6 +590,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
               };
             }
             if (snapshot.status === "error") {
+              await markWorkspaceTurnTerminalAttentionConsumed(snapshot.status);
               return {
                 status: "error" as const,
                 taskId,
@@ -596,6 +614,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
               requestingWorkspaceId: workspaceId,
               backgroundOnMessageQueued: true,
             });
+            await markWorkspaceTurnTerminalAttentionConsumed("completed");
             return {
               status: "completed" as const,
               taskId,
@@ -630,30 +649,29 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
               const latest = await taskService.getWorkspaceTurnSnapshot(workspaceId, taskId);
               if (latest == null) return { status: "not_found" as const, taskId };
               if (latest.status === "completed") {
-                return {
-                  status: "completed" as const,
-                  taskId,
-                  handleKind: "workspace_turn" as const,
-                  workspaceId: latest.workspaceId,
-                  reportMarkdown:
-                    latest.reportMarkdown ?? "Workspace turn completed without final text output.",
-                  title: latest.title,
-                  messageId: latest.messageId,
-                  finalMessageRef: latest.finalMessageRef,
-                  note: COMPLETED_REPORT_REFETCH_NOTE,
-                };
+                await markWorkspaceTurnTerminalAttentionConsumed(latest.status);
+                return completedWorkspaceTurnResult(latest);
               }
               if (latest.status === "error") {
+                await markWorkspaceTurnTerminalAttentionConsumed(latest.status);
                 return {
                   status: "error" as const,
                   taskId,
                   error: latest.error ?? WORKSPACE_TURN_DEFAULT_ERROR,
                 };
               }
+              if (latest.status === "interrupted") {
+                await markWorkspaceTurnTerminalAttentionConsumed(latest.status);
+                return {
+                  status: "interrupted" as const,
+                  taskId,
+                  handleKind: "workspace_turn" as const,
+                  workspaceId: latest.workspaceId,
+                  note: "Workspace turn was interrupted. The full workspace is preserved.",
+                };
+              }
               return {
-                status: isWorkspaceTurnActiveStatus(latest.status)
-                  ? (latest.status as "queued" | "starting" | "running")
-                  : "interrupted",
+                status: latest.status,
                 taskId,
                 handleKind: "workspace_turn" as const,
                 workspaceId: latest.workspaceId,
@@ -664,20 +682,11 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
               const latest = await taskService.getWorkspaceTurnSnapshot(workspaceId, taskId);
               if (latest == null) return { status: "not_found" as const, taskId };
               if (latest.status === "completed") {
-                return {
-                  status: "completed" as const,
-                  taskId,
-                  handleKind: "workspace_turn" as const,
-                  workspaceId: latest.workspaceId,
-                  reportMarkdown:
-                    latest.reportMarkdown ?? "Workspace turn completed without final text output.",
-                  title: latest.title,
-                  messageId: latest.messageId,
-                  finalMessageRef: latest.finalMessageRef,
-                  note: COMPLETED_REPORT_REFETCH_NOTE,
-                };
+                await markWorkspaceTurnTerminalAttentionConsumed(latest.status);
+                return completedWorkspaceTurnResult(latest);
               }
               if (latest.status === "error") {
+                await markWorkspaceTurnTerminalAttentionConsumed(latest.status);
                 return {
                   status: "error" as const,
                   taskId,
@@ -685,6 +694,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
                 };
               }
               if (latest.status === "interrupted") {
+                await markWorkspaceTurnTerminalAttentionConsumed(latest.status);
                 return {
                   status: "interrupted" as const,
                   taskId,
@@ -702,6 +712,31 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
             }
             if (/out of scope/i.test(message) || /not found/i.test(message)) {
               return { status: "invalid_scope" as const, taskId };
+            }
+            const latest = await taskService
+              .getWorkspaceTurnSnapshot(workspaceId, taskId)
+              .catch(() => null);
+            if (latest?.status === "completed") {
+              await markWorkspaceTurnTerminalAttentionConsumed(latest.status);
+              return completedWorkspaceTurnResult(latest);
+            }
+            if (latest?.status === "error") {
+              await markWorkspaceTurnTerminalAttentionConsumed(latest.status);
+              return {
+                status: "error" as const,
+                taskId,
+                error: latest.error ?? WORKSPACE_TURN_DEFAULT_ERROR,
+              };
+            }
+            if (latest?.status === "interrupted") {
+              await markWorkspaceTurnTerminalAttentionConsumed(latest.status);
+              return {
+                status: "interrupted" as const,
+                taskId,
+                handleKind: "workspace_turn" as const,
+                workspaceId: latest.workspaceId,
+                note: "Workspace turn was interrupted. The full workspace is preserved.",
+              };
             }
             return { status: "error" as const, taskId, error: message };
           }

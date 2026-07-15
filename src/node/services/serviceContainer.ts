@@ -23,6 +23,7 @@ import { MenuEventService } from "@/node/services/menuEventService";
 import { VoiceService } from "@/node/services/voiceService";
 import { TelemetryService } from "@/node/services/telemetryService";
 import type {
+  ErrorEvent,
   ReasoningDeltaEvent,
   StreamAbortEvent,
   StreamDeltaEvent,
@@ -39,7 +40,10 @@ import { BrowserControlService } from "@/node/services/browser/BrowserControlSer
 import { BrowserSessionStateHub } from "@/node/services/browser/BrowserSessionStateHub";
 import { DevToolsService } from "@/node/services/devToolsService";
 import { SessionTimingService } from "@/node/services/sessionTimingService";
-import { AnalyticsService } from "@/node/services/analytics/analyticsService";
+import {
+  AnalyticsService,
+  type IngestWorkspaceMeta,
+} from "@/node/services/analytics/analyticsService";
 import { ExperimentsService } from "@/node/services/experimentsService";
 import { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
 import { McpOauthService } from "@/node/services/mcpOauthService";
@@ -315,7 +319,17 @@ export class ServiceContainer {
       this.extensionMetadata,
       this.workspaceService,
       this.windowService,
-      this.aiService
+      this.aiService,
+      // Status generation spends tokens outside StreamManager; give it a cost
+      // telemetry sink so that spend shows up in per-workspace usage, and an
+      // ingest trigger so the headless-usage sidecar reaches dashboard totals
+      // even when the workspace has no further stream activity.
+      {
+        sessionUsageService: this.sessionUsageService,
+        requestAnalyticsIngest: (workspaceId) => {
+          this.workspaceService.emit("analyticsIngest", { workspaceId });
+        },
+      }
     );
     this.serverService = new ServerService();
     this.menuEventService = new MenuEventService();
@@ -379,23 +393,37 @@ export class ServiceContainer {
     this.aiService.on("tool-call-end", (data: ToolCallEndEvent) =>
       this.sessionTimingService.handleToolCallEnd(data)
     );
-    this.aiService.on("stream-end", (data: StreamEndEvent) => {
-      this.sessionTimingService.handleStreamEnd(data);
-
-      const workspaceLookup = this.config.findWorkspace(data.workspaceId);
-      const sessionDir = this.config.getSessionDir(data.workspaceId);
+    // Newly created sub-agent workspaces are ingested here before a full rebuild,
+    // so keep workspaceName + parentWorkspaceId to avoid NULL analytics attribution.
+    // Multi-project workspaces stay stored under _multi in config, but analytics should
+    // still attribute spend to the workspace's first real project path.
+    const ingestWorkspaceAnalytics = (workspaceId: string) => {
+      const workspaceLookup = this.config.findWorkspace(workspaceId);
+      const sessionDir = this.config.getSessionDir(workspaceId);
       const analyticsProjectPath =
         workspaceLookup?.attributionProjectPath ?? workspaceLookup?.projectPath;
-      // Newly created sub-agent workspaces are ingested here before a full rebuild,
-      // so keep workspaceName + parentWorkspaceId to avoid NULL analytics attribution.
-      // Multi-project workspaces stay stored under _multi in config, but analytics should
-      // still attribute spend to the workspace's first real project path.
-      this.analyticsService.ingestWorkspace(data.workspaceId, sessionDir, {
+      this.analyticsService.ingestWorkspace(workspaceId, sessionDir, {
         projectPath: analyticsProjectPath,
         projectName: analyticsProjectPath ? path.basename(analyticsProjectPath) : undefined,
         workspaceName: workspaceLookup?.workspaceName,
         parentWorkspaceId: workspaceLookup?.parentWorkspaceId,
       });
+    };
+    this.aiService.on("stream-end", (data: StreamEndEvent) => {
+      this.sessionTimingService.handleStreamEnd(data);
+      ingestWorkspaceAnalytics(data.workspaceId);
+    });
+    // Billable usage persisted outside StreamManager stream-end (e.g. /btw
+    // side-question answers) requests its own incremental ingest pass.
+    this.workspaceService.on("analyticsIngest", (event) => {
+      ingestWorkspaceAnalytics(event.workspaceId);
+    });
+    // Memory consolidation/harvest spend rides the headless-usage sidecar
+    // without any chat activity; ingest promptly so background sweeps reach
+    // dashboard totals instead of stranding until an unrelated stream-end
+    // or app restart.
+    this.memoryConsolidationService.on("analyticsIngest", (event: { workspaceId: string }) => {
+      ingestWorkspaceAnalytics(event.workspaceId);
     });
     // WorkspaceService emits metadata:null after successful remove().
     // Clear analytics rows immediately so deleted workspaces disappear from stats
@@ -405,12 +433,49 @@ export class ServiceContainer {
         return;
       }
 
-      this.analyticsService.clearWorkspace(event.workspaceId);
+      // Removed sub-agent children archive their transcript into the parent's
+      // session dir before this event fires. Re-ingest the parent (chained after
+      // the clear) so the child's spend is restored from the archive instead of
+      // vanishing from analytics until the parent's next stream-end.
+      let reingestAfterClear:
+        | { workspaceId: string; sessionDir: string; meta: IngestWorkspaceMeta }
+        | undefined;
+      const parentWorkspaceId = event.removedParentWorkspaceId;
+      if (parentWorkspaceId) {
+        const parentLookup = this.config.findWorkspace(parentWorkspaceId);
+        const parentProjectPath = parentLookup?.attributionProjectPath ?? parentLookup?.projectPath;
+        reingestAfterClear = {
+          workspaceId: parentWorkspaceId,
+          sessionDir: this.config.getSessionDir(parentWorkspaceId),
+          meta: {
+            projectPath: parentProjectPath,
+            projectName: parentProjectPath ? path.basename(parentProjectPath) : undefined,
+            workspaceName: parentLookup?.workspaceName,
+            parentWorkspaceId: parentLookup?.parentWorkspaceId,
+          },
+        };
+      }
+
+      this.analyticsService.clearWorkspace(event.workspaceId, { reingestAfterClear });
     });
 
-    this.aiService.on("stream-abort", (data: StreamAbortEvent) =>
-      this.sessionTimingService.handleStreamAbort(data)
-    );
+    this.aiService.on("stream-abort", (data: StreamAbortEvent) => {
+      this.sessionTimingService.handleStreamAbort(data);
+      // Aborted turns persist their spend before this event fires (same async
+      // chain): normal aborts commit the usage-stamped partial to chat.jsonl
+      // (or the headless sidecar for non-commit-worthy partials); abandoned
+      // aborts (edit/discard) write only the sidecar. Ingest both, or the
+      // interrupted turn's spend stays out of dashboards until the next
+      // stream-end.
+      ingestWorkspaceAnalytics(data.workspaceId);
+    });
+    // Errored turns whose partial would be dropped at commit time route their
+    // usage to the headless sidecar (persistStreamError). The sidecar write
+    // precedes this event in the same async chain, so ingest here keeps the
+    // dashboard current instead of waiting for the next stream or restart.
+    this.aiService.on("error", (data: ErrorEvent) => {
+      ingestWorkspaceAnalytics(data.workspaceId);
+    });
   }
 
   get onePasswordService(): OnePasswordService | null {
@@ -593,6 +658,10 @@ export class ServiceContainer {
    * Terminates all background processes to prevent orphans.
    */
   async dispose(): Promise<void> {
+    // Must run before any session teardown: AgentSession.dispose() triggers
+    // backgroundProcessManager.cleanup(), which would otherwise erase the persisted
+    // armed-monitor registry records that drive post-restart "monitor lost" wakes.
+    this.backgroundProcessManager.beginShutdown();
     // Stop the bridge before closing sessions so desktop clients get a clean disconnect.
     await this.desktopBridgeServer.stop();
     this.desktopTokenManager.dispose();
@@ -619,6 +688,5 @@ export class ServiceContainer {
     this.serverAuthService.dispose();
     this.providerService.dispose();
     await this.backgroundProcessManager.terminateAll();
-
   }
 }

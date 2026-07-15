@@ -26,6 +26,10 @@ function createProjectsConfig(workspace: Workspace): ProjectsConfig {
   };
 }
 
+// expect.any returns `any`; pin the matcher's type once so exact-equality object
+// literals with the server-managed stamp stay lint-clean (no-unsafe-assignment).
+const anyNumber = expect.any(Number) as number;
+
 function createWorkspace(heartbeat: {
   enabled: boolean;
   intervalMs: number;
@@ -60,8 +64,10 @@ describe("WorkspaceService heartbeat settings", () => {
         workspacePath: TEST_WORKSPACE_PATH,
         projectPath: TEST_PROJECT_PATH,
       })),
-      saveConfig: mock((nextConfig: ProjectsConfig) => {
-        currentProjectsConfig = nextConfig;
+      // Heartbeat writers mutate inside serialized editConfig transforms (saveConfig is
+      // private); mirror that by applying the transform to the current config snapshot.
+      editConfig: mock((transform: (config: ProjectsConfig) => ProjectsConfig) => {
+        currentProjectsConfig = transform(currentProjectsConfig);
         return Promise.resolve();
       }),
     } as unknown as Config;
@@ -171,6 +177,8 @@ describe("WorkspaceService heartbeat settings", () => {
       intervalMs: 45 * 60 * 1000,
       message: "Keep this custom heartbeat message.",
       contextMode: HEARTBEAT_DEFAULT_CONTEXT_MODE,
+      // The interval changed (30m → 45m), so the cadence-edit stamp is expected.
+      scheduleUpdatedAt: anyNumber,
     });
   });
 
@@ -192,12 +200,14 @@ describe("WorkspaceService heartbeat settings", () => {
       intervalMs: 45 * 60 * 1000,
       message: LONG_HEARTBEAT_MESSAGE,
       contextMode: HEARTBEAT_DEFAULT_CONTEXT_MODE,
+      scheduleUpdatedAt: anyNumber,
     });
     expect(service.getHeartbeatSettings(TEST_WORKSPACE_ID)).toEqual({
       enabled: true,
       intervalMs: 45 * 60 * 1000,
       message: LONG_HEARTBEAT_MESSAGE,
       contextMode: HEARTBEAT_DEFAULT_CONTEXT_MODE,
+      scheduleUpdatedAt: anyNumber,
     });
   });
 
@@ -216,6 +226,7 @@ describe("WorkspaceService heartbeat settings", () => {
       enabled: true,
       intervalMs: 45 * 60 * 1000,
       contextMode: HEARTBEAT_DEFAULT_CONTEXT_MODE,
+      scheduleUpdatedAt: anyNumber,
     });
   });
 
@@ -246,6 +257,129 @@ describe("WorkspaceService heartbeat settings", () => {
     });
   });
 
+  test("round-trips trigger and whenBusy and preserves them when a write omits the keys", async () => {
+    const setResult = await service.setHeartbeatSettings(TEST_WORKSPACE_ID, {
+      enabled: true,
+      intervalMs: 45 * 60 * 1000,
+      trigger: "interval",
+      whenBusy: "tool-end",
+    });
+    expect(setResult.success).toBe(true);
+    expect(service.getHeartbeatSettings(TEST_WORKSPACE_ID)).toMatchObject({
+      trigger: "interval",
+      whenBusy: "tool-end",
+    });
+
+    // An update without the keys preserves the persisted values.
+    const omitResult = await service.setHeartbeatSettings(TEST_WORKSPACE_ID, {
+      intervalMs: 50 * 60 * 1000,
+    });
+    expect(omitResult.success).toBe(true);
+    const persistedHeartbeat = currentProjectsConfig.projects
+      .get(TEST_PROJECT_PATH)
+      ?.workspaces.at(0)?.heartbeat;
+    expect(persistedHeartbeat).toMatchObject({
+      intervalMs: 50 * 60 * 1000,
+      trigger: "interval",
+      whenBusy: "tool-end",
+    });
+  });
+
+  test("explicit null clears trigger and whenBusy back to unset", async () => {
+    const setResult = await service.setHeartbeatSettings(TEST_WORKSPACE_ID, {
+      trigger: "interval",
+      whenBusy: "skip",
+    });
+    expect(setResult.success).toBe(true);
+
+    const clearResult = await service.setHeartbeatSettings(TEST_WORKSPACE_ID, {
+      trigger: null,
+      whenBusy: null,
+    });
+    expect(clearResult.success).toBe(true);
+
+    const persistedHeartbeat = currentProjectsConfig.projects
+      .get(TEST_PROJECT_PATH)
+      ?.workspaces.at(0)?.heartbeat;
+    expect(persistedHeartbeat).toBeDefined();
+    expect(Object.keys(persistedHeartbeat!)).not.toContain("trigger");
+    expect(Object.keys(persistedHeartbeat!)).not.toContain("whenBusy");
+  });
+
+  test("unset trigger/whenBusy are never materialized into config by unrelated writes", async () => {
+    const result = await service.setHeartbeatSettings(TEST_WORKSPACE_ID, {
+      enabled: true,
+      intervalMs: 45 * 60 * 1000,
+    });
+    expect(result.success).toBe(true);
+
+    const persistedHeartbeat = currentProjectsConfig.projects
+      .get(TEST_PROJECT_PATH)
+      ?.workspaces.at(0)?.heartbeat;
+    expect(persistedHeartbeat).toBeDefined();
+    expect(Object.keys(persistedHeartbeat!)).not.toContain("trigger");
+    expect(Object.keys(persistedHeartbeat!)).not.toContain("whenBusy");
+    const readBack = service.getHeartbeatSettings(TEST_WORKSPACE_ID);
+    expect(readBack).not.toBeNull();
+    expect(Object.keys(readBack!)).not.toContain("trigger");
+    expect(Object.keys(readBack!)).not.toContain("whenBusy");
+  });
+
+  test("stamps scheduleUpdatedAt on cadence edits and preserves it on cosmetic edits", async () => {
+    const before = Date.now();
+    // Trigger change is cadence-affecting: the fixed schedule re-anchors at the edit.
+    const triggerResult = await service.setHeartbeatSettings(TEST_WORKSPACE_ID, {
+      trigger: "interval",
+    });
+    expect(triggerResult.success).toBe(true);
+    const readPersisted = () =>
+      currentProjectsConfig.projects.get(TEST_PROJECT_PATH)?.workspaces.at(0)?.heartbeat;
+    const stamped = readPersisted()?.scheduleUpdatedAt;
+    expect(typeof stamped).toBe("number");
+    expect(stamped!).toBeGreaterThanOrEqual(before);
+
+    // A message-only edit is cosmetic: the cadence anchor must survive unchanged, or a
+    // restart would defer the next firing past a schedule the user never edited.
+    const messageResult = await service.setHeartbeatSettings(TEST_WORKSPACE_ID, {
+      message: "Different cosmetic message.",
+    });
+    expect(messageResult.success).toBe(true);
+    expect(readPersisted()?.scheduleUpdatedAt).toBe(stamped);
+
+    // An interval change re-stamps.
+    const intervalResult = await service.setHeartbeatSettings(TEST_WORKSPACE_ID, {
+      intervalMs: 45 * 60 * 1000,
+    });
+    expect(intervalResult.success).toBe(true);
+    expect(readPersisted()?.scheduleUpdatedAt).toBeGreaterThanOrEqual(stamped!);
+  });
+
+  test("an explicit no-op trigger write does not stamp scheduleUpdatedAt", async () => {
+    // null → "idle" resolves to the same trigger, so the cadence did not change even
+    // though the persisted shape did; the live path would not re-anchor either.
+    const result = await service.setHeartbeatSettings(TEST_WORKSPACE_ID, {
+      trigger: "idle",
+    });
+    expect(result.success).toBe(true);
+    const persistedHeartbeat = currentProjectsConfig.projects
+      .get(TEST_PROJECT_PATH)
+      ?.workspaces.at(0)?.heartbeat;
+    expect(persistedHeartbeat).toMatchObject({ trigger: "idle" });
+    expect(Object.keys(persistedHeartbeat!)).not.toContain("scheduleUpdatedAt");
+  });
+
+  test("rejects invalid trigger and whenBusy values", async () => {
+    const invalidTrigger = await service.setHeartbeatSettings(TEST_WORKSPACE_ID, {
+      trigger: "hourly" as never,
+    });
+    expect(invalidTrigger.success).toBe(false);
+
+    const invalidWhenBusy = await service.setHeartbeatSettings(TEST_WORKSPACE_ID, {
+      whenBusy: "interrupt" as never,
+    });
+    expect(invalidWhenBusy.success).toBe(false);
+  });
+
   test("persists an explicit heartbeat context mode", async () => {
     const result = await service.setHeartbeatSettings(TEST_WORKSPACE_ID, {
       enabled: true,
@@ -259,6 +393,7 @@ describe("WorkspaceService heartbeat settings", () => {
       intervalMs: 45 * 60 * 1000,
       message: "Keep this custom heartbeat message.",
       contextMode: "compact",
+      scheduleUpdatedAt: anyNumber,
     });
   });
 });

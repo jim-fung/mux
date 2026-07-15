@@ -1,7 +1,4 @@
-import {
-  isActiveWorkflowRunStatus,
-  type WorkflowRunRecord,
-} from "@/common/types/workflow";
+import { isActiveWorkflowRunStatus, type WorkflowRunRecord } from "@/common/types/workflow";
 
 function getWorkflowRunTimestamp(value: string): number | null {
   const timestamp = Date.parse(value);

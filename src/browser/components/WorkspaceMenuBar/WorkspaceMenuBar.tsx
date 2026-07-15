@@ -23,7 +23,10 @@ import { formatKeybind, KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keyb
 import { getDevcontainerStatusChip } from "@/browser/utils/runtimeUi";
 import { useGitStatus } from "@/browser/stores/GitStatusStore";
 import { useRuntimeStatus, useRuntimeStatusStoreRaw } from "@/browser/stores/RuntimeStatusStore";
-import { useWorkspaceMetadataEntry, useWorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
+import {
+  useWorkspaceMetadataEntry,
+  useWorkspaceSidebarState,
+} from "@/browser/stores/WorkspaceStore";
 import { Button } from "@/browser/components/Button/Button";
 import { isDevcontainerRuntime, type RuntimeConfig } from "@/common/types/runtime";
 import { useTutorial } from "@/browser/contexts/TutorialContext";
@@ -50,7 +53,10 @@ import { useWorkspaceActions } from "@/browser/contexts/WorkspaceContext";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { formatProjectHierarchyLabel } from "@/common/utils/subProjects";
 import { isMultiProject } from "@/common/utils/multiProject";
+import { isWorkspacePinnable, isWorkspacePinned } from "@/common/utils/pin";
+import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
 import { forkWorkspace } from "@/browser/utils/chatCommands";
+import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
 import { WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX } from "@/constants/layout";
 import type { AgentSkillDescriptor, AgentSkillIssue } from "@/common/types/agentSkill";
 
@@ -77,6 +83,57 @@ const COLLAPSED_LEFT_SIDEBAR_MENU_BAR_STYLE = {
   paddingLeft: `${WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX}px`,
 } as const;
 
+interface WorkspaceRepositoryControlsProps {
+  workspaceId: string;
+  workspaceName: string;
+  projectPath: string;
+  isWorking: boolean;
+  showMultiProjectStatus: boolean;
+  devcontainerChip: ReturnType<typeof getDevcontainerStatusChip>;
+}
+
+function WorkspaceRepositoryControls({
+  workspaceId,
+  workspaceName,
+  projectPath,
+  isWorking,
+  showMultiProjectStatus,
+  devcontainerChip,
+}: WorkspaceRepositoryControlsProps) {
+  const gitStatus = useGitStatus(workspaceId);
+
+  return (
+    <div className="flex items-center gap-1">
+      <BranchSelector key={workspaceId} workspaceId={workspaceId} workspaceName={workspaceName} />
+      {devcontainerChip && (
+        <span
+          className={cn(
+            "shrink-0 rounded px-1.5 py-0.5 text-[10px] leading-tight font-medium",
+            devcontainerChip.className
+          )}
+        >
+          {devcontainerChip.label}
+        </span>
+      )}
+      {showMultiProjectStatus ? (
+        <MultiProjectGitStatusIndicator
+          workspaceId={workspaceId}
+          tooltipPosition="bottom"
+          isWorking={isWorking}
+        />
+      ) : (
+        <GitStatusIndicator
+          gitStatus={gitStatus}
+          workspaceId={workspaceId}
+          projectPath={projectPath}
+          tooltipPosition="bottom"
+          isWorking={isWorking}
+        />
+      )}
+    </div>
+  );
+}
+
 export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   workspaceId,
   projectName,
@@ -91,14 +148,16 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
 }) => {
   const { api } = useAPI();
   const { disableWorkspaceAgents } = useAgent();
-  const { preflightArchiveWorkspace, archiveWorkspace } = useWorkspaceActions();
+  const { preflightArchiveWorkspace, archiveWorkspace, setWorkspacePinned } = useWorkspaceActions();
   const workspaceEntry = useWorkspaceMetadataEntry(workspaceId);
   const workspaceHeartbeatsEnabled = useExperimentValue(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS);
   const openTerminalPopout = useOpenTerminal();
   const openInEditor = useOpenInEditor();
-  const gitStatus = useGitStatus(workspaceId);
   const runtimeStatus = useRuntimeStatus(workspaceId);
   const showMultiProjectStatus = workspaceEntry != null && isMultiProject(workspaceEntry);
+  // Metadata can briefly be unavailable while a workspace is opening. Treat that as
+  // repository-backed until we receive an explicit scratch entry to avoid hiding controls.
+  const hasRepository = workspaceEntry == null || hasWorkspaceRepository(workspaceEntry);
   // The workspace's metadata.projectName is the parent project (since worktrees
   // are owned by the top-most parent). When the workspace is scoped to a
   // sub-project we surface the hierarchy as "parent / child" so the menu bar
@@ -106,9 +165,11 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const { userProjects } = useProjectContext();
   const subProjectPath = workspaceEntry?.subProjectPath;
   const projectLabel =
-    subProjectPath && userProjects.has(subProjectPath)
-      ? formatProjectHierarchyLabel(subProjectPath, userProjects)
-      : projectName;
+    workspaceEntry?.kind === "scratch"
+      ? SCRATCH_PROJECT_NAME
+      : subProjectPath && userProjects.has(subProjectPath)
+        ? formatProjectHierarchyLabel(subProjectPath, userProjects)
+        : projectName;
   const runtimeStatusStore = useRuntimeStatusStoreRaw();
   const { canInterrupt, isStarting, awaitingUserQuestion, loadedSkills, skillLoadErrors } =
     useWorkspaceSidebarState(workspaceId);
@@ -150,7 +211,9 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
 
   // Auto-enable notifications for new workspaces (project-level)
   const [autoEnableNotifications, setAutoEnableNotifications] = usePersistedState<boolean>(
-    getNotifyOnResponseAutoEnableKey(projectPath),
+    getNotifyOnResponseAutoEnableKey(
+      workspaceEntry?.kind === "scratch" ? SCRATCH_PROJECT_CONFIG_KEY : projectPath
+    ),
     false,
     { listener: true }
   );
@@ -521,42 +584,16 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
           tooltipSide="bottom"
         />
         <span className="min-w-0 truncate font-mono text-xs">{projectLabel}</span>
-        <div className="flex items-center gap-1">
-          {/* BranchSelector keeps workspace-scoped local UI state (current branch fallback,
-              open popover contents, remote expansion). Key it by workspace identity so
-              switching workspaces resets that state instead of leaking the previous
-              workspace's branch presentation into the next one. */}
-          <BranchSelector
-            key={workspaceId}
+        {hasRepository && (
+          <WorkspaceRepositoryControls
             workspaceId={workspaceId}
             workspaceName={workspaceName}
+            projectPath={projectPath}
+            isWorking={isWorking}
+            showMultiProjectStatus={showMultiProjectStatus}
+            devcontainerChip={devcontainerChip}
           />
-          {devcontainerChip && (
-            <span
-              className={cn(
-                "shrink-0 rounded px-1.5 py-0.5 text-[10px] leading-tight font-medium",
-                devcontainerChip.className
-              )}
-            >
-              {devcontainerChip.label}
-            </span>
-          )}
-          {showMultiProjectStatus ? (
-            <MultiProjectGitStatusIndicator
-              workspaceId={workspaceId}
-              tooltipPosition="bottom"
-              isWorking={isWorking}
-            />
-          ) : (
-            <GitStatusIndicator
-              gitStatus={gitStatus}
-              workspaceId={workspaceId}
-              projectPath={projectPath}
-              tooltipPosition="bottom"
-              isWorking={isWorking}
-            />
-          )}
-        </div>
+        )}
       </div>
       <div className={cn("flex items-center gap-2", isDesktop && "titlebar-no-drag")}>
         <WorkspaceLinks workspaceId={workspaceId} />
@@ -741,13 +778,27 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
                 workspaceHeartbeatsEnabled ? () => setHeartbeatModalOpen(true) : null
               }
               onOpenTouchFullscreenReview={
-                isTouchMobileScreen ? handleOpenTouchFullscreenReview : null
+                hasRepository && isTouchMobileScreen ? handleOpenTouchFullscreenReview : null
               }
-              onEnterImmersiveReview={isTouchMobileScreen ? null : handleEnterImmersiveReview}
+              onEnterImmersiveReview={
+                hasRepository && !isTouchMobileScreen ? handleEnterImmersiveReview : null
+              }
               onStopRuntime={isRuntimeRunning ? () => void handleStopRuntime() : null}
-              onForkChat={(anchorEl) => {
-                void handleForkChat(anchorEl);
-              }}
+              onForkChat={
+                hasRepository
+                  ? (anchorEl) => {
+                      void handleForkChat(anchorEl);
+                    }
+                  : null
+              }
+              onTogglePinned={
+                workspaceEntry && isWorkspacePinnable(workspaceEntry)
+                  ? () => {
+                      void setWorkspacePinned(workspaceId, !isWorkspacePinned(workspaceEntry));
+                    }
+                  : null
+              }
+              isPinned={workspaceEntry ? isWorkspacePinned(workspaceEntry) : false}
               onArchiveChat={(anchorEl) => {
                 // handleArchiveChat runs preflight and opens a confirmation dialog
                 // when streaming or untracked files are detected.

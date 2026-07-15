@@ -468,10 +468,8 @@ async function main(): Promise<number> {
     }
 
     if (trustOnlyProjects.size > 0) {
-      await config.saveConfig({
-        ...config.loadConfigOrDefault(),
-        projects: trustOnlyProjects,
-      });
+      // Config.saveConfig is private (lost-update safety); route through the queue.
+      await config.editConfig((cfg) => ({ ...cfg, projects: trustOnlyProjects }));
     }
   }
 
@@ -1424,6 +1422,9 @@ async function main(): Promise<number> {
     }
   } finally {
     unsubscribe();
+    // Suppress monitor:stopped before session.dispose() triggers cleanup() so persisted
+    // armed-monitor registry records survive shutdown (post-restart "monitor lost" wakes).
+    backgroundProcessManager.beginShutdown();
     session.dispose();
     mcpServerManager.dispose();
     await codexOauthService.dispose();

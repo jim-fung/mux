@@ -115,6 +115,125 @@ describe("ProjectService", () => {
     await fs.rm(tempDir, { recursive: true, force: true });
   });
 
+  describe("create", () => {
+    // Regression (PR #3694 Codex P1): two concurrent create() calls for the same
+    // not-yet-existing path both compute createdDirectory === true before either
+    // registration is serialized. The loser hits the duplicate re-check inside the
+    // editConfig transform; it must NOT recursively delete the directory, which now
+    // belongs to the winning registration.
+    it("concurrent create of the same new path keeps the winner's directory", async () => {
+      const projectPath = path.join(tempDir, "concurrent-project");
+
+      const [first, second] = await Promise.all([
+        service.create(projectPath),
+        service.create(projectPath),
+      ]);
+
+      const outcomes = [first, second];
+      expect(outcomes.filter((r) => r.success)).toHaveLength(1);
+      const loser = outcomes.find((r) => !r.success);
+      expect(loser && !loser.success ? loser.error : "").toContain("already exists");
+
+      // The winner's registered checkout must survive the loser's failure path.
+      const stat = await fs.stat(projectPath);
+      expect(stat.isDirectory()).toBe(true);
+      expect(config.loadConfigOrDefault().projects.has(projectPath)).toBe(true);
+    });
+
+    // Regression (PR #3694 Codex P2): the snapshot-time depth check can miss a
+    // sub-project ancestor registered concurrently, persisting a project nested
+    // under a registered sub-project ("one level deep" invariant violation). The
+    // serialized transform must re-validate depth against the fresh hierarchy.
+    it("create rejects a path nested under a concurrently registered sub-project", async () => {
+      const repoPath = path.join(tempDir, "repo");
+      const pkgPath = path.join(repoPath, "pkg");
+      const apiPath = path.join(pkgPath, "api");
+      await fs.mkdir(apiPath, { recursive: true });
+      // Same-git-repo hierarchy so the snapshot-time git-root validations pass.
+      const git = Bun.spawn(["git", "init", "-q", repoPath]);
+      await git.exited;
+
+      const topLevel = await service.create(repoPath);
+      expect(topLevel.success).toBe(true);
+
+      // Deterministic interleaving: enqueue the concurrent sub-project registration
+      // of /repo/pkg first (not yet written), then call create(/repo/pkg/api). The
+      // create's synchronous snapshot read runs before the queued write lands, so
+      // its snapshot-time depth check misses pkg; its transform is queued after and
+      // sees pkg — only the fresh in-transform depth re-check can reject it.
+      const registerPkg = config.editConfig((cfg) => {
+        cfg.projects.set(pkgPath, { workspaces: [], parentProjectPath: repoPath });
+        return cfg;
+      });
+      const api = await service.create(apiPath);
+      await registerPkg;
+
+      expect(api.success).toBe(false);
+      expect(!api.success && api.error).toContain("one level deep");
+      const persisted = config.loadConfigOrDefault().projects;
+      expect(persisted.has(apiPath)).toBe(false);
+      // The pre-existing directory was not created by this call; it must survive.
+      const stat = await fs.stat(apiPath);
+      expect(stat.isDirectory()).toBe(true);
+    });
+
+    // Regression (PR #3694 Codex P2): the same-git-repo validations only run against
+    // the snapshot. A concurrent registration can introduce a parent (or descendant)
+    // that was never git-validated; the transform must reject rather than persist an
+    // unvalidated hierarchy (here: a sub-project from a DIFFERENT git repository).
+    it("create rejects when a concurrent registration changes the unvalidated hierarchy", async () => {
+      const repoPath = path.join(tempDir, "hier-repo");
+      const pkgPath = path.join(repoPath, "pkg");
+      await fs.mkdir(pkgPath, { recursive: true });
+      await Bun.spawn(["git", "init", "-q", repoPath]).exited;
+      // pkg is a SEPARATE git repository: had /repo existed at snapshot time, the
+      // same-git-repo validation would have rejected registering pkg beneath it.
+      await Bun.spawn(["git", "init", "-q", pkgPath]).exited;
+
+      // Deterministic interleaving: queue the registration of /hier-repo (the would-be
+      // parent) so create(pkg)'s synchronous snapshot read misses it — its git-root
+      // validation therefore never runs — while its queued transform sees it.
+      const registerRepo = config.editConfig((cfg) => {
+        cfg.projects.set(repoPath, { workspaces: [] });
+        return cfg;
+      });
+      const result = await service.create(pkgPath);
+      await registerRepo;
+
+      expect(result.success).toBe(false);
+      expect(!result.success && result.error).toContain("changed concurrently");
+      expect(config.loadConfigOrDefault().projects.has(pkgPath)).toBe(false);
+      // Pre-existing directory not created by this call must survive the rejection.
+      expect((await fs.stat(pkgPath)).isDirectory()).toBe(true);
+    });
+
+    // Regression (PR #3694 Codex P1): when create() made the directory itself and the
+    // hierarchy rejection is caused by a NEW DESCENDANT registered concurrently, the
+    // descendant's checkout lives inside that directory tree — recursive cleanup would
+    // delete the winning project's files.
+    it("create keeps the directory when a descendant project registered concurrently", async () => {
+      const parentPath = path.join(tempDir, "race-parent");
+      const descendantPath = path.join(parentPath, "pkg");
+
+      // Deterministic interleaving: queue the descendant registration so create()'s
+      // synchronous snapshot read misses it (createdDirectory === true, no validated
+      // descendants) while its queued transform sees the new descendant.
+      const registerDescendant = config.editConfig((cfg) => {
+        cfg.projects.set(descendantPath, { workspaces: [] });
+        return cfg;
+      });
+      const result = await service.create(parentPath);
+      await registerDescendant;
+
+      expect(result.success).toBe(false);
+      expect(!result.success && result.error).toContain("changed concurrently");
+      // The created directory now hosts the registered descendant project's tree:
+      // it must NOT be recursively deleted by the loser's cleanup.
+      expect((await fs.stat(parentPath)).isDirectory()).toBe(true);
+      expect(config.loadConfigOrDefault().projects.has(descendantPath)).toBe(true);
+    });
+  });
+
   describe("listDirectory", () => {
     it("returns root node with the actual requested path, not empty string", async () => {
       // Create test directory structure
@@ -1637,7 +1756,7 @@ exit 1
         parentProjectPath: parentPath,
         workspaces: [],
       });
-      await config.saveConfig(cfg);
+      await config.editConfig(() => cfg);
 
       const result = await service.assignWorkspaceToSubProject(
         subProjectPath,
@@ -1674,7 +1793,7 @@ exit 1
         parentProjectPath: "/other/project",
         workspaces: [],
       });
-      await config.saveConfig(cfg);
+      await config.editConfig(() => cfg);
 
       const result = await service.assignWorkspaceToSubProject(
         parentPath,
@@ -1686,6 +1805,43 @@ exit 1
       if (result.success) throw new Error("Expected failure");
       expect(result.error).toContain("Sub-project not found under parent");
     });
+
+    // Regression (PR #3694 Codex P2): the sub-project is validated on the snapshot
+    // read; if it is removed while the edit is queued, the transform must not persist
+    // the stale pointer (send/runtime paths use subProjectPath as the execution root).
+    it("rejects when the sub-project is removed while the edit is queued", async () => {
+      const parentPath = "/fake/project";
+      const subProjectPath = "/fake/project/packages/api";
+      const workspaceId = "workspace-1";
+      const cfg = config.loadConfigOrDefault();
+      cfg.projects.set(parentPath, {
+        workspaces: [{ id: workspaceId, path: path.join(tempDir, "workspace-1") }],
+      });
+      cfg.projects.set(subProjectPath, {
+        parentProjectPath: parentPath,
+        workspaces: [],
+      });
+      await config.editConfig(() => cfg);
+
+      // Deterministic interleaving: queue the sub-project removal so the assign call's
+      // synchronous snapshot read still sees it while its queued transform does not.
+      const removeSubProject = config.editConfig((fresh) => {
+        fresh.projects.delete(subProjectPath);
+        return fresh;
+      });
+      const result = await service.assignWorkspaceToSubProject(
+        parentPath,
+        workspaceId,
+        subProjectPath
+      );
+      await removeSubProject;
+
+      expect(result.success).toBe(false);
+      if (result.success) throw new Error("Expected failure");
+      expect(result.error).toContain("Sub-project not found under parent");
+      const workspace = config.loadConfigOrDefault().projects.get(parentPath)?.workspaces[0];
+      expect(workspace?.subProjectPath).toBeUndefined();
+    });
   });
 
   describe("remove", () => {
@@ -1693,7 +1849,7 @@ exit 1
       const projectPath = "/fake/project";
       const cfg = config.loadConfigOrDefault();
       cfg.projects.set(projectPath, { workspaces: [] });
-      await config.saveConfig(cfg);
+      await config.editConfig(() => cfg);
 
       const result = await service.remove(projectPath);
 
@@ -1763,7 +1919,7 @@ exit 1
 
         const cfg = config.loadConfigOrDefault();
         cfg.projects.set(projectPath, { workspaces });
-        await config.saveConfig(cfg);
+        await config.editConfig(() => cfg);
 
         const removedWorkspaceIds: string[] = [];
         service.setWorkspaceService({
@@ -1793,7 +1949,7 @@ exit 1
       cfg.projects.set(projectPath, {
         workspaces: [{ path: archivedWorkspaceDir, archivedAt: ARCHIVED_AT }],
       });
-      await config.saveConfig(cfg);
+      await config.editConfig(() => cfg);
 
       const legacyWorkspaceId = config.generateLegacyId(projectPath, archivedWorkspaceDir);
       const metadataPath = path.join(config.getSessionDir(legacyWorkspaceId), "metadata.json");
@@ -1832,7 +1988,7 @@ exit 1
       cfg.projects.set(projectPath, {
         workspaces: [{ id: "archived-workspace-1", path: archivedWorkspaceDir, archivedAt }],
       });
-      await config.saveConfig(cfg);
+      await config.editConfig(() => cfg);
 
       let removeCallCount = 0;
       service.setWorkspaceService({
@@ -1864,7 +2020,7 @@ exit 1
       cfg.projects.set(projectPath, {
         workspaces: [{ path: wsDir }],
       });
-      await config.saveConfig(cfg);
+      await config.editConfig(() => cfg);
 
       const result = await service.remove(projectPath);
 
@@ -1888,7 +2044,7 @@ exit 1
           },
         ],
       });
-      await config.saveConfig(cfg);
+      await config.editConfig(() => cfg);
 
       const result = await service.remove(projectPath);
 
@@ -1920,7 +2076,7 @@ exit 1
           },
         ],
       });
-      await config.saveConfig(cfg);
+      await config.editConfig(() => cfg);
 
       const result = await service.remove(projectPath);
 
@@ -1946,7 +2102,7 @@ exit 1
       cfg.projects.set(projectPath, {
         workspaces: [{ path: stalePath }],
       });
-      await config.saveConfig(cfg);
+      await config.editConfig(() => cfg);
 
       const result = await service.remove(projectPath);
 
@@ -1966,7 +2122,7 @@ exit 1
           },
         ],
       });
-      await config.saveConfig(cfg);
+      await config.editConfig(() => cfg);
 
       const result = await service.remove(projectPath);
 
@@ -1992,7 +2148,7 @@ exit 1
       cfg.projects.set(projectPath, {
         workspaces: [{ path: stalePath }, { path: realDir }],
       });
-      await config.saveConfig(cfg);
+      await config.editConfig(() => cfg);
 
       const result = await service.remove(projectPath);
 

@@ -5,15 +5,19 @@ import {
   streamText,
   stepCountIs,
   type ModelMessage,
+  type SystemModelMessage,
   type LanguageModel,
   type Tool,
+  type ToolSet,
   LoadAPIKeyError,
   NoSuchToolError,
   APICallError,
   RetryError,
 } from "ai";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
+import type { ProviderOptions } from "@ai-sdk/provider-utils";
 import type { Result } from "@/common/types/result";
+import assert from "@/common/utils/assert";
 import { Ok, Err } from "@/common/types/result";
 import { log, type Logger } from "./log";
 import type {
@@ -22,6 +26,7 @@ import type {
   StreamAbortReason,
   UsageDeltaEvent,
   ToolCallEndEvent,
+  ToolCallExecutionStartEvent,
   CompletedMessagePart,
   WorkflowRunAttachedEvent,
 } from "@/common/types/stream";
@@ -29,6 +34,10 @@ import type {
 import type { SendMessageError, StreamErrorType } from "@/common/types/errors";
 import type { MuxMetadata, MuxMessage, PersistedToolModelUsage } from "@/common/types/message";
 import type { ThinkingLevel } from "@/common/types/thinking";
+import type {
+  ActiveTurnThinkingOverride,
+  RebuildProviderOptionsForThinkingLevel,
+} from "@/node/services/thinkingOverride";
 import type { NestedToolCall } from "@/common/orpc/schemas/message";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import {
@@ -37,24 +46,36 @@ import {
   stripNoisyErrorPrefix,
   type StreamErrorPayload,
 } from "@/node/services/utils/sendMessageError";
-import type { HistoryService } from "./historyService";
-import { addUsage, accumulateProviderMetadata } from "@/common/utils/tokens/usageHelpers";
+import { hasCommitWorthyParts, type HistoryService } from "./historyService";
+import {
+  addUsage,
+  accumulateProviderMetadata,
+  normalizeUsage,
+  withCacheWriteMetadata,
+  type AiSdkUsageLike,
+} from "@/common/utils/tokens/usageHelpers";
 import { linkAbortSignal } from "@/node/utils/abort";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import { stripInternalToolResultFields } from "@/common/utils/tools/internalToolResultFields";
-import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
+import { buildRequiredToolPatterns, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
+import {
+  computeActiveToolNames,
+  type ToolSearchStreamState,
+} from "@/common/utils/tools/toolCatalog";
 import { StreamingTokenTracker } from "@/node/utils/main/StreamingTokenTracker";
 import { countTokens } from "@/node/utils/main/tokenizer";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import type { Runtime } from "@/node/runtime/Runtime";
 import {
   createCachedSystemMessage,
+  createOpenAICachedSystemMessage,
   applyCacheControlToTools,
   type AnthropicCacheTtl,
 } from "@/common/utils/ai/cacheStrategy";
 import type { SessionUsageService } from "./sessionUsageService";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { extractToolMediaAsUserMessagesFromModelMessages } from "@/node/utils/messages/extractToolMediaAsUserMessagesFromModelMessages";
+import { stripEncryptedContent } from "@/node/utils/messages/stripEncryptedContent";
 import { stripWorkflowRunRecordsFromModelMessages } from "@/node/utils/messages/stripWorkflowRunRecordsFromModelMessages";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { MUX_GATEWAY_SESSION_EXPIRED_MESSAGE } from "@/common/constants/muxGatewayOAuth";
@@ -150,7 +171,13 @@ interface StepMessageTracker {
 interface StreamRequestConfig {
   model: LanguageModel;
   messages: ModelMessage[];
-  system?: string;
+  /**
+   * System instructions for streamText. Direct official OpenAI GPT-5.6
+   * requests carry a structured SystemModelMessage with an explicit prompt
+   * cache breakpoint (createOpenAICachedSystemMessage); everything else keeps
+   * the plain string.
+   */
+  system?: string | SystemModelMessage;
   tools?: Record<string, Tool>;
   providerOptions?: Record<string, unknown>;
   /** Per-request HTTP headers (e.g., anthropic-beta for 1M context). */
@@ -163,6 +190,25 @@ interface StreamRequestConfig {
   /** Optional hook for callers that need the live prepared step transcript. */
   onStepMessages?: (messages: ModelMessage[]) => void;
   toolPolicy?: ToolPolicy;
+  /**
+   * Tool-search deferral state (tool-search experiment). Owned and mutated by
+   * aiService/tool_catalog_search.execute; prepareStep reads it each step to compute
+   * `activeTools`. Absent when the feature is inactive.
+   */
+  toolSearchState?: ToolSearchStreamState;
+  /**
+   * Mid-turn thinking override holder — the SESSION'S object, by reference
+   * (never created inside StreamManager: a locally-created object would be
+   * invisible to AgentSession.setActiveTurnThinkingLevel). prepareStep
+   * consumes `pending` before every model step.
+   */
+  thinkingOverrideState?: ActiveTurnThinkingOverride;
+  /**
+   * Closure built by AIService that re-runs the effective-level pipeline
+   * (policy clamp + resolveEffectiveThinkingLevel) and rebuilds provider
+   * options for the stream's model. `null` ⇒ not applicable / no-op.
+   */
+  rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel;
 }
 
 /**
@@ -193,6 +239,12 @@ export interface PreparedModelFallback {
   thinkingLevel?: string;
   /** Route attribution corrections (routedThroughGateway, routeProvider, costsIncluded). */
   initialMetadataPatch?: Partial<MuxMetadata>;
+  /**
+   * Rebuild closure bound to the FALLBACK model so mid-turn thinking changes
+   * keep working after a fallback hop (the source model's closure would build
+   * options for the wrong model).
+   */
+  rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel;
 }
 
 export interface ModelFallbackPrepareOptions {
@@ -202,6 +254,12 @@ export interface ModelFallbackPrepareOptions {
    * receives it so provider-message preparation cannot mutate live UI parts.
    */
   continuation?: { assistantMessage: MuxMessage };
+  /**
+   * Mid-turn thinking level to fold into the fallback's baseline: pending (not
+   * yet applied) or already-applied override from the refused stream. The
+   * fallback prepare re-clamps it for the next model.
+   */
+  thinkingLevelOverride?: ThinkingLevel;
 }
 
 export interface ModelFallbackOptions {
@@ -281,46 +339,6 @@ enum StreamState {
   STOPPING = "stopping",
   COMPLETED = "completed", // Stream finished successfully (before cleanup)
   ERROR = "error",
-}
-
-/**
- * Strip encryptedContent from web search results to reduce token usage.
- * The encrypted page content can be massive (4000+ chars per result) and isn't
- * needed for model context. Keep URL, title, and pageAge for reference.
- */
-function stripEncryptedContentFromArray(output: unknown[]): unknown[] {
-  return output.map((item: unknown) => {
-    if (item && typeof item === "object" && "encryptedContent" in item) {
-      // Remove encryptedContent but keep other fields
-      const { encryptedContent, ...rest } = item as Record<string, unknown>;
-      return rest;
-    }
-
-    return item;
-  });
-}
-
-export function stripEncryptedContent(output: unknown): unknown {
-  if (Array.isArray(output)) {
-    return stripEncryptedContentFromArray(output);
-  }
-
-  // Handle SDK json output shape: { type: "json", value: unknown[] }
-  if (
-    typeof output === "object" &&
-    output !== null &&
-    "type" in output &&
-    output.type === "json" &&
-    "value" in output &&
-    Array.isArray(output.value)
-  ) {
-    return {
-      ...output,
-      value: stripEncryptedContentFromArray(output.value),
-    };
-  }
-
-  return output;
 }
 
 const MAX_ORPHAN_TOOL_RESULT_WARNINGS_PER_STREAM = 3;
@@ -492,6 +510,11 @@ interface WorkspaceStreamInfo {
   // attachment and apply it as soon as the matching dynamic-tool part lands.
   pendingWorkflowRunAttachments: Map<string, WorkflowRunToolAttachment>;
 
+  // execute() can begin (lock acquired in withSequentialExecution) before the fullStream
+  // consumer has stored the matching dynamic-tool part. Keep the execution-start timestamp
+  // and apply it as soon as the part lands.
+  pendingToolExecutionStarts: Map<string, number>;
+
   model: string;
   /** Metadata model resolved from provider mapping for cost/token metadata lookups. */
   metadataModel: string;
@@ -625,7 +648,9 @@ export class StreamManager extends EventEmitter {
     }
     return log.withFields(fields);
   }
-  private resolveMetadataModel(modelString: string): string {
+  // Public: AIService.resolveMetadataModel delegates here so non-stream
+  // consumers (/btw answer rows) can stamp the same mappedToModel resolution.
+  resolveMetadataModel(modelString: string): string {
     try {
       return resolveModelForMetadata(modelString, this.getProvidersConfig());
     } catch (error) {
@@ -723,6 +748,65 @@ export class StreamManager extends EventEmitter {
 
     await this.flushPartialWrite(workspaceId, streamInfo);
     return true;
+  }
+
+  /**
+   * Record on the dynamic-tool part when its execute() actually began running and notify
+   * the UI. Returns false when the part has not landed in streamInfo.parts yet.
+   */
+  private applyToolExecutionStart(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo,
+    toolCallId: string,
+    timestamp: number
+  ): boolean {
+    const partIndex = streamInfo.parts.findIndex(
+      (part) => part.type === "dynamic-tool" && part.toolCallId === toolCallId
+    );
+    if (partIndex === -1) {
+      return false;
+    }
+
+    const part = streamInfo.parts[partIndex];
+    assert(part.type === "dynamic-tool", "applyToolExecutionStart matched a non-tool part");
+    streamInfo.parts[partIndex] = { ...part, executionStartedAt: timestamp };
+
+    this.emit("tool-call-execution-start", {
+      type: "tool-call-execution-start",
+      workspaceId: workspaceId as string,
+      messageId: streamInfo.messageId,
+      toolCallId,
+      timestamp,
+    } satisfies ToolCallExecutionStartEvent);
+    return true;
+  }
+
+  /**
+   * Called from withSequentialExecution the moment a tool call's execute() acquires the
+   * execution lock. Parallel tool calls run sequentially, so this is the honest start of
+   * execution — the part's own `timestamp` only marks when the model emitted the call.
+   */
+  private handleToolExecutionStart(
+    workspaceId: WorkspaceId,
+    messageId: string,
+    toolCallId: string
+  ): void {
+    const streamInfo = this.workspaceStreams.get(workspaceId);
+    if (streamInfo?.messageId !== messageId) {
+      return;
+    }
+
+    // Use the stream's monotonic clock, not raw Date.now(): the tool-call part timestamp
+    // was monotonicized by nextPartTimestamp(), so a same-millisecond raw reading could be
+    // <= it. Reconnect replay repairs missed execution starts only when
+    // executionStartedAt > cursor, and the cursor sits at the tool-call timestamp when the
+    // client disconnected right after tool-call-start.
+    const timestamp = nextPartTimestamp(streamInfo);
+    if (!this.applyToolExecutionStart(workspaceId, streamInfo, toolCallId, timestamp)) {
+      // execute() won the race against the fullStream consumer; the "tool-call" case
+      // consumes this entry right after storing the part.
+      (streamInfo.pendingToolExecutionStarts ??= new Map()).set(toolCallId, timestamp);
+    }
   }
 
   /**
@@ -942,25 +1026,31 @@ export class StreamManager extends EventEmitter {
       ]).catch(() => undefined);
 
     // Fetch all metadata in parallel with independent timeouts
-    // - totalUsage: sum of all steps (for cost calculation)
-    // - contextUsage: last step only (for context window display)
+    // - totalUsage: sum of all steps (for cost calculation). AI SDK 7's
+    //   top-level `usage` accumulates across all steps (old `totalUsage`).
+    // - contextUsage: last step only (for context window display) — moved to
+    //   `finalStep.usage` in AI SDK 7.
     // - contextProviderMetadata: last step (for context window cache display)
     const streamResultWithFinishReason = streamInfo.streamResult as {
       finishReason?: PromiseLike<string>;
     };
-    const [totalUsage, contextUsage, contextProviderMetadata, finishReason] = await Promise.all([
-      withTimeout(streamInfo.streamResult.totalUsage),
+    const [totalUsageRaw, finalStep, finishReason] = await Promise.all([
       withTimeout(streamInfo.streamResult.usage),
-      withTimeout(streamInfo.streamResult.providerMetadata),
+      withTimeout(streamInfo.streamResult.finalStep),
       streamResultWithFinishReason.finishReason
         ? withTimeout(streamResultWithFinishReason.finishReason)
         : Promise.resolve(undefined),
     ]);
 
     return {
-      totalUsage,
-      contextUsage,
-      contextProviderMetadata,
+      totalUsage: normalizeUsage(totalUsageRaw),
+      contextUsage: normalizeUsage(finalStep?.usage),
+      // AI SDK 7 moved Anthropic cache-write tokens off provider metadata;
+      // re-inject from the final step's usage so cache display keeps working.
+      contextProviderMetadata: withCacheWriteMetadata(
+        finalStep?.providerMetadata,
+        finalStep?.usage
+      ),
       finishReason,
       duration: Date.now() - streamInfo.startTime,
     };
@@ -975,6 +1065,14 @@ export class StreamManager extends EventEmitter {
       (streamInfo.didRetryPreviousResponseIdAtStep || streamInfo.didRetryAfterEmptyOutput) &&
       hasTokenUsage(cumulativeUsage)
     ) {
+      return cumulativeUsage;
+    }
+
+    // streamResult.totalUsage is read with a short timeout (getStreamMetadata) and can
+    // resolve to undefined under slow SDK settlement even though the provider billed the
+    // turn. Fall back to the live per-step accumulation so completed streams never
+    // persist an unpriced assistant message (analytics prices rows from metadata.usage).
+    if (!hasTokenUsage(totalUsage) && hasTokenUsage(cumulativeUsage)) {
       return cumulativeUsage;
     }
 
@@ -1059,42 +1157,24 @@ export class StreamManager extends EventEmitter {
       ]);
 
       if (!steps || steps.length === 0) {
-        // Fall back to last step's provider metadata
-        return await streamInfo.streamResult.providerMetadata;
+        // Fall back to the final step's provider metadata; AI SDK 7 reports
+        // cache writes on usage, so re-inject them for downstream pricing.
+        const finalStep = await streamInfo.streamResult.finalStep;
+        return withCacheWriteMetadata(finalStep.providerMetadata, finalStep.usage);
       }
 
-      // If only one step, no aggregation needed
-      if (steps.length === 1) {
-        return steps[0].providerMetadata;
-      }
-
-      // Aggregate cache creation tokens across all steps
-      let totalCacheCreationTokens = 0;
-      let lastStepMetadata: Record<string, unknown> | undefined;
-
+      // Aggregate cache creation tokens across all steps. AI SDK 7 moved
+      // per-step cache-write tokens from providerMetadata.anthropic to
+      // step.usage.inputTokenDetails, so inject them back per step before
+      // accumulating (accumulateProviderMetadata sums across steps).
+      let accumulated: Record<string, unknown> | undefined;
       for (const step of steps) {
-        lastStepMetadata = step.providerMetadata;
-        const anthropicMeta = step.providerMetadata?.anthropic as
-          | { cacheCreationInputTokens?: number }
-          | undefined;
-        if (anthropicMeta?.cacheCreationInputTokens) {
-          totalCacheCreationTokens += anthropicMeta.cacheCreationInputTokens;
-        }
+        accumulated = accumulateProviderMetadata(
+          accumulated,
+          withCacheWriteMetadata(step.providerMetadata, step.usage)
+        );
       }
-
-      // If no cache creation tokens found, just return last step's metadata
-      if (totalCacheCreationTokens === 0) {
-        return lastStepMetadata;
-      }
-
-      // Merge aggregated cache creation tokens into the last step's metadata
-      return {
-        ...lastStepMetadata,
-        anthropic: {
-          ...(lastStepMetadata?.anthropic as Record<string, unknown> | undefined),
-          cacheCreationInputTokens: totalCacheCreationTokens,
-        },
-      };
+      return accumulated;
     } catch (error) {
       log.debug("Could not aggregate provider metadata:", error);
       return undefined;
@@ -1162,6 +1242,11 @@ export class StreamManager extends EventEmitter {
         args: part.input,
         tokens,
         timestamp,
+        // Replays rebuild parts from scratch; carry the real execution start so
+        // elapsed timers don't restart from the model-emission timestamp.
+        ...(part.executionStartedAt !== undefined
+          ? { executionStartedAt: part.executionStartedAt }
+          : {}),
       });
 
       if (part.workflowRun != null) {
@@ -1210,13 +1295,35 @@ export class StreamManager extends EventEmitter {
       // Always persist the part in-memory (and to partial.json, if enabled), even if emit fails.
       let partToPersist = part;
       let pendingAttachment: WorkflowRunToolAttachment | undefined;
+      let pendingExecutionStart: number | undefined;
       if (part.type === "dynamic-tool") {
         pendingAttachment = this.takePendingWorkflowRunAttachment(streamInfo, part.toolCallId);
-        if (pendingAttachment != null) {
-          partToPersist = { ...part, workflowRun: pendingAttachment };
+        // execute() may have started (lock acquired) before the fullStream consumer
+        // stored this part; carry the real execution start onto the persisted part.
+        pendingExecutionStart = streamInfo.pendingToolExecutionStarts?.get(part.toolCallId);
+        if (pendingExecutionStart !== undefined) {
+          streamInfo.pendingToolExecutionStarts.delete(part.toolCallId);
+        }
+        if (pendingAttachment != null || pendingExecutionStart !== undefined) {
+          partToPersist = {
+            ...part,
+            ...(pendingAttachment != null ? { workflowRun: pendingAttachment } : {}),
+            ...(pendingExecutionStart !== undefined
+              ? { executionStartedAt: pendingExecutionStart }
+              : {}),
+          };
         }
       }
       streamInfo.parts.push(partToPersist);
+      if (pendingExecutionStart !== undefined && part.type === "dynamic-tool") {
+        this.emit("tool-call-execution-start", {
+          type: "tool-call-execution-start",
+          workspaceId: workspaceId as string,
+          messageId: streamInfo.messageId,
+          toolCallId: part.toolCallId,
+          timestamp: pendingExecutionStart,
+        } satisfies ToolCallExecutionStartEvent);
+      }
       if (pendingAttachment != null && part.type === "dynamic-tool") {
         await this.flushPartialWrite(workspaceId, streamInfo);
         this.emitWorkflowRunAttachedFromAttachment({
@@ -1336,6 +1443,64 @@ export class StreamManager extends EventEmitter {
       streamInfo
     );
 
+    // Stamp the aborted turn's usage onto the partial message BEFORE emitting
+    // stream-abort (whose handler commits the partial to chat.jsonl). Analytics
+    // prices history rows from metadata.usage, so without this every
+    // interrupted turn — user Esc, queued tool-end preemption, monitor wakes —
+    // would ingest as $0 even though the provider billed all completed steps.
+    if (!abandonPartial && (usage !== undefined || streamInfo.toolModelUsages.length > 0)) {
+      try {
+        await this.awaitPendingPartialWrite(streamInfo);
+        const partialMessage = this.buildPartialAssistantMessage(streamInfo, {
+          metadata: {
+            ...(usage !== undefined ? { usage: cloneUsage(usage) } : {}),
+            ...(providerMetadata !== undefined ? { providerMetadata } : {}),
+            ...(contextUsage !== undefined ? { contextUsage } : {}),
+            ...(contextProviderMetadata !== undefined ? { contextProviderMetadata } : {}),
+            duration,
+            ...(streamInfo.toolModelUsages.length > 0
+              ? { toolModelUsages: streamInfo.toolModelUsages.map(clonePersistedToolModelUsage) }
+              : {}),
+          },
+        });
+        await this.historyService.writePartial(workspaceId as string, partialMessage);
+
+        // Tool-only aborts (Esc while a tool is still running): commitPartial
+        // refuses to commit partials whose only parts are input-available tool
+        // calls, so the usage stamped above would die with the deleted
+        // partial. Route that spend through the headless-usage sidecar
+        // instead. Same predicate commitPartial applies, so exactly one of
+        // {chat row, sidecar row} carries this turn's usage.
+        if (!hasCommitWorthyParts(partialMessage.parts)) {
+          await this.recordDroppedPartialUsageInSidecar(
+            workspaceId,
+            streamInfo,
+            usage,
+            providerMetadata,
+            "aborted_stream"
+          );
+        }
+      } catch (error) {
+        log.error("Failed to persist aborted-stream usage on partial message", { error });
+      }
+    } else if (abandonPartial && (usage !== undefined || streamInfo.toolModelUsages.length > 0)) {
+      // Abandoned aborts (edit/discard of the streaming turn): the partial is
+      // deliberately dropped and its content never reaches chat.jsonl, but
+      // the provider still billed every completed step. The sidecar is the
+      // only route to the events table for this spend.
+      try {
+        await this.recordDroppedPartialUsageInSidecar(
+          workspaceId,
+          streamInfo,
+          usage,
+          providerMetadata,
+          "aborted_stream"
+        );
+      } catch (error) {
+        log.error("Failed to record abandoned-abort usage in headless sidecar", { error });
+      }
+    }
+
     // Emit abort event with usage if available
     this.emitStreamAbort(
       workspaceId,
@@ -1348,6 +1513,42 @@ export class StreamManager extends EventEmitter {
 
     // Clean up immediately
     this.workspaceStreams.delete(workspaceId);
+  }
+
+  /**
+   * Route a dropped partial's billed usage to the headless-usage sidecar:
+   * the parent stream's cumulative usage plus every tool-internal model call
+   * (toolModelUsages). Used by the abort and error paths when the partial
+   * fails commitPartial's durability predicate — metadata stamped on such a
+   * partial dies with it, so the sidecar is the only route to the events
+   * table. skipSessionLedger everywhere: parent usage was recorded via
+   * recordSessionUsage and tool usage at report time (AIService).
+   */
+  private async recordDroppedPartialUsageInSidecar(
+    workspaceId: WorkspaceId,
+    streamInfo: Pick<WorkspaceStreamInfo, "model" | "toolModelUsages">,
+    usage: LanguageModelV2Usage | undefined,
+    providerMetadata: Record<string, unknown> | undefined,
+    analyticsSource: "aborted_stream" | "errored_stream"
+  ): Promise<void> {
+    if (usage !== undefined) {
+      await this.sessionUsageService?.recordHeadlessUsage(
+        workspaceId as string,
+        streamInfo.model,
+        cloneUsage(usage),
+        providerMetadata,
+        { analyticsSource, skipSessionLedger: true }
+      );
+    }
+    for (const toolUsage of streamInfo.toolModelUsages) {
+      await this.sessionUsageService?.recordHeadlessUsage(
+        workspaceId as string,
+        toolUsage.model,
+        cloneUsage(toolUsage.usage),
+        toolUsage.providerMetadata,
+        { analyticsSource, skipSessionLedger: true }
+      );
+    }
   }
 
   private async recordSessionUsage(
@@ -1388,6 +1589,10 @@ export class StreamManager extends EventEmitter {
     modelString: string,
     messages: ModelMessage[],
     system: string,
+    // Backend-resolved route provider (initialMetadata.routeProvider for the
+    // primary request, initialMetadataPatch.routeProvider for fallbacks).
+    // Missing route metadata fails closed for OpenAI explicit prompt caching.
+    routeProvider?: string,
     tools?: Record<string, Tool>,
     providerOptions?: Record<string, unknown>,
     maxOutputTokens?: number,
@@ -1397,14 +1602,23 @@ export class StreamManager extends EventEmitter {
     headers?: Record<string, string | undefined>,
     anthropicCacheTtlOverride?: AnthropicCacheTtl,
     onChunk?: StreamTextOnChunk,
-    onStepMessages?: (messages: ModelMessage[]) => void
+    onStepMessages?: (messages: ModelMessage[]) => void,
+    toolSearchState?: ToolSearchStreamState,
+    onToolExecutionStart?: (toolCallId: string) => void,
+    thinkingOverrideState?: ActiveTurnThinkingOverride,
+    rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel
   ): StreamRequestConfig {
-    const finalProviderOptions = providerOptions;
+    // Mid-turn thinking overrides mutate providerOptions IN PLACE (the SDK's
+    // per-step deep-merge reads the object passed at streamText() time, so
+    // identity must stay stable). An initially-undefined value would make that
+    // mutation unobservable — normalize to a guaranteed mutable object.
+    const finalProviderOptions =
+      rebuildProviderOptionsForThinkingLevel != null ? (providerOptions ?? {}) : providerOptions;
 
     // Apply cache control for Anthropic models
     let finalMessages = messages;
     let finalTools = tools;
-    let finalSystem: string | undefined = system;
+    let finalSystem: string | SystemModelMessage | undefined = system;
     const anthropicCacheTtl =
       anthropicCacheTtlOverride ?? getAnthropicCacheTtl(finalProviderOptions);
 
@@ -1415,6 +1629,23 @@ export class StreamManager extends EventEmitter {
       // Note: Must be undefined, not empty string, to avoid Anthropic API error
       finalMessages = [cachedSystemMessage, ...messages];
       finalSystem = undefined;
+    } else {
+      // Direct official OpenAI GPT-5.6: put one explicit prompt cache
+      // breakpoint at the end of the stable system instructions. The system
+      // stays in streamText's `system` argument (as a structured message);
+      // request-wide caching remains implicit so OpenAI keeps placing its
+      // automatic latest-message breakpoint. Ineligible routes (gateways,
+      // Codex OAuth, custom base URLs, missing route metadata) keep the
+      // original string.
+      const openaiCachedSystem = createOpenAICachedSystemMessage(
+        system,
+        modelString,
+        routeProvider,
+        this.getProvidersConfig()
+      );
+      if (openaiCachedSystem) {
+        finalSystem = openaiCachedSystem;
+      }
     }
 
     // Apply cache control to tools for Anthropic models
@@ -1444,7 +1675,7 @@ export class StreamManager extends EventEmitter {
       system: finalSystem,
       // Keep provider-level parallel tool planning enabled, but serialize sibling
       // execute() handlers inside this stream so shared mutable state cannot race.
-      tools: withSequentialExecution(finalTools),
+      tools: withSequentialExecution(finalTools, onToolExecutionStart),
       providerOptions: finalProviderOptions,
       headers,
       maxOutputTokens: effectiveMaxOutputTokens,
@@ -1454,6 +1685,9 @@ export class StreamManager extends EventEmitter {
       onChunk,
       onStepMessages,
       toolPolicy,
+      toolSearchState,
+      thinkingOverrideState,
+      rebuildProviderOptionsForThinkingLevel,
     };
   }
 
@@ -1483,14 +1717,7 @@ export class StreamManager extends EventEmitter {
       return true;
     };
 
-    const requiredPatterns = (request.toolPolicy ?? [])
-      .filter((filter) => filter.action === "require")
-      .map((filter) => {
-        // Strip existing anchors to avoid double-anchoring recovery policies
-        // (e.g. "^agent_report$" would otherwise become "^^agent_report$$").
-        const rawPattern = filter.regex_match.replace(/^\^/, "").replace(/\$$/, "");
-        return new RegExp(`^${rawPattern}$`);
-      });
+    const requiredPatterns = buildRequiredToolPatterns(request.toolPolicy);
 
     const hasSuccessfulRequiredToolResult: ReturnType<typeof stepCountIs> = ({ steps }) => {
       if (requiredPatterns.length === 0) {
@@ -1508,9 +1735,63 @@ export class StreamManager extends EventEmitter {
 
     return [
       stepCountIs(100000),
+      // The SDK evaluates stop conditions only after every sibling tool result in the
+      // model's current step settles. Do not move this to individual tool-call-end events:
+      // that would abort the remaining calls the model emitted in the same batch.
       () => request.hasQueuedMessages?.("tool-end") ?? false,
       hasSuccessfulRequiredToolResult,
     ];
+  }
+
+  /**
+   * Consume a pending mid-turn thinking-level override for the next step.
+   *
+   * Consume-once: `pending` is always cleared (a failed/no-op application must
+   * not retry on every subsequent step). On success the CONTENT of
+   * `request.providerOptions` is replaced in place — object identity is
+   * preserved because the SDK's per-step deep-merge reads the reference passed
+   * at streamText() time, and deep-merge alone cannot delete keys (e.g. the
+   * Anthropic `thinking` object when moving to "off").
+   *
+   * Returns the rebuilt options (for the prepareStep return value) or
+   * undefined when there is nothing to apply.
+   */
+  private applyPendingThinkingOverride(
+    request: StreamRequestConfig
+  ): Record<string, unknown> | undefined {
+    const state = request.thinkingOverrideState;
+    const pending = state?.pending;
+    if (state == null || pending == null) {
+      return undefined;
+    }
+    state.pending = undefined;
+    const rebuild = request.rebuildProviderOptionsForThinkingLevel;
+    if (rebuild == null) {
+      return undefined;
+    }
+    const rebuilt = rebuild(pending);
+    if (rebuilt == null) {
+      log.debug("Mid-turn thinking override skipped (not applicable / no-op)", {
+        requestedLevel: pending,
+        appliedLevel: state.applied,
+      });
+      return undefined;
+    }
+    const target = request.providerOptions;
+    // buildStreamRequestConfig normalizes providerOptions to a stable object
+    // whenever a rebuild closure is present, so target must exist here.
+    assert(target != null, "providerOptions must be normalized when a rebuild closure is present");
+    for (const key of Object.keys(target)) {
+      delete target[key];
+    }
+    Object.assign(target, rebuilt.providerOptions);
+    state.applied = rebuilt.effectiveLevel;
+    state.onApplied?.(rebuilt.effectiveLevel);
+    log.debug("Mid-turn thinking override applied", {
+      requestedLevel: pending,
+      effectiveLevel: rebuilt.effectiveLevel,
+    });
+    return rebuilt.providerOptions;
   }
 
   private createStreamResult(
@@ -1518,10 +1799,18 @@ export class StreamManager extends EventEmitter {
     abortController: AbortController,
     stepTracker?: StepMessageTracker
   ): Awaited<ReturnType<typeof streamText>> {
-    return streamText({
+    // Explicit <ToolSet> pins RUNTIME_CONTEXT to its default: mux tools use
+    // Tool's `any` context, which would otherwise infect the inferred result
+    // type (no-unsafe-return).
+    return streamText<ToolSet>({
       model: request.model,
       messages: request.messages,
       system: request.system,
+      // For Anthropic prompt caching, the system prompt is prepended to
+      // `messages` as a { role: "system" } message (createCachedSystemMessage).
+      // AI SDK 7 rejects system messages inside `messages` unless opted in.
+      // Trusted: mux builds these messages server-side.
+      allowSystemInMessages: true,
       abortSignal: abortController.signal,
       prepareStep: async ({ messages: stepMessages }) => {
         // streamText runs multiple internal LLM calls (steps) when tools are enabled.
@@ -1536,8 +1825,32 @@ export class StreamManager extends EventEmitter {
           stepTracker.latestMessages = effectiveMessages;
         }
         request.onStepMessages?.(effectiveMessages);
-        if (rewritten === stepMessages) return undefined;
-        return { messages: rewritten };
+        // Tool search (tool-search experiment): scope the advertised tool list
+        // to core tools + activated deferred tools. Read per step so tools
+        // activated by tool_catalog_search.execute appear on the following step.
+        // undefined when the feature is inactive, keeping the return value
+        // byte-identical to the pre-feature behavior.
+        const activeTools = computeActiveToolNames(request.toolSearchState);
+        // Mid-turn thinking-level change: consume a pending override before
+        // this step's provider request is built.
+        const thinkingOverride = this.applyPendingThinkingOverride(request);
+        if (
+          rewritten === stepMessages &&
+          activeTools === undefined &&
+          thinkingOverride === undefined
+        ) {
+          return undefined;
+        }
+        return {
+          ...(rewritten === stepMessages ? {} : { messages: rewritten }),
+          ...(activeTools !== undefined ? { activeTools } : {}),
+          // Defense in depth: the in-place request mutation is authoritative
+          // (per-step deep-merge cannot delete keys); returning the rebuilt
+          // options also covers any future SDK options snapshotting.
+          ...(thinkingOverride !== undefined
+            ? { providerOptions: thinkingOverride as ProviderOptions }
+            : {}),
+        };
       },
       onChunk: request.onChunk,
       tools: request.tools,
@@ -1578,7 +1891,10 @@ export class StreamManager extends EventEmitter {
     anthropicCacheTtlOverride?: AnthropicCacheTtl,
     onChunk?: StreamTextOnChunk,
     onStepMessages?: (messages: ModelMessage[]) => void,
-    modelFallback?: ModelFallbackOptions
+    modelFallback?: ModelFallbackOptions,
+    toolSearchState?: ToolSearchStreamState,
+    thinkingOverrideState?: ActiveTurnThinkingOverride,
+    rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel
   ): WorkspaceStreamInfo {
     // abortController is created and linked to the caller-provided abortSignal in startStream().
 
@@ -1589,6 +1905,7 @@ export class StreamManager extends EventEmitter {
       modelString,
       messages,
       system,
+      initialMetadata?.routeProvider,
       tools,
       providerOptions,
       maxOutputTokens,
@@ -1598,7 +1915,11 @@ export class StreamManager extends EventEmitter {
       headers,
       anthropicCacheTtlOverride,
       onChunk,
-      onStepMessages
+      onStepMessages,
+      toolSearchState,
+      (toolCallId) => this.handleToolExecutionStart(workspaceId, messageId, toolCallId),
+      thinkingOverrideState,
+      rebuildProviderOptionsForThinkingLevel
     );
 
     // Start streaming - this can throw immediately if API key is missing
@@ -1624,6 +1945,7 @@ export class StreamManager extends EventEmitter {
       lastPartTimestamp: startTime,
       toolCompletionTimestamps: new Map(),
       pendingWorkflowRunAttachments: new Map(),
+      pendingToolExecutionStarts: new Map(),
       model: modelString,
       metadataModel,
       thinkingLevel,
@@ -1660,6 +1982,19 @@ export class StreamManager extends EventEmitter {
       cumulativeProviderMetadata: undefined,
     };
 
+    // Mid-turn thinking override: route applied levels into this stream's
+    // metadata (partials, stream-end, final assistant message). Wired before
+    // any step can run; the catch-up sync covers a holder that already applied
+    // a level (e.g. re-attachment on retry paths).
+    if (request.thinkingOverrideState) {
+      request.thinkingOverrideState.onApplied = (level) => {
+        streamInfo.thinkingLevel = level;
+      };
+      if (request.thinkingOverrideState.applied) {
+        streamInfo.thinkingLevel = request.thinkingOverrideState.applied;
+      }
+    }
+
     // Atomically register the stream
     this.workspaceStreams.set(workspaceId, streamInfo);
 
@@ -1677,7 +2012,8 @@ export class StreamManager extends EventEmitter {
     toolCalls: ToolCallMap,
     toolCallId: string,
     toolName: string,
-    output: unknown
+    output: unknown,
+    providerExecuted?: boolean
   ): Promise<void> {
     // Find and update the existing tool part
     const existingPartIndex = streamInfo.parts.findIndex(
@@ -1736,6 +2072,7 @@ export class StreamManager extends EventEmitter {
       toolCallId,
       toolName,
       result: output,
+      ...(providerExecuted === true ? { providerExecuted: true } : {}),
       timestamp: completionTimestamp,
     } as ToolCallEndEvent);
   }
@@ -1746,9 +2083,18 @@ export class StreamManager extends EventEmitter {
     toolCalls: ToolCallMap,
     toolCallId: string,
     toolName: string,
-    output: unknown
+    output: unknown,
+    providerExecuted?: boolean
   ): Promise<void> {
-    await this.completeToolCall(workspaceId, streamInfo, toolCalls, toolCallId, toolName, output);
+    await this.completeToolCall(
+      workspaceId,
+      streamInfo,
+      toolCalls,
+      toolCallId,
+      toolName,
+      output,
+      providerExecuted
+    );
     await this.checkSoftCancelStream(workspaceId, streamInfo);
   }
 
@@ -2213,14 +2559,32 @@ export class StreamManager extends EventEmitter {
     // it would be categorized as a retryable api/unknown error and re-enter the
     // unbounded auto-retry loop this feature exists to prevent. Aborts rethrow so
     // a user interrupt during prepare stays an abort instead of a refusal.
+    // Fold a mid-turn thinking override (pending or already applied) into the
+    // fallback's baseline so the hop doesn't silently revert the user's
+    // mid-turn change. Pending is cleared here — prepare() re-clamps it for
+    // the fallback model and bakes it into the rebuilt provider options.
+    const overrideHolder = streamInfo.request.thinkingOverrideState;
+    const thinkingLevelOverride = overrideHolder?.pending ?? overrideHolder?.applied;
+    if (overrideHolder?.pending != null) {
+      overrideHolder.pending = undefined;
+    }
+    if (overrideHolder != null && thinkingLevelOverride != null) {
+      // Keep the override visible to later hops: prepare() bakes it into this
+      // hop's baseline, but a second hop re-folds from `applied`.
+      overrideHolder.applied = thinkingLevelOverride;
+    }
+    const prepareCallOptions: ModelFallbackPrepareOptions | undefined =
+      continuation?.success === true || thinkingLevelOverride != null
+        ? {
+            ...(continuation?.success === true
+              ? { continuation: { assistantMessage: continuation.data } }
+              : {}),
+            ...(thinkingLevelOverride != null ? { thinkingLevelOverride } : {}),
+          }
+        : undefined;
     let prepared: Result<PreparedModelFallback, string>;
     try {
-      prepared = await fallbackState.options.prepare(
-        nextModelString,
-        continuation?.success === true
-          ? { continuation: { assistantMessage: continuation.data } }
-          : undefined
-      );
+      prepared = await fallbackState.options.prepare(nextModelString, prepareCallOptions);
     } catch (error) {
       if (streamInfo.abortController.signal.aborted) {
         throw error;
@@ -2245,6 +2609,10 @@ export class StreamManager extends EventEmitter {
       prepared.data.modelString,
       prepared.data.messages,
       prepared.data.system,
+      // Use the fallback's freshly-resolved route (not stale source metadata,
+      // which streamInfo.initialMetadata still holds at this point) so the
+      // OpenAI cached-system transform evaluates the fallback route.
+      prepared.data.initialMetadataPatch?.routeProvider,
       prepared.data.tools,
       prepared.data.providerOptions,
       fallbackState.original.maxOutputTokens,
@@ -2254,7 +2622,16 @@ export class StreamManager extends EventEmitter {
       prepared.data.headers,
       prepared.data.anthropicCacheTtl,
       streamInfo.request.onChunk,
-      streamInfo.request.onStepMessages
+      streamInfo.request.onStepMessages,
+      // Same state object: aiService's fallback prepare() rebuilt it in place
+      // against the fallback toolset, so prepareStep keeps reading live state.
+      streamInfo.request.toolSearchState,
+      (toolCallId) => this.handleToolExecutionStart(workspaceId, streamInfo.messageId, toolCallId),
+      // Same holder object (the session's setter keeps working across the
+      // hop) with a closure bound to the FALLBACK model. Attached before
+      // createStreamResult below in case the SDK eagerly prepares step 1.
+      streamInfo.request.thinkingOverrideState,
+      prepared.data.rebuildProviderOptionsForThinkingLevel
     );
     // createStreamResult may eagerly prepare the first fallback step and update
     // latestMessages. Clear stale source-step messages before starting it so a
@@ -2592,6 +2969,7 @@ export class StreamManager extends EventEmitter {
                   toolCallId: string;
                   toolName: string;
                   output: unknown;
+                  providerExecuted?: boolean;
                 };
 
                 // Strip encrypted content from web search results before storing
@@ -2625,7 +3003,8 @@ export class StreamManager extends EventEmitter {
                   toolCalls,
                   toolResultPart.toolCallId,
                   toolResultPart.toolName,
-                  strippedOutput
+                  strippedOutput,
+                  toolResultPart.providerExecuted
                 );
                 break;
               }
@@ -2637,6 +3016,7 @@ export class StreamManager extends EventEmitter {
                   toolCallId: string;
                   toolName: string;
                   error: unknown;
+                  providerExecuted?: boolean;
                 };
 
                 const logLevel = streamInfo.abortController.signal.aborted ? log.debug : log.error;
@@ -2663,7 +3043,8 @@ export class StreamManager extends EventEmitter {
                   toolCalls,
                   toolErrorPart.toolCallId,
                   toolErrorPart.toolName,
-                  errorOutput
+                  errorOutput,
+                  toolErrorPart.providerExecuted
                 );
                 break;
               }
@@ -2793,30 +3174,35 @@ export class StreamManager extends EventEmitter {
                 // Emit usage-delta event with usage from this step
                 const finishStepPart = part as {
                   type: "finish-step";
-                  usage: LanguageModelV2Usage;
+                  usage: AiSdkUsageLike;
                   providerMetadata?: Record<string, unknown>;
                 };
 
-                // Update cumulative totals for this stream
-                streamInfo.cumulativeUsage = addUsage(
-                  streamInfo.cumulativeUsage,
+                // Normalize AI SDK 7 nested usage into mux's persisted flat shape,
+                // re-injecting Anthropic cache-write tokens into provider metadata.
+                const stepUsage = normalizeUsage(finishStepPart.usage);
+                const stepProviderMetadata = withCacheWriteMetadata(
+                  finishStepPart.providerMetadata,
                   finishStepPart.usage
                 );
+
+                // Update cumulative totals for this stream
+                streamInfo.cumulativeUsage = addUsage(streamInfo.cumulativeUsage, stepUsage);
                 streamInfo.cumulativeProviderMetadata = accumulateProviderMetadata(
                   streamInfo.cumulativeProviderMetadata,
-                  finishStepPart.providerMetadata
+                  stepProviderMetadata
                 );
 
                 // Track last step's data for context window display
-                streamInfo.lastStepUsage = finishStepPart.usage;
-                streamInfo.lastStepProviderMetadata = finishStepPart.providerMetadata;
+                streamInfo.lastStepUsage = stepUsage;
+                streamInfo.lastStepProviderMetadata = stepProviderMetadata;
 
                 const usageEvent = buildUsageDeltaEvent({
                   workspaceId: workspaceId as string,
                   messageId: streamInfo.messageId,
                   // Step-level (for context window display)
-                  usage: finishStepPart.usage,
-                  providerMetadata: finishStepPart.providerMetadata,
+                  usage: stepUsage,
+                  providerMetadata: stepProviderMetadata,
                   // Cumulative (for live cost display)
                   cumulativeUsage: streamInfo.cumulativeUsage,
                   cumulativeProviderMetadata: streamInfo.cumulativeProviderMetadata,
@@ -3225,21 +3611,55 @@ export class StreamManager extends EventEmitter {
     const terminalRefusalUsage = streamInfo.terminalRefusalUsage;
     const terminalRefusalProviderMetadata = streamInfo.terminalRefusalProviderMetadata;
 
+    // Errored turns still billed every completed step. Capture the
+    // live-tracked cumulative usage for the sidecar below and mirror it into
+    // session-usage.json — the error path previously skipped both, ingesting
+    // failed turns as $0. Refusal errors are excluded entirely: the refusal
+    // paths already attributed the refusing attempt's tokens (terminal
+    // refusals via terminalRefusalUsage, fallback hops — including the FINAL
+    // hop on chain exhaustion — via recordRefusedAttemptUsage into
+    // toolModelUsages + the ledger), so re-recording the cumulative counters
+    // here would double-count the last refusing attempt.
+    let cumulativeErrorUsage: LanguageModelV2Usage | undefined;
+    let cumulativeErrorProviderMetadata: Record<string, unknown> | undefined;
+    if (payload.errorType !== "model_refusal" && hasTokenUsage(streamInfo.cumulativeUsage)) {
+      cumulativeErrorUsage = cloneUsage(streamInfo.cumulativeUsage);
+      await this.backfillReasoningTokensFromParts(streamInfo, cumulativeErrorUsage);
+      cumulativeErrorProviderMetadata = markProviderMetadataCostsIncluded(
+        streamInfo.cumulativeProviderMetadata
+          ? { ...streamInfo.cumulativeProviderMetadata }
+          : undefined,
+        streamInfo.initialMetadata?.costsIncluded
+      );
+      await this.recordSessionUsage(
+        workspaceId,
+        streamInfo.model,
+        cumulativeErrorUsage,
+        cumulativeErrorProviderMetadata,
+        "Failed to record session usage for errored stream",
+        "warn",
+        streamInfo
+      );
+    }
+    const errorUsage = terminalRefusalUsage ?? cumulativeErrorUsage;
+    const errorProviderMetadata =
+      terminalRefusalProviderMetadata ?? cumulativeErrorProviderMetadata;
+
     const errorPartialMessage = this.buildPartialAssistantMessage(streamInfo, {
       metadata: {
         error: payload.error,
         errorType: payload.errorType,
         ...(refusalFinishReason !== undefined ? { finishReason: refusalFinishReason } : {}),
-        ...(terminalRefusalUsage !== undefined ? { usage: terminalRefusalUsage } : {}),
-        ...(terminalRefusalProviderMetadata !== undefined
-          ? { providerMetadata: terminalRefusalProviderMetadata }
-          : {}),
-        // Keep tool-side / refused-fallback usage rows durable on the error
-        // partial: a fallback chain that ends in a terminal refusal must not
-        // drop the refused attempts' tokens from persisted metadata.
-        ...(streamInfo.toolModelUsages.length > 0
-          ? { toolModelUsages: streamInfo.toolModelUsages.map(clonePersistedToolModelUsage) }
-          : {}),
+        ...(errorProviderMetadata !== undefined ? { providerMetadata: errorProviderMetadata } : {}),
+        // INVARIANT: usage / toolModelUsages are deliberately NOT stamped on
+        // the error partial. Errored turns are sidecar-canonical: unlike
+        // aborts, nothing commits the partial at error time (AIService
+        // forwards "error" without commitPartial), so usage stamped here
+        // would strand in partial.json until an unrelated send — or die
+        // entirely when a retry overwrites the partial. The sidecar rows
+        // below are ingested immediately by the error listener, and the
+        // eventually committed row carries no usage, so exactly one source
+        // ever reaches the events table.
       },
     });
 
@@ -3250,6 +3670,18 @@ export class StreamManager extends EventEmitter {
 
     // Write error state to disk - await to ensure consistent state before any resume.
     await this.historyService.writePartial(workspaceId as string, errorPartialMessage);
+
+    try {
+      await this.recordDroppedPartialUsageInSidecar(
+        workspaceId,
+        streamInfo,
+        errorUsage,
+        errorProviderMetadata,
+        "errored_stream"
+      );
+    } catch (error) {
+      log.error("Failed to record errored-stream usage in headless sidecar", { error });
+    }
 
     // Emit error event.
     this.emit("error", createErrorEvent(workspaceId as string, payload));
@@ -3662,7 +4094,10 @@ export class StreamManager extends EventEmitter {
     onChunk?: StreamTextOnChunk,
     onStepMessages?: (messages: ModelMessage[]) => void,
     providedRuntimeTempDir?: string,
-    modelFallback?: ModelFallbackOptions
+    modelFallback?: ModelFallbackOptions,
+    toolSearchState?: ToolSearchStreamState,
+    thinkingOverrideState?: ActiveTurnThinkingOverride,
+    rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel
   ): Promise<Result<StreamToken, SendMessageError>> {
     const typedWorkspaceId = workspaceId as WorkspaceId;
 
@@ -3745,7 +4180,10 @@ export class StreamManager extends EventEmitter {
           anthropicCacheTtlOverride,
           onChunk,
           onStepMessages,
-          modelFallback
+          modelFallback,
+          toolSearchState,
+          thinkingOverrideState,
+          rebuildProviderOptionsForThinkingLevel
         );
 
         // Guard against a narrow race:
@@ -4109,6 +4547,17 @@ export class StreamManager extends EventEmitter {
                 }
 
                 return completionTimestamp > afterTimestamp;
+              }
+
+              // A queued tool's execute() can begin after the reconnect cursor while the
+              // part's own timestamp (model emission) is older. Replay the part so the
+              // enriched tool-call-start carries executionStartedAt and the renderer can
+              // start the elapsed timer (the aggregator merges it into the existing row).
+              if (
+                part.executionStartedAt !== undefined &&
+                part.executionStartedAt > afterTimestamp
+              ) {
+                return true;
               }
             }
 

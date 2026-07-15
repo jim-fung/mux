@@ -77,6 +77,29 @@ export interface MonitorMatchPayload {
   totalMatches: number;
   droppedLines?: number;
   timestamp: number;
+  /**
+   * File byte offset at the end of the last matched line, carried so the drain can re-check it
+   * against the settled shown-frontier at delivery time. The emit-time suppression in
+   * emitMonitorMatch is only a point-in-time fast path; drainBashMonitorWakes is authoritative.
+   */
+  matchedThroughOffset: number;
+}
+
+/** Emitted when a spawn arms a monitor; drives the persisted armed-monitor registry. */
+export interface MonitorArmedPayload {
+  processId: string;
+  taskId: string;
+  workspaceId: string;
+  displayName?: string;
+  filter: string;
+  filterExclude: boolean;
+  script: string;
+  createdAt: string;
+}
+
+/** Emitted when a monitor retires normally (not during shutdown); deletes its registry record. */
+export interface MonitorStoppedPayload {
+  processId: string;
 }
 
 export interface BackgroundProcessMonitorState extends BackgroundProcessMonitorConfig {
@@ -128,6 +151,15 @@ export interface BackgroundProcess {
    * the monitor's matchedThroughOffset are absolute file offsets, so suppression is race-free.
    */
   shownThroughOffset: number;
+  /**
+   * Resolves when the current in-flight *unfiltered* getOutput read settles (i.e. after it has
+   * advanced shownThroughOffset and returned). undefined when no unfiltered read is in flight.
+   * getSettledShownThroughOffset awaits this so the drain gate reads a settled frontier instead of
+   * racing a concurrent task_await. Filtered reads are deliberately not tracked here: they never
+   * advance shownThroughOffset and a filtered long-poll can hold the lock for the full timeout, so
+   * waiting on them would stall wake delivery for nothing.
+   */
+  unfilteredReadSettled?: Promise<void>;
   /** Mutex to serialize getOutput() calls (prevents race condition when
    * parallel tool calls read from same offset before position is updated) */
   outputLock: AsyncMutex;
@@ -177,6 +209,8 @@ export interface ForegroundProcess {
 export interface BackgroundProcessManagerEvents {
   change: [workspaceId: string];
   "monitor:match": [workspaceId: string, payload: MonitorMatchPayload];
+  "monitor:armed": [workspaceId: string, payload: MonitorArmedPayload];
+  "monitor:stopped": [workspaceId: string, payload: MonitorStoppedPayload];
 }
 
 export class BackgroundProcessManager extends EventEmitter<BackgroundProcessManagerEvents> {
@@ -194,6 +228,11 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   private foregroundProcesses = new Map<string, ForegroundProcess>();
   // Tracks workspaces with queued messages (for bash_output to return early)
   private queuedMessageWorkspaces = new Set<string>();
+
+  // Once set, stopMonitor() suppresses "monitor:stopped" so the persisted armed-monitor
+  // registry survives shutdown and the next startup can notify owners their monitors
+  // were lost. Never reset: the manager does not outlive a shutdown.
+  private shuttingDown = false;
 
   constructor(bgOutputDir: string) {
     super();
@@ -265,6 +304,27 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     };
   }
 
+  /**
+   * Count running background processes whose wake-on-match monitor is still armed.
+   * Surfaced through workspace activity so the sidebar can show that a workspace is
+   * still waiting on a monitor even though no stream is active.
+   */
+  getActiveMonitorCount(workspaceId: string): number {
+    assert(workspaceId.length > 0, "getActiveMonitorCount requires a workspaceId");
+    let count = 0;
+    for (const proc of this.processes.values()) {
+      if (
+        proc.workspaceId === workspaceId &&
+        proc.status === "running" &&
+        proc.monitor !== undefined &&
+        !proc.monitor.stopped
+      ) {
+        count++;
+      }
+    }
+    return count;
+  }
+
   private emitMonitorMatch(proc: BackgroundProcess, monitor: BackgroundProcessMonitorState): void {
     if (monitor.pendingLines.length === 0) return;
 
@@ -273,14 +333,15 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       monitor.flushTimer = undefined;
     }
 
-    // Don't wake the agent about output it has already been shown. shownThroughOffset is the file
-    // position an unfiltered task_await / bash_output read has delivered complete lines through;
-    // matchedThroughOffset is where the matched line ends. Both are absolute file offsets, so this
-    // is order-independent (no race between the reader and the monitor). If the agent was shown
-    // through the match, a wake would only double-report it (e.g. a concurrent task_await that just
-    // returned the same line), so drop. Anything still beyond the shown mark -- a filtered-out
-    // match (filtered reads never advance the mark), a line still buffered unterminated (matched
-    // only on exit), or genuinely new output -- stays above it and still wakes.
+    // Fast-path drop: don't even emit a wake for output the agent has already been shown.
+    // shownThroughOffset is the file position an unfiltered task_await / bash_output read has
+    // delivered complete lines through; matchedThroughOffset is where the matched line ends. Both
+    // are absolute file offsets, so this is order-independent. This check is only a point-in-time
+    // optimization -- it suppresses the common cooldown-deferred case with zero store I/O. It can
+    // still race a concurrent task_await that advances shownThroughOffset just after this flush
+    // (e.g. a process that prints its final line then exits, triggering an immediate exit flush).
+    // drainBashMonitorWakes re-checks matchedThroughOffset against the settled frontier at delivery
+    // time and is the authoritative suppression point; this is the cheap early-out ahead of it.
     if (proc.shownThroughOffset >= monitor.matchedThroughOffset) {
       monitor.pendingLines = [];
       monitor.droppedLines = 0;
@@ -303,8 +364,19 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       totalMatches: monitor.matchesCount,
       ...(droppedLines > 0 ? { droppedLines } : {}),
       timestamp: Date.now(),
+      matchedThroughOffset: monitor.matchedThroughOffset,
     });
     this.emitChange(proc.workspaceId);
+  }
+
+  /**
+   * Mark the manager as shutting down. Must be called before any session teardown that
+   * triggers cleanup()/terminateAll() (e.g. first line of ServiceContainer.dispose()),
+   * otherwise per-workspace cleanup would emit "monitor:stopped" and erase the registry
+   * records the post-restart "monitor lost" notification depends on.
+   */
+  beginShutdown(): void {
+    this.shuttingDown = true;
   }
 
   private stopMonitor(proc: BackgroundProcess, flushPending: boolean): void {
@@ -319,6 +391,16 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     if (flushPending) {
       this.emitMonitorMatch(proc, monitor);
     }
+    // A monitor retiring while the app is alive means the agent no longer wants wakes for
+    // this process, so its armed-registry record must go. During shutdown the record must
+    // survive so the next startup can deliver the "monitor lost" notice.
+    if (!this.shuttingDown) {
+      this.emit("monitor:stopped", proc.workspaceId, { processId: proc.id });
+    }
+    // Armed -> stopped is workspace-visible state (sidebar "watching" indicator), and not
+    // every stop path also changes process status or flushes a match (e.g. maxEvents
+    // reached with the wake suppressed), so always notify subscribers.
+    this.emitChange(proc.workspaceId);
   }
 
   private scheduleMonitorFlush(
@@ -497,7 +579,10 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     void this.monitorTailLoop(proc.id).catch((error: unknown) => {
       const current = this.processes.get(proc.id);
       if (current?.monitor && !current.monitor.stopped) {
-        current.monitor.stopped = true;
+        // Route through stopMonitor so the retirement also clears any pending flush timer,
+        // emits "monitor:stopped" (registry cleanup), and broadcasts the change event so
+        // activity consumers see the armed-monitor count drop. No flush: the loop failed.
+        this.stopMonitor(current, false);
       }
       log.debug(
         `BackgroundProcessManager: monitor tail for ${proc.id} failed: ${getErrorMessage(error)}`
@@ -675,6 +760,18 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
           : MONITOR_POLL_INTERVAL_MS_REMOTE;
       proc.monitor = this.createMonitorState(config.monitor, { pollIntervalMs });
       this.startMonitorTail(proc);
+      // spawn() is the only place monitors are ever armed (registerMigratedProcess never
+      // sets one), so this single emit keeps the persisted armed-monitor registry complete.
+      this.emit("monitor:armed", workspaceId, {
+        processId,
+        taskId: `bash:${processId}`,
+        workspaceId,
+        displayName: config.displayName,
+        filter: proc.monitor.filter,
+        filterExclude: proc.monitor.exclude,
+        script,
+        createdAt: new Date().toISOString(),
+      });
     }
 
     log.debug(
@@ -891,6 +988,61 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   }
 
   /**
+   * Register an in-flight unfiltered read on the process and return a disposable that resolves +
+   * clears it when the read settles. Filtered reads get an inert disposable: they never advance the
+   * shown frontier, so wake delivery must not wait on them. See BackgroundProcess.unfilteredReadSettled.
+   */
+  private trackUnfilteredRead(proc: BackgroundProcess, filter: string | undefined): Disposable {
+    if (filter) {
+      // Filtered read: nothing to track, so the disposable is a no-op.
+      return { [Symbol.dispose]: () => undefined };
+    }
+    let resolve!: () => void;
+    const settled = new Promise<void>((r) => {
+      resolve = r;
+    });
+    proc.unfilteredReadSettled = settled;
+    return {
+      [Symbol.dispose]: () => {
+        // A later read only starts after this one releases outputLock, so the field is still ours.
+        if (proc.unfilteredReadSettled === settled) {
+          proc.unfilteredReadSettled = undefined;
+        }
+        resolve();
+      },
+    };
+  }
+
+  /**
+   * The shown-frontier (shownThroughOffset) after any in-flight unfiltered read settles. Used by
+   * drainBashMonitorWakes to decide, at delivery time, whether a monitor match has already been
+   * shown to the agent by a concurrent task_await. Returns undefined for an unknown process so the
+   * drain fails open (delivers the wake) rather than silently dropping it.
+   *
+   * `originNotAfterMs` binds the answer to the process instance that produced the wake. Process
+   * IDs are derived from display_name and reclaimed across restarts, so a pending wake for a dead
+   * instance could otherwise be superseded by a newer process's frontier. Callers pass the wake
+   * record's createdAt: the originating instance necessarily started before its first match created
+   * the record, so an instance whose startTime is after createdAt reused the ID and we return
+   * undefined (fail open) rather than let it suppress the prior instance's undelivered output.
+   */
+  async getSettledShownThroughOffset(
+    processId: string,
+    originNotAfterMs?: number
+  ): Promise<number | undefined> {
+    const proc = await this.getProcess(processId);
+    if (!proc) return undefined;
+    if (originNotAfterMs != null && proc.startTime > originNotAfterMs) return undefined;
+    // Await the current unfiltered read (if any). The matched output already exists on disk, so an
+    // unfiltered long-poll picks it up on its first iteration and returns promptly -- this does not
+    // hang on an idle process (no read in flight => field is undefined).
+    if (proc.unfilteredReadSettled) {
+      await proc.unfilteredReadSettled;
+    }
+    return proc.shownThroughOffset;
+  }
+
+  /**
    * Get incremental output from a background process.
    * Returns only NEW output since the last call (tracked per process).
    * @param processId Process ID to get output from
@@ -940,6 +1092,12 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     // the same offset before either updates the read position.
     await using _lock = await proc.outputLock.acquire();
 
+    // Register this read so the wake drain (getSettledShownThroughOffset) can await it before
+    // reading the shown-frontier, closing the race where a monitor exit-flush emits a wake for the
+    // same final line a concurrent task_await is still delivering. Filtered reads return an inert
+    // tracker: they never advance shownThroughOffset, so wake delivery must not block on them.
+    using _readTracker = this.trackUnfilteredRead(proc, filter);
+
     // Track call count for polling detection
     proc.getOutputCallCount++;
     const callCount = proc.getOutputCallCount;
@@ -977,6 +1135,10 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
 
     // Track the previous buffer to prepend to accumulated output
     const previousBuffer = proc.incompleteLineBuffer;
+    // File offset where this read's processable content begins (start cursor minus the buffered
+    // fragment that cursor already advanced past). Used below to detect a gap left by a prior
+    // filtered read so the shown-frontier never jumps over lines this read never showed.
+    const readStartOffset = proc.outputBytesRead;
 
     while (true) {
       // Read new content via the handle (works for both local and SSH runtimes)
@@ -1112,10 +1274,20 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     // dropped matched lines, so it must not count as having shown them. End-of-last-complete-line =
     // read cursor minus the trailing fragment we just buffered (cleared, hence 0, on exit). Offsets
     // only grow; Math.max guards against any out-of-order/partial call regressing the mark.
+    //
+    // Contiguity guard: outputBytesRead is a shared cursor that *filtered* reads also advance while
+    // dropping non-matching complete lines. If a prior filtered read consumed lines past our last
+    // shown frontier, this read starts beyond that frontier (shownRegionStart > shownThroughOffset)
+    // and those skipped lines were never shown to the agent. Advancing across that gap would let a
+    // wake for filtered-out output be wrongly suppressed, so only advance when this read's content
+    // is contiguous with the frontier. A gap pins the frontier low (safe: it can only over-wake).
     if (!filter) {
-      const shownThrough =
-        proc.outputBytesRead - Buffer.byteLength(proc.incompleteLineBuffer, "utf8");
-      proc.shownThroughOffset = Math.max(proc.shownThroughOffset, shownThrough);
+      const shownRegionStart = readStartOffset - Buffer.byteLength(previousBuffer, "utf8");
+      if (shownRegionStart <= proc.shownThroughOffset) {
+        const shownThrough =
+          proc.outputBytesRead - Buffer.byteLength(proc.incompleteLineBuffer, "utf8");
+        proc.shownThroughOffset = Math.max(proc.shownThroughOffset, shownThrough);
+      }
     }
 
     log.debug(
@@ -1334,6 +1506,9 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
    */
   async terminateAll(): Promise<void> {
     log.debug(`BackgroundProcessManager.terminateAll() called`);
+    // terminateAll only runs at shutdown; set the flag defensively in case a caller
+    // skipped beginShutdown(), so retiring monitors keep their registry records.
+    this.shuttingDown = true;
     const allProcesses = Array.from(this.processes.values());
     await Promise.all(allProcesses.map((p) => this.terminate(p.id)));
     this.processes.clear();

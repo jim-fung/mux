@@ -10,6 +10,7 @@ import {
 import type { ModelMessage } from "@/common/types/message";
 import { THINKING_LEVEL_OFF, coerceThinkingLevel } from "@/common/types/thinking";
 import { buildProviderOptions } from "@/common/utils/ai/providerOptions";
+import { normalizeUsage, withCacheWriteMetadata } from "@/common/utils/tokens/usageHelpers";
 import { extractChunkDeltaText } from "@/common/utils/ai/streamChunks";
 import { getErrorMessage } from "@/common/utils/errors";
 import { sanitizeErrorMessageForDisplay } from "@/common/utils/providerOutputSanitization";
@@ -21,6 +22,7 @@ import type {
 import { AdvisorToolInputSchema, TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { AdvisorToolCallSnapshot, ToolConfiguration } from "@/common/utils/tools/tools";
 import { log } from "@/node/services/log";
+import { flattenProviderExecutedToolParts } from "@/node/utils/messages/flattenProviderExecutedToolParts";
 import { emitChatEventBestEffort } from "./toolUtils";
 
 type StreamTextProviderOptions = Parameters<typeof streamText>[0]["providerOptions"];
@@ -240,7 +242,12 @@ export function createAdvisorTool(config: ToolConfiguration): Tool {
       const remainingUses =
         runtime.maxUsesPerTurn !== null ? runtime.maxUsesPerTurn - usesThisTurn : null;
 
-      const transcript = runtime.getTranscriptSnapshot();
+      // Flatten provider-executed (server-side) tool parts to text: the live
+      // step transcript keeps them as assistant tool-call/tool-result parts,
+      // which cannot be replayed against a different provider (e.g. OpenAI
+      // rejects foreign `srvtoolu_...` ids as unknown item_references). See
+      // flattenProviderExecutedToolParts for details.
+      const transcript = flattenProviderExecutedToolParts(runtime.getTranscriptSnapshot());
       assert(Array.isArray(transcript), "advisor transcript snapshot must be an array");
       assert(transcript.length > 0, "advisor transcript snapshot must not be empty");
       assert(toolCallId, "advisor requires toolCallId");
@@ -261,6 +268,11 @@ export function createAdvisorTool(config: ToolConfiguration): Tool {
           model,
           system: ADVISOR_SYSTEM_PROMPT,
           messages,
+          // The parent transcript snapshot can start with the cached
+          // { role: "system" } message StreamManager prepends for Anthropic
+          // caching; AI SDK 7 rejects it unless opted in. Trusted: mux builds
+          // the transcript server-side.
+          allowSystemInMessages: true,
           // Advisor requests are intentionally tool-less strategic consultations.
           tools: {},
           providerOptions,
@@ -298,8 +310,14 @@ export function createAdvisorTool(config: ToolConfiguration): Tool {
         }
 
         const advice = finalAdvice.length > 0 ? finalAdvice : streamedAdviceChunks.join("");
-        const usage = await result.usage;
-        const providerMetadata = await result.providerMetadata;
+        // Normalize AI SDK 7 usage to mux's persisted flat shape and re-inject
+        // cache-write tokens (moved off providerMetadata in v7) for pricing.
+        const rawUsage = await result.usage;
+        const usage = normalizeUsage(rawUsage);
+        const providerMetadata = withCacheWriteMetadata(
+          (await result.providerMetadata) as Record<string, unknown> | undefined,
+          rawUsage
+        );
 
         emitAdvisorPhase("finalizing_result");
 
@@ -316,7 +334,7 @@ export function createAdvisorTool(config: ToolConfiguration): Tool {
               toolName: "advisor",
               model: advisorModelString,
               usage,
-              providerMetadata: providerMetadata as Record<string, unknown> | undefined,
+              providerMetadata,
               toolCallId,
               timestamp: Date.now(),
             });

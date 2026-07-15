@@ -2,7 +2,11 @@ import { useCallback, useEffect, useRef } from "react";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { coerceThinkingLevel, type ThinkingLevel } from "@/common/types/thinking";
 import { normalizeAgentId } from "@/common/utils/agentIds";
-import { updatePersistedState, readPersistedState, usePersistedState } from "@/browser/hooks/usePersistedState";
+import {
+  updatePersistedState,
+  readPersistedState,
+  usePersistedState,
+} from "@/browser/hooks/usePersistedState";
 import type { APIClient } from "@/browser/contexts/API";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { Toast } from "./ChatInputToast";
@@ -26,7 +30,6 @@ import {
 } from "@/common/utils/goals/budgetPricing";
 
 type GoalBudgetState = Parameters<typeof hasBudgetedResumableGoal>[0];
-
 
 export interface WorkspaceModelSelectionConfig {
   variant: "workspace" | "creation";

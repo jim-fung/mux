@@ -776,6 +776,7 @@ export const ReviewAssistedStatsReporter: React.FC<ReviewAssistedStatsReporterPr
     isRead,
     isCreating,
     onUnreadAssistedChange,
+    workspaceMetadata,
   ]);
 
   return null;
@@ -912,9 +913,7 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
     const workspaceBaseIsPersisted = readPersistedString(workspaceDiffBaseKey) !== undefined;
     const shouldInitializeWorkspaceBase = !workspaceBaseIsPersisted;
 
-    const metadataTrunkBase = toMetadataDiffBase(
-      workspaceMetadata?.taskTrunkBranch
-    );
+    const metadataTrunkBase = toMetadataDiffBase(workspaceMetadata?.taskTrunkBranch);
     const initializedWorkspaceFromMetadata =
       shouldInitializeWorkspaceBase && metadataTrunkBase != null;
     if (initializedWorkspaceFromMetadata) {
@@ -1502,14 +1501,15 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
       cancelled = true;
     };
   }, [
-      api,
-      workspaceId,
-      workspacePath,
-      projectPath,
-      filters.diffBase,
-      filters.includeUncommitted,
-      refreshTrigger,
+    api,
+    workspaceId,
+    workspacePath,
+    projectPath,
+    filters.diffBase,
+    filters.includeUncommitted,
+    refreshTrigger,
     isCreating,
+    workspaceMetadata,
   ]);
 
   // Load diff hunks - when workspace, diffBase, selected path, or refreshTrigger changes

@@ -25,6 +25,7 @@ import { createSetGoalTool } from "@/node/services/tools/set_goal";
 import { createGetGoalTool } from "@/node/services/tools/get_goal";
 import { createCompleteGoalTool } from "@/node/services/tools/complete_goal";
 import { createNotifyTool } from "@/node/services/tools/notify";
+import { createToolSearchTool } from "@/node/services/tools/toolSearch";
 import { createAnalyticsQueryTool } from "@/node/services/tools/analyticsQuery";
 import { createDesktopTools } from "@/node/services/tools/desktopTools";
 import type { MuxToolScope } from "@/common/types/toolScope";
@@ -59,6 +60,7 @@ import {
   supportsGoogleNativeToolsWithFunctionTools,
 } from "@/common/utils/tools/toolDefinitions";
 import { sanitizeMCPToolsForOpenAI } from "@/common/utils/tools/schemaSanitizer";
+import type { ToolSearchRuntime } from "@/common/utils/tools/toolCatalog";
 
 import type { Result } from "@/common/types/result";
 import type { Runtime } from "@/node/runtime/Runtime";
@@ -268,6 +270,7 @@ export interface ToolConfiguration {
     memory?: boolean;
     workspaceHeartbeats?: boolean;
     astGrepOutline?: boolean;
+    toolSearch?: boolean;
   };
   /** Available sub-agents for the task tool description (dynamic context) */
   availableSubagents?: AgentDefinitionDescriptor[];
@@ -305,6 +308,12 @@ export interface ToolConfiguration {
     /** The abort signal from the parent stream */
     abortSignal: AbortSignal;
   };
+  /**
+   * Runtime holder for the tool_catalog_search tool (tool-search experiment; present
+   * only when the experiment is enabled and MCP tools exist for this stream).
+   * `state` is assigned by aiService after policy filtering builds the catalog.
+   */
+  toolSearchRuntime?: ToolSearchRuntime;
   /** Desktop session manager for desktop automation tools */
   desktopSessionManager?: DesktopSessionManager;
 }
@@ -594,6 +603,7 @@ export async function getToolsForModel(
     skills_catalog_search: createSkillsCatalogSearchTool(config),
     skills_catalog_read: createSkillsCatalogReadTool(config),
     ...(config.advisorRuntime ? { advisor: createAdvisorTool(config) } : {}),
+    ...(config.toolSearchRuntime ? { tool_catalog_search: createToolSearchTool(config) } : {}),
     ask_user_question: createAskUserQuestionTool(config),
     propose_plan: createProposePlanTool(config),
     // propose_name and propose_status are intentionally NOT registered here —
@@ -737,6 +747,7 @@ export async function getToolsForModel(
       enableAdvisor: Boolean(config.advisorRuntime),
       enableMemory: Boolean(config.memoryService && config.experiments?.memory),
       enableAstGrepOutline: Boolean(config.experiments?.astGrepOutline),
+      enableToolSearch: Boolean(config.toolSearchRuntime),
       // The Review pane belongs to the user-facing parent workspace. config
       // .enableAgentReport is the canonical "is sub-agent" signal (set true iff
       // the workspace has a parentWorkspaceId), so withhold the review_pane_*

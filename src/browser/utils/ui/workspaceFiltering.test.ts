@@ -4,6 +4,7 @@ import {
   formatDaysThreshold,
   AGE_THRESHOLDS_DAYS,
   buildSortedWorkspacesByProject,
+  orderMultiProjectSectionRows,
   computeWorkspaceDepthMap,
   computeAgentRowRenderMeta,
   computeDelegatedActivityByWorkspaceId,
@@ -620,6 +621,153 @@ describe("buildSortedWorkspacesByProject", () => {
     const result = buildSortedWorkspacesByProject(projects, metadata, {});
 
     expect(result.get("/project/a")).toHaveLength(0);
+  });
+});
+
+describe("buildSortedWorkspacesByProject pinning", () => {
+  const now = Date.now();
+  const projectsWithIds = (ids: string[]): Map<string, ProjectConfig> =>
+    new Map<string, ProjectConfig>([
+      ["/project/a", { workspaces: ids.map((id) => ({ path: `/a/${id}`, id })) }],
+    ]);
+
+  it("sorts pinned chats above unpinned ones in pinnedAt order regardless of recency", () => {
+    const projects = projectsWithIds(["ws1", "ws2", "ws3", "ws4"]);
+    const metadata = new Map<string, FrontendWorkspaceMetadata>([
+      // ws2 pinned second, ws4 pinned first: pin order must be ws4, ws2.
+      ["ws1", createWorkspace("ws1", "/project/a")],
+      ["ws2", { ...createWorkspace("ws2", "/project/a"), pinnedAt: "2026-01-02T00:00:00.000Z" }],
+      ["ws3", createWorkspace("ws3", "/project/a")],
+      ["ws4", { ...createWorkspace("ws4", "/project/a"), pinnedAt: "2026-01-01T00:00:00.000Z" }],
+    ]);
+    // Pinned rows have the *lowest* recency; unpinned ws1 is most recent.
+    const recency = { ws1: now, ws2: now - 500_000, ws3: now - 1_000, ws4: now - 900_000 };
+
+    const result = buildSortedWorkspacesByProject(projects, metadata, recency);
+
+    expect(result.get("/project/a")?.map((w) => w.id)).toEqual(["ws4", "ws2", "ws1", "ws3"]);
+  });
+
+  it("keeps pin order stable when an unpinned chat's recency is bumped", () => {
+    const projects = projectsWithIds(["pinnedA", "pinnedB", "free"]);
+    const metadata = new Map<string, FrontendWorkspaceMetadata>([
+      [
+        "pinnedA",
+        { ...createWorkspace("pinnedA", "/project/a"), pinnedAt: "2026-01-01T00:00:00.000Z" },
+      ],
+      [
+        "pinnedB",
+        { ...createWorkspace("pinnedB", "/project/a"), pinnedAt: "2026-01-02T00:00:00.000Z" },
+      ],
+      ["free", createWorkspace("free", "/project/a")],
+    ]);
+
+    const before = buildSortedWorkspacesByProject(projects, metadata, { free: now - 10_000 });
+    // Simulate activity on the unpinned chat: it must stay below the pinned block.
+    const after = buildSortedWorkspacesByProject(projects, metadata, { free: now });
+
+    expect(before.get("/project/a")?.map((w) => w.id)).toEqual(["pinnedA", "pinnedB", "free"]);
+    expect(after.get("/project/a")?.map((w) => w.id)).toEqual(["pinnedA", "pinnedB", "free"]);
+  });
+
+  it("keeps child rows attached under a pinned parent and ignores stale child pins", () => {
+    const projects = projectsWithIds(["root", "child", "other"]);
+    const metadata = new Map<string, FrontendWorkspaceMetadata>([
+      ["root", { ...createWorkspace("root", "/project/a"), pinnedAt: "2026-01-01T00:00:00.000Z" }],
+      [
+        "child",
+        {
+          ...createWorkspace("child", { projectPath: "/project/a", parentWorkspaceId: "root" }),
+          // Stale/malformed pin on a sub-agent must not detach it from its parent.
+          pinnedAt: "2026-06-01T00:00:00.000Z",
+        },
+      ],
+      ["other", createWorkspace("other", "/project/a")],
+    ]);
+    // The unpinned root is the most recent chat.
+    const recency = { root: now - 500_000, child: now - 400_000, other: now };
+
+    const result = buildSortedWorkspacesByProject(projects, metadata, recency);
+
+    expect(result.get("/project/a")?.map((w) => w.id)).toEqual(["root", "child", "other"]);
+  });
+
+  it("ignores pinnedAt on archived workspaces", () => {
+    const projects = projectsWithIds(["stale", "fresh"]);
+    const metadata = new Map<string, FrontendWorkspaceMetadata>([
+      [
+        "stale",
+        {
+          ...createWorkspace("stale", "/project/a"),
+          pinnedAt: "2026-01-01T00:00:00.000Z",
+          archivedAt: "2026-01-02T00:00:00.000Z",
+        },
+      ],
+      ["fresh", createWorkspace("fresh", "/project/a")],
+    ]);
+
+    const result = buildSortedWorkspacesByProject(projects, metadata, { fresh: now });
+
+    expect(result.get("/project/a")?.map((w) => w.id)).toEqual(["fresh", "stale"]);
+  });
+});
+
+describe("orderMultiProjectSectionRows", () => {
+  it("floats pinned rows to the top in pinnedAt order and keeps unpinned relative order", () => {
+    const rows = [
+      createWorkspace("free-1", "/project/a"),
+      { ...createWorkspace("pin-late", "/project/b"), pinnedAt: "2026-01-02T00:00:00.000Z" },
+      createWorkspace("free-2", "/project/c"),
+      { ...createWorkspace("pin-early", "/project/a"), pinnedAt: "2026-01-01T00:00:00.000Z" },
+    ];
+
+    expect(orderMultiProjectSectionRows(rows).map((w) => w.id)).toEqual([
+      "pin-early",
+      "pin-late",
+      "free-1",
+      "free-2",
+    ]);
+  });
+
+  it("keeps sub-agent children attached under their pinned parent", () => {
+    const parent = {
+      ...createWorkspace("parent", "/project/b"),
+      pinnedAt: "2026-01-01T00:00:00.000Z",
+    };
+    const child = createWorkspace("child", {
+      projectPath: "/project/b",
+      parentWorkspaceId: "parent",
+    });
+    const other = createWorkspace("other", "/project/a");
+
+    expect(orderMultiProjectSectionRows([other, child, parent]).map((w) => w.id)).toEqual([
+      "parent",
+      "child",
+      "other",
+    ]);
+  });
+});
+
+describe("partitionWorkspacesByAge pinning", () => {
+  const now = Date.now();
+  const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+
+  it("classifies an old pinned root and its children as recent", () => {
+    const pinnedRoot = {
+      ...createWorkspace("pinned-root"),
+      pinnedAt: "2026-01-01T00:00:00.000Z",
+    };
+    const child = createWorkspace("child", { parentWorkspaceId: "pinned-root" });
+    const oldFree = createWorkspace("old-free");
+
+    const { recent, buckets } = partitionWorkspacesByAge([pinnedRoot, child, oldFree], {
+      "pinned-root": now - 40 * ONE_DAY_MS,
+      child: now - 40 * ONE_DAY_MS,
+      "old-free": now - 40 * ONE_DAY_MS,
+    });
+
+    expect(recent.map((w) => w.id)).toEqual(["pinned-root", "child"]);
+    expect(getAllOld(buckets).map((w) => w.id)).toEqual(["old-free"]);
   });
 });
 

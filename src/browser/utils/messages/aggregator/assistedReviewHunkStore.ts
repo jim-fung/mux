@@ -1,8 +1,5 @@
 import type { AssistedReviewHunk } from "@/common/types/review";
-import {
-  formatAssistedFilter,
-  parseAssistedFilter,
-} from "@/common/utils/review/assistedReview";
+import { formatAssistedFilter, parseAssistedFilter } from "@/common/utils/review/assistedReview";
 import { ReviewPaneUpdateSuccessResultSchema } from "./schemas";
 
 /** Optional context passed through from `processToolResult`. */

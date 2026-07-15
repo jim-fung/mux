@@ -15,6 +15,7 @@ import {
   type StreamEndEvent,
   type StreamAbortEvent,
   type StreamAbortReasonSnapshot,
+  type ToolCallExecutionStartEvent,
   type ToolCallStartEvent,
   type ToolCallDeltaEvent,
   type ToolCallEndEvent,
@@ -230,7 +231,7 @@ export class StreamingMessageAggregator {
   private reviewHunkStore: AssistedReviewHunkStore = new AssistedReviewHunkStore();
 
   // Agent status lifecycle (status_set persistence + transient displayStatus)
-  private agentStatusAdapter: AgentStatusAdapter;
+  private readonly agentStatusAdapter: AgentStatusAdapter;
 
   // Agent-flagged "Assisted review" hunks (updated by review_pane_update).
   // Reconstructed from chat history on reload via processToolResult so the
@@ -246,7 +247,7 @@ export class StreamingMessageAggregator {
   // Workspace init hook state machine (ephemeral, not persisted to history).
   // Encapsulates init-start/output/end lifecycle, replay dedup, and throttled
   // cache invalidation during fast init output streaming.
-  private initStateHandler: InitStateHandler;
+  private readonly initStateHandler: InitStateHandler;
 
   // Track when we're waiting for stream-start after user message
   // Prevents retry barrier flash during normal send flow
@@ -288,7 +289,12 @@ export class StreamingMessageAggregator {
   // Shows "interrupting..." in StreamingBarrier until real stream-abort arrives
   private interruptingMessageId: string | null = null;
 
-  // H7: Session timing stats managed by StreamingStatsService.
+  // Execution starts that arrived before their tool part exists (messageId → toolCallId →
+  // timestamp). During reconnect replay, live tool-call-execution-start events are not
+  // replay-buffered and can beat the replayed tool-call-start that creates the part;
+  // dropping them would leave the running tool's elapsed timer hidden until the next
+  // reconnect. Consumed in handleToolCallStart, cleared in cleanupStreamState.
+  private stashedToolExecutionStarts = new Map<string, Map<string, number>>();
 
   // Workspace creation timestamp (used for recency calculation)
   // REQUIRED: Backend guarantees every workspace has createdAt via config.ts
@@ -537,6 +543,9 @@ export class StreamingMessageAggregator {
       this.interruptingMessageId = null;
     }
 
+    // Drop unconsumed execution starts (e.g. the tool part never materialized).
+    this.stashedToolExecutionStarts.delete(messageId);
+
     // Capture timing stats before removing the stream context
     const context = this.activeStreams.get(messageId);
     if (context) {
@@ -700,7 +709,9 @@ export class StreamingMessageAggregator {
     if (!opts?.skipDerivedState) {
       // Replay historical messages in order to reconstruct derived state
       for (const message of chronologicalMessages) {
-        this.skillStore.maybeTrackLoadedSkillFromAgentSkillSnapshot(message.metadata?.agentSkillSnapshot);
+        this.skillStore.maybeTrackLoadedSkillFromAgentSkillSnapshot(
+          message.metadata?.agentSkillSnapshot
+        );
 
         if (message.role === "user") {
           // Mirror live behavior for status: clear transient status on new user turn
@@ -1821,16 +1832,36 @@ export class StreamingMessageAggregator {
         part.type === "dynamic-tool" && part.toolCallId === data.toolCallId
     );
 
+    // A live tool-call-execution-start may have arrived before this (replayed) start
+    // created the part; fold the stashed timestamp in as if the event carried it.
+    const executionStartedAt =
+      data.executionStartedAt ??
+      this.takeStashedToolExecutionStart(data.messageId, data.toolCallId);
+
     if (existingToolPart) {
+      // A `since` replay re-sends tool-call-start when a queued tool's execute() began
+      // after the reconnect cursor. Merge the enriched execution start into the existing
+      // row (otherwise the elapsed timer stays hidden) instead of dropping the event.
+      if (executionStartedAt !== undefined && existingToolPart.executionStartedAt === undefined) {
+        existingToolPart.executionStartedAt = executionStartedAt;
+        // Also re-anchor the timing-stats start (seeded from the live tool-call-start's
+        // emission timestamp before disconnect), mirroring handleToolCallExecutionStart —
+        // otherwise tool-call-end still counts queue wait as execution time.
+        this.reanchorPendingToolStart(data.messageId, data.toolCallId, executionStartedAt);
+        this.markMessageDirty(data.messageId);
+        return;
+      }
       console.warn(`Tool call ${data.toolCallId} already exists, skipping duplicate`);
       return;
     }
 
-    // Track tool start time for execution duration calculation
+    // Track tool start time for execution duration calculation.
+    // Replayed starts may already carry the true execution start; prefer it so
+    // toolExecutionMs never counts time spent queued behind serialized siblings.
     const context = this.activeStreams.get(data.messageId);
     if (context) {
       this.updateStreamClock(context, data.timestamp);
-      context.pendingToolStarts.set(data.toolCallId, data.timestamp);
+      context.pendingToolStarts.set(data.toolCallId, executionStartedAt ?? data.timestamp);
     }
 
     // Add tool part to maintain temporal order
@@ -1841,6 +1872,8 @@ export class StreamingMessageAggregator {
       state: "input-available",
       input: data.args,
       timestamp: data.timestamp,
+      // Present on replay when execute() had already begun before reconnect.
+      ...(executionStartedAt !== undefined ? { executionStartedAt } : {}),
     };
     message.parts.push(toolPart);
 
@@ -1854,6 +1887,69 @@ export class StreamingMessageAggregator {
     // Track delta for token counting and TPS calculation
     this.trackDelta(data.messageId, data.tokens, data.timestamp, "tool-args");
     // Tool deltas are for display - args are in dynamic-tool part
+  }
+
+  /**
+   * Re-anchor the timing-stats start for a tool whose execute() actually began running.
+   * toolExecutionMs sums per-tool durations at tool-call-end; without this, each
+   * serialized sibling's duration would include the time it spent queued behind earlier
+   * siblings (double-counting tool time and deflating derived streaming/tok-s stats).
+   * Provider-executed tools never report an execution start and keep their
+   * tool-call-start anchor.
+   */
+  private reanchorPendingToolStart(
+    messageId: string,
+    toolCallId: string,
+    executionStartedAt: number
+  ): void {
+    const context = this.activeStreams.get(messageId);
+    if (context) {
+      this.updateStreamClock(context, executionStartedAt);
+      if (context.pendingToolStarts.has(toolCallId)) {
+        context.pendingToolStarts.set(toolCallId, executionStartedAt);
+      }
+    }
+  }
+
+  /**
+   * Mark when a tool call's execute() actually began running. Parallel tool calls are
+   * serialized in the backend, so this arrives once the call reaches the front of the
+   * queue — elapsed timers start here instead of at tool-call-start.
+   */
+  handleToolCallExecutionStart(data: ToolCallExecutionStartEvent): void {
+    this.reanchorPendingToolStart(data.messageId, data.toolCallId, data.timestamp);
+
+    const message = this.messages.get(data.messageId);
+    const toolPart = message?.parts.find(
+      (part): part is DynamicToolPart =>
+        part.type === "dynamic-tool" && part.toolCallId === data.toolCallId
+    );
+    if (!toolPart) {
+      // Live event won the race against the replayed tool-call-start that creates the
+      // part (execution-start events are not replay-buffered). Stash it for
+      // handleToolCallStart to apply.
+      const stash =
+        this.stashedToolExecutionStarts.get(data.messageId) ?? new Map<string, number>();
+      stash.set(data.toolCallId, data.timestamp);
+      this.stashedToolExecutionStarts.set(data.messageId, stash);
+      return;
+    }
+
+    toolPart.executionStartedAt = data.timestamp;
+    this.markMessageDirty(data.messageId);
+  }
+
+  /** Consume a stashed execution start that arrived before its tool part existed. */
+  private takeStashedToolExecutionStart(messageId: string, toolCallId: string): number | undefined {
+    const stash = this.stashedToolExecutionStarts.get(messageId);
+    const timestamp = stash?.get(toolCallId);
+    if (stash && timestamp !== undefined) {
+      stash.delete(toolCallId);
+      if (stash.size === 0) {
+        this.stashedToolExecutionStarts.delete(messageId);
+      }
+    }
+    return timestamp;
   }
 
   /**
@@ -2121,7 +2217,9 @@ export class StreamingMessageAggregator {
     }
 
     this.addMessage(incomingMessage);
-    this.skillStore.maybeTrackLoadedSkillFromAgentSkillSnapshot(incomingMessage.metadata?.agentSkillSnapshot);
+    this.skillStore.maybeTrackLoadedSkillFromAgentSkillSnapshot(
+      incomingMessage.metadata?.agentSkillSnapshot
+    );
 
     if (incomingMessage.role !== "user" || isSideQuestionUserMuxMessage(incomingMessage)) {
       return;
@@ -2431,9 +2529,7 @@ export class StreamingMessageAggregator {
       const initSnapshot = this.initStateHandler.getSnapshot();
       if (initSnapshot) {
         const durationMs =
-          initSnapshot.endTime !== null
-            ? initSnapshot.endTime - initSnapshot.startTime
-            : null;
+          initSnapshot.endTime !== null ? initSnapshot.endTime - initSnapshot.startTime : null;
         const initMessage: DisplayedMessage = {
           type: "workspace-init",
           id: "workspace-init",

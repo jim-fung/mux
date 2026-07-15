@@ -18,6 +18,31 @@ describe("MessageQueue", () => {
       expect(queue.getDisplayText()).toBe("First message\nSecond message");
     });
 
+    it("should hide synthetic background entries from the user-visible queue snapshot", () => {
+      queue.add(
+        "Background monitor wake",
+        { model: "gpt-4", agentId: "exec", queueDispatchMode: "tool-end" },
+        { synthetic: true, agentInitiated: true }
+      );
+      queue.add("User follow-up", {
+        model: "gpt-4",
+        agentId: "exec",
+        queueDispatchMode: "turn-end",
+      });
+
+      // Dispatch state still includes both FIFO entries, but the composer/queue card
+      // only exposes the user's own input and its chosen dispatch boundary.
+      expect(queue.getMessages()).toEqual(["Background monitor wake", "User follow-up"]);
+      expect(queue.getVisibleMessages()).toEqual(["User follow-up"]);
+      expect(queue.getVisibleDisplayText()).toBe("User follow-up");
+      expect(queue.getQueueDispatchMode()).toBe("tool-end");
+      expect(queue.getVisibleQueueDispatchMode()).toBe("turn-end");
+      const background = queue.dequeueNext();
+      expect(background.message).toBe("Background monitor wake");
+      expect(background.internal).toMatchObject({ synthetic: true, agentInitiated: true });
+      expect(queue.dequeueNext().message).toBe("User follow-up");
+    });
+
     it("should return rawCommand for compaction request", () => {
       const metadata: MuxMessageMetadata = {
         type: "compaction-request",
@@ -36,7 +61,7 @@ describe("MessageQueue", () => {
       expect(queue.getDisplayText()).toBe("/compact -t 3000");
     });
 
-    it("should throw when adding compaction after normal message", () => {
+    it("should queue compaction after normal message as its own entry", () => {
       queue.add("First message");
 
       const metadata: MuxMessageMetadata = {
@@ -51,11 +76,19 @@ describe("MessageQueue", () => {
         muxMetadata: metadata,
       };
 
-      // Compaction requests cannot be mixed with other messages to prevent
-      // silent failures where compaction metadata would be lost
-      expect(() => queue.add("Summarize this conversation...", options)).toThrow(
-        /Cannot queue compaction request/
-      );
+      // Compaction must not adopt earlier batched texts; it starts a new entry
+      // and dispatches after the pending messages instead of erroring.
+      expect(queue.add("Summarize this conversation...", options)).toBe(true);
+      expect(queue.getDisplayText()).toBe("First message\n/compact");
+
+      const first = queue.dequeueNext();
+      expect(first.message).toBe("First message");
+      expect(first.options?.muxMetadata).toBeUndefined();
+
+      const second = queue.dequeueNext();
+      expect(second.message).toBe("Summarize this conversation...");
+      expect((second.options?.muxMetadata as MuxMessageMetadata).type).toBe("compaction-request");
+      expect(queue.isEmpty()).toBe(true);
     });
 
     it("should return joined messages when metadata type is not compaction-request", () => {
@@ -198,37 +231,7 @@ describe("MessageQueue", () => {
       expect(queue.getQueueDispatchMode()).toBe("tool-end");
     });
 
-    it("should preserve turn-end mode when compaction enqueue is rejected", () => {
-      const validOptions: SendMessageOptions = {
-        model: "gpt-4",
-        agentId: "exec",
-      };
-
-      queue.add("wait for turn end", {
-        ...validOptions,
-        queueDispatchMode: "turn-end",
-      });
-      expect(queue.getQueueDispatchMode()).toBe("turn-end");
-
-      const metadata: MuxMessageMetadata = {
-        type: "compaction-request",
-        rawCommand: "/compact",
-        parsed: {},
-      };
-
-      expect(() =>
-        queue.add("summarize", {
-          ...validOptions,
-          queueDispatchMode: "tool-end",
-          muxMetadata: metadata,
-        })
-      ).toThrow(/Cannot queue compaction request/);
-
-      expect(queue.getQueueDispatchMode()).toBe("turn-end");
-      expect(queue.getMessages()).toHaveLength(1);
-    });
-
-    it("should preserve turn-end mode when agent-skill enqueue is rejected", () => {
+    it("should report tool-end when any pending entry wants tool-end", () => {
       const validOptions: SendMessageOptions = {
         model: "gpt-4",
         agentId: "exec",
@@ -247,16 +250,35 @@ describe("MessageQueue", () => {
         scope: "built-in",
       };
 
-      expect(() =>
-        queue.add("run skill", {
-          ...validOptions,
-          queueDispatchMode: "tool-end",
-          muxMetadata: metadata,
-        })
-      ).toThrow(/Cannot queue agent skill/);
+      // A later entry queued for tool-end makes the whole queue drain at tool-end
+      // (sticky, matching pre-entry batching semantics).
+      queue.add("run skill", {
+        ...validOptions,
+        queueDispatchMode: "tool-end",
+        muxMetadata: metadata,
+      });
+      expect(queue.getQueueDispatchMode()).toBe("tool-end");
 
-      expect(queue.getQueueDispatchMode()).toBe("turn-end");
-      expect(queue.getMessages()).toHaveLength(1);
+      // Once the tool-end entry dispatches, the remaining entries' mode wins again.
+      queue.dequeueNext(); // "wait for turn end" (FIFO head)
+      expect(queue.getQueueDispatchMode()).toBe("tool-end");
+      queue.dequeueNext(); // the tool-end skill entry
+      expect(queue.getQueueDispatchMode()).toBe("tool-end"); // empty queue default
+    });
+
+    it("should keep per-entry modes so a turn-end tail does not downgrade the queue", () => {
+      queue.add("interrupt soon", {
+        model: "gpt-4",
+        agentId: "exec",
+        queueDispatchMode: "tool-end",
+      });
+      queue.add("later is fine", {
+        model: "gpt-4",
+        agentId: "exec",
+        queueDispatchMode: "turn-end",
+      });
+
+      expect(queue.getQueueDispatchMode()).toBe("tool-end");
     });
 
     it("should reset mode to tool-end when cleared", () => {
@@ -280,17 +302,48 @@ describe("MessageQueue", () => {
       turnId: "turn-1",
     };
 
-    it("should not batch workspace-turn follow-ups with other queued messages", () => {
-      queue.add("Follow up", { model: "gpt-4", agentId: "exec", muxMetadata: metadata });
+    it("should queue user messages behind a workspace-turn follow-up instead of erroring", () => {
+      // Regression: sending a message while an internal workspace-turn follow-up
+      // was queued used to fail with "Cannot queue additional messages".
+      const onAccepted = () => undefined;
+      queue.add(
+        "Follow up",
+        { model: "gpt-4", agentId: "exec", muxMetadata: metadata },
+        { agentInitiated: true, onAccepted }
+      );
 
-      expect(() => queue.add("Second message")).toThrow(/workspace turn/);
+      expect(queue.add("Second message")).toBe(true);
+      expect(queue.getMessages()).toEqual(["Follow up", "Second message"]);
 
-      queue.clear();
+      // FIFO: the workspace turn dispatches first with its metadata + callbacks...
+      const first = queue.dequeueNext();
+      expect(first.message).toBe("Follow up");
+      expect((first.options?.muxMetadata as MuxMessageMetadata).type).toBe("workspace-turn-task");
+      expect(first.internal?.onAccepted).toBe(onAccepted);
+
+      // ...and the user message dispatches after it, without adopting either.
+      const second = queue.dequeueNext();
+      expect(second.message).toBe("Second message");
+      expect(second.options?.muxMetadata).toBeUndefined();
+      expect(second.internal).toBeUndefined();
+      expect(queue.isEmpty()).toBe(true);
+    });
+
+    it("should queue a workspace-turn follow-up behind pending messages", () => {
       queue.add("Normal message");
-
-      expect(() =>
+      expect(
         queue.add("Follow up", { model: "gpt-4", agentId: "exec", muxMetadata: metadata })
-      ).toThrow(/workspace turn/);
+      ).toBe(true);
+      expect(queue.hasWorkspaceTurn("wst_followup")).toBe(true);
+
+      const first = queue.dequeueNext();
+      expect(first.message).toBe("Normal message");
+      expect(first.options?.muxMetadata).toBeUndefined();
+      expect(queue.hasWorkspaceTurn("wst_followup")).toBe(true);
+
+      const second = queue.dequeueNext();
+      expect((second.options?.muxMetadata as MuxMessageMetadata).type).toBe("workspace-turn-task");
+      expect(queue.hasWorkspaceTurn("wst_followup")).toBe(false);
     });
 
     it("should preserve internal workspace-turn callbacks", () => {
@@ -304,12 +357,61 @@ describe("MessageQueue", () => {
         { agentInitiated: true, onAccepted, onAcceptedPreStreamFailure, onCanceled }
       );
 
-      const { internal } = queue.produceMessage();
+      const clearCallbacks = queue.getClearCallbacks();
+      expect(clearCallbacks).toHaveLength(1);
+      expect(clearCallbacks[0].onCanceled).toBe(onCanceled);
+
+      const { internal } = queue.dequeueNext();
       expect(internal?.agentInitiated).toBe(true);
       expect(internal?.onAccepted).toBe(onAccepted);
       expect(internal?.onAcceptedPreStreamFailure).toBe(onAcceptedPreStreamFailure);
       expect(internal?.onCanceled).toBe(onCanceled);
-      expect(queue.getClearCallbacks().onCanceled).toBe(onCanceled);
+    });
+
+    it("removeWorkspaceTurn drops only the matching entry and keeps user messages", () => {
+      const onCanceled = () => undefined;
+      queue.add("User message before");
+      queue.add(
+        "Follow up",
+        { model: "gpt-4", agentId: "exec", muxMetadata: metadata },
+        { agentInitiated: true, onCanceled }
+      );
+      queue.add("User message after");
+
+      expect(queue.removeWorkspaceTurn("wst_other")).toBeNull();
+
+      const callbacks = queue.removeWorkspaceTurn("wst_followup");
+      expect(callbacks?.onCanceled).toBe(onCanceled);
+      expect(queue.hasWorkspaceTurn("wst_followup")).toBe(false);
+      // Unrelated queued input survives the targeted cancel.
+      expect(queue.getMessages()).toEqual(["User message before", "User message after"]);
+    });
+
+    it("should report clear callbacks for every pending entry", () => {
+      const onCanceledFirst = () => undefined;
+      const onCanceledSecond = () => undefined;
+
+      queue.add(
+        "First follow up",
+        { model: "gpt-4", agentId: "exec" },
+        {
+          onCanceled: onCanceledFirst,
+        }
+      );
+      queue.add("User message in between");
+      queue.add(
+        "Second follow up",
+        { model: "gpt-4", agentId: "exec" },
+        {
+          onCanceled: onCanceledSecond,
+        }
+      );
+
+      const clearCallbacks = queue.getClearCallbacks();
+      expect(clearCallbacks.map((callbacks) => callbacks.onCanceled)).toEqual([
+        onCanceledFirst,
+        onCanceledSecond,
+      ]);
     });
   });
 
@@ -321,7 +423,7 @@ describe("MessageQueue", () => {
         goalInterventionPolicy: "steer",
       });
 
-      const { options } = queue.produceMessage();
+      const { options } = queue.dequeueNext();
 
       expect(options?.goalInterventionPolicy).toBe("steer");
     });
@@ -338,7 +440,7 @@ describe("MessageQueue", () => {
         goalInterventionPolicy: "steer",
       });
 
-      const { options } = queue.produceMessage();
+      const { options } = queue.dequeueNext();
 
       expect(options?.goalInterventionPolicy).toBe("pause");
     });
@@ -353,7 +455,7 @@ describe("MessageQueue", () => {
       queue.clear();
       queue.add("Plain follow-up", { model: "gpt-4", agentId: "exec" });
 
-      const { options } = queue.produceMessage();
+      const { options } = queue.dequeueNext();
       expect(options?.goalInterventionPolicy).toBeUndefined();
     });
   });
@@ -376,6 +478,78 @@ describe("MessageQueue", () => {
       expect(addedSecond).toBe(false);
       expect(queue.getMessages()).toEqual(["Follow up"]);
       expect(queue.getFileParts()).toEqual([image]);
+    });
+
+    it("should report pending dedupe keys and reset them when the queue clears", () => {
+      expect(queue.hasDedupeKey("heartbeat-request")).toBe(false);
+
+      queue.addOnce("Heartbeat", { model: "gpt-4", agentId: "exec" }, "heartbeat-request");
+      expect(queue.hasDedupeKey("heartbeat-request")).toBe(true);
+
+      // Drain and user-clear both go through clear(), which must release the key so the
+      // next scheduled message can enqueue again.
+      queue.clear();
+      expect(queue.hasDedupeKey("heartbeat-request")).toBe(false);
+      expect(
+        queue.addOnce("Heartbeat", { model: "gpt-4", agentId: "exec" }, "heartbeat-request")
+      ).toBe(true);
+    });
+
+    it("holdsOnlyDedupeKey is true only when the keyed entry is the sole queue content", () => {
+      // Empty queue: nothing to supersede.
+      expect(queue.holdsOnlyDedupeKey("heartbeat-request")).toBe(false);
+
+      // Sole keyed entry: droppable so later real input never batches behind it.
+      queue.addOnce("Heartbeat", { model: "gpt-4", agentId: "exec" }, "heartbeat-request");
+      expect(queue.holdsOnlyDedupeKey("heartbeat-request")).toBe(true);
+
+      // Once anything else shares the queue, a blanket drop would destroy real input.
+      queue.add("User follow-up", { model: "gpt-4", agentId: "exec" });
+      expect(queue.holdsOnlyDedupeKey("heartbeat-request")).toBe(false);
+    });
+
+    it("should dedupe a keyed entry queued behind an existing plain message", () => {
+      queue.add("User follow-up", { model: "gpt-4", agentId: "exec" });
+
+      expect(
+        queue.addOnce("Heartbeat", { model: "gpt-4", agentId: "exec" }, "heartbeat-request")
+      ).toBe(true);
+      expect(
+        queue.addOnce("Heartbeat", { model: "gpt-4", agentId: "exec" }, "heartbeat-request")
+      ).toBe(false);
+      expect(queue.getMessages()).toEqual(["User follow-up", "Heartbeat"]);
+    });
+
+    it("prioritizeNextUserEntry moves user input ahead of hidden background work", () => {
+      queue.add("Background wake", { model: "gpt-4", agentId: "exec" }, { synthetic: true });
+      queue.add("User send now", { model: "gpt-4", agentId: "exec" });
+      queue.add(
+        "Later background wake",
+        { model: "gpt-4", agentId: "exec" },
+        {
+          synthetic: true,
+        }
+      );
+
+      expect(queue.prioritizeNextUserEntry()).toBe(true);
+      expect(queue.dequeueNext().message).toBe("User send now");
+      expect(queue.dequeueNext().message).toBe("Background wake");
+      expect(queue.dequeueNext().message).toBe("Later background wake");
+      expect(queue.prioritizeNextUserEntry()).toBe(false);
+    });
+
+    it("should release a dedupe key when its entry dispatches", () => {
+      queue.addOnce("Heartbeat", { model: "gpt-4", agentId: "exec" }, "heartbeat-request");
+      expect(queue.hasDedupeKey("heartbeat-request")).toBe(true);
+
+      queue.dequeueNext();
+
+      // The key belongs to the dispatched entry, so the next scheduled message
+      // can enqueue again even if other entries were still pending.
+      expect(queue.hasDedupeKey("heartbeat-request")).toBe(false);
+      expect(
+        queue.addOnce("Heartbeat", { model: "gpt-4", agentId: "exec" }, "heartbeat-request")
+      ).toBe(true);
     });
   });
 
@@ -409,8 +583,8 @@ describe("MessageQueue", () => {
       // getMessages includes both
       expect(queue.getMessages()).toEqual(["Summarize...", "And then do this follow-up task"]);
 
-      // produceMessage preserves compaction metadata from first message
-      const { message, options } = queue.produceMessage();
+      // dequeueNext preserves compaction metadata from the entry's first message
+      const { message, options } = queue.dequeueNext();
       expect(message).toBe("Summarize...\nAnd then do this follow-up task");
       const muxMeta = options?.muxMetadata as MuxMessageMetadata;
       expect(muxMeta.type).toBe("compaction-request");
@@ -419,7 +593,7 @@ describe("MessageQueue", () => {
       }
     });
 
-    it("should throw when adding agent-skill invocation after normal message", () => {
+    it("should queue an agent-skill invocation after a normal message as its own entry", () => {
       queue.add("First message");
 
       const metadata: MuxMessageMetadata = {
@@ -435,12 +609,20 @@ describe("MessageQueue", () => {
         muxMetadata: metadata,
       };
 
-      expect(() => queue.add("Using skill init", options)).toThrow(
-        /Cannot queue agent skill invocation/
-      );
+      // Skill metadata must not adopt earlier batched texts; the invocation
+      // dispatches after the pending messages instead of erroring.
+      expect(queue.add("Using skill init", options)).toBe(true);
+      expect(queue.getDisplayText()).toBe("First message\n/init");
+
+      const first = queue.dequeueNext();
+      expect(first.message).toBe("First message");
+      expect(first.options?.muxMetadata).toBeUndefined();
+
+      const second = queue.dequeueNext();
+      expect((second.options?.muxMetadata as MuxMessageMetadata).type).toBe("agent-skill");
     });
 
-    it("should throw when adding normal message after agent-skill invocation", () => {
+    it("should queue a normal message behind an agent-skill invocation without leaking metadata", () => {
       const metadata: MuxMessageMetadata = {
         type: "agent-skill",
         rawCommand: "/init",
@@ -456,16 +638,25 @@ describe("MessageQueue", () => {
 
       expect(queue.getDisplayText()).toBe("/init");
 
-      expect(() => queue.add("Follow-up message")).toThrow(
-        /agent skill invocation is already queued/
-      );
+      // Skill entries are sealed: the follow-up starts a new entry and dispatches
+      // after the skill turn instead of adopting its metadata (or erroring).
+      expect(queue.add("Follow-up message")).toBe(true);
+      expect(queue.getDisplayText()).toBe("/init\nFollow-up message");
+
+      const first = queue.dequeueNext();
+      expect(first.message).toBe("Use skill init");
+      expect((first.options?.muxMetadata as MuxMessageMetadata).type).toBe("agent-skill");
+
+      const second = queue.dequeueNext();
+      expect(second.message).toBe("Follow-up message");
+      expect(second.options?.muxMetadata).toBeUndefined();
     });
 
     it("should produce combined message for API call", () => {
       queue.add("First message", { model: "gpt-4", agentId: "exec" });
       queue.add("Second message");
 
-      const { message, options } = queue.produceMessage();
+      const { message, options } = queue.dequeueNext();
 
       // Messages are joined with newlines
       expect(message).toBe("First message\nSecond message");
@@ -509,16 +700,21 @@ describe("MessageQueue", () => {
         { synthetic: true }
       );
 
-      const { internal } = queue.produceMessage();
+      const { internal } = queue.dequeueNext();
       expect(internal).toEqual({ synthetic: true });
     });
 
-    it("should not mark mixed synthetic + user batches as synthetic", () => {
+    it("should keep synthetic and user messages in separate entries", () => {
       queue.add("Idle compaction", { model: "gpt-4", agentId: "compact" }, { synthetic: true });
       queue.add("User follow-up", { model: "gpt-4", agentId: "exec" });
 
-      const { internal } = queue.produceMessage();
-      expect(internal).toBeUndefined();
+      const background = queue.dequeueNext();
+      expect(background.message).toBe("Idle compaction");
+      expect(background.internal).toEqual({ synthetic: true });
+
+      const user = queue.dequeueNext();
+      expect(user.message).toBe("User follow-up");
+      expect(user.internal).toBeUndefined();
     });
 
     it("should clear synthetic flag when queue is cleared", () => {
@@ -526,7 +722,7 @@ describe("MessageQueue", () => {
       queue.clear();
 
       queue.add("User message", { model: "gpt-4", agentId: "exec" });
-      const { internal } = queue.produceMessage();
+      const { internal } = queue.dequeueNext();
       expect(internal).toBeUndefined();
     });
   });
@@ -636,7 +832,7 @@ describe("MessageQueue", () => {
       const image = { url: "data:image/png;base64,abc", mediaType: "image/png" };
       queue.add("", { model: "gpt-4", agentId: "exec", fileParts: [image] });
 
-      const { message, options } = queue.produceMessage();
+      const { message, options } = queue.dequeueNext();
 
       expect(message).toBe("");
       expect(options?.fileParts).toEqual([image]);

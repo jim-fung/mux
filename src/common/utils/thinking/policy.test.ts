@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
 import {
   getThinkingPolicyForModel,
   enforceThinkingPolicy,
@@ -6,7 +7,9 @@ import {
   isGeminiFlashThinkingLevelModelName,
   getDefaultMinimumThinkingLevel,
   resolveMinimumThinkingLevel,
+  resolveEffectiveThinkingLevel,
   getAvailableThinkingLevels,
+  isXaiGrokFastVariantSwap,
 } from "./policy";
 
 describe("getThinkingPolicyForModel", () => {
@@ -194,6 +197,62 @@ describe("getThinkingPolicyForModel", () => {
     ]);
   });
 
+  test("returns 6 levels including max for gpt-5.6-sol", () => {
+    expect(getThinkingPolicyForModel("openai:gpt-5.6-sol")).toEqual([
+      "off",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+    expect(getThinkingPolicyForModel("mux-gateway:openai/gpt-5.6-sol-2026-07-09")).toEqual([
+      "off",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+  });
+
+  // Native max is family-wide at GA (Sol/Terra/Luna and the bare alias).
+  test("returns 6 levels including max for gpt-5.6-terra and gpt-5.6-luna", () => {
+    expect(getThinkingPolicyForModel("openai:gpt-5.6-terra")).toEqual([
+      "off",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+    expect(getThinkingPolicyForModel("openai:gpt-5.6-luna")).toEqual([
+      "off",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+    expect(getThinkingPolicyForModel("mux-gateway:openai/gpt-5.6-terra-2026-07-09")).toEqual([
+      "off",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+  });
+
+  test("gpt-5.6-sol named variants fall through to the default policy", () => {
+    expect(getThinkingPolicyForModel("openai:gpt-5.6-sol-mini")).toEqual([
+      "off",
+      "low",
+      "medium",
+      "high",
+    ]);
+  });
+
   test("returns 5 levels including xhigh for gpt-5.4-mini", () => {
     expect(getThinkingPolicyForModel("openai:gpt-5.4-mini")).toEqual([
       "off",
@@ -365,10 +424,10 @@ describe("getThinkingPolicyForModel", () => {
     ]);
   });
 
-  test("returns all 6 levels for Mythos-class Fable 5 / Mythos 5", () => {
-    // Fable / Mythos sit above Opus and support the native xhigh effort level.
+  test("excludes 'off' for Mythos-class Fable 5 / Mythos 5 (API rejects disabled thinking)", () => {
+    // Fable / Mythos sit above Opus and support the native xhigh effort level, but the
+    // API rejects `thinking: { type: "disabled" }`, so "off" is not offered.
     expect(getThinkingPolicyForModel("anthropic:claude-fable-5")).toEqual([
-      "off",
       "low",
       "medium",
       "high",
@@ -376,6 +435,69 @@ describe("getThinkingPolicyForModel", () => {
       "max",
     ]);
     expect(getThinkingPolicyForModel("anthropic:claude-mythos-5")).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+  });
+
+  test("clamps 'off' up to 'low' for Mythos-class models", () => {
+    // A stored/legacy "off" selection must not reach the wire as disabled thinking.
+    expect(enforceThinkingPolicy("anthropic:claude-fable-5", "off")).toBe("low");
+    expect(enforceThinkingPolicy("anthropic:claude-mythos-5", "off")).toBe("low");
+  });
+
+  test("resolveEffectiveThinkingLevel clamps unset/off for Mythos-class only", () => {
+    // Mythos-class cannot disable thinking: unset and "off" both resolve to "low"
+    // so provider options, replay transforms, and metadata stay consistent with
+    // the provider's always-thinking behavior.
+    expect(resolveEffectiveThinkingLevel("anthropic:claude-fable-5", undefined)).toBe("low");
+    expect(resolveEffectiveThinkingLevel("anthropic:claude-fable-5", "off")).toBe("low");
+    expect(resolveEffectiveThinkingLevel("anthropic:claude-fable-5", "medium")).toBe("medium");
+    // Other models keep legacy behavior: unset means "off", explicit levels pass through
+    // unclamped (policy enforcement happens at the call sites that own it).
+    expect(resolveEffectiveThinkingLevel("anthropic:claude-opus-4-8", undefined)).toBe("off");
+    expect(resolveEffectiveThinkingLevel("openai:gpt-5-pro", undefined)).toBe("off");
+    expect(resolveEffectiveThinkingLevel("anthropic:claude-sonnet-4-5", "high")).toBe("high");
+  });
+
+  test("resolveEffectiveThinkingLevel resolves mappedToModel aliases before the Mythos check", () => {
+    // A configured alias entry mapped to a Mythos-class model must follow the same
+    // no-disabled-thinking rule as the canonical id, matching buildProviderOptions'
+    // capability resolution.
+    const providersConfig: ProvidersConfigMap = {
+      anthropic: {
+        apiKeySet: true,
+        isEnabled: true,
+        isConfigured: true,
+        models: [{ id: "internal-fable", mappedToModel: "anthropic:claude-fable-5" }],
+      },
+    };
+    expect(
+      resolveEffectiveThinkingLevel("anthropic:internal-fable", undefined, providersConfig)
+    ).toBe("low");
+    expect(resolveEffectiveThinkingLevel("anthropic:internal-fable", "off", providersConfig)).toBe(
+      "low"
+    );
+    // Without providers config the alias is unknown and keeps legacy off behavior.
+    expect(resolveEffectiveThinkingLevel("anthropic:internal-fable", undefined)).toBe("off");
+  });
+
+  test("policy path resolves mappedToModel aliases to the target's capability", () => {
+    // An alias mapped to a GPT-5.6 model must expose the target's 6-level
+    // ladder (incl. native max) and clamp against it — otherwise AgentSession
+    // strips "max" before buildProviderOptions can resolve the alias.
+    const providersConfig: ProvidersConfigMap = {
+      openai: {
+        apiKeySet: true,
+        isEnabled: true,
+        isConfigured: true,
+        models: [{ id: "team-sol", mappedToModel: "openai:gpt-5.6-sol" }],
+      },
+    };
+    expect(getThinkingPolicyForModel("openai:team-sol", providersConfig)).toEqual([
       "off",
       "low",
       "medium",
@@ -383,6 +505,14 @@ describe("getThinkingPolicyForModel", () => {
       "xhigh",
       "max",
     ]);
+    expect(getAvailableThinkingLevels("openai:team-sol", null, providersConfig)).toContain("max");
+    expect(enforceThinkingPolicy("openai:team-sol", "max", null, providersConfig)).toBe("max");
+    // Aliases inherit the target's default medium floor (recognized reasoning model).
+    expect(getDefaultMinimumThinkingLevel("openai:team-sol", providersConfig)).toBe("medium");
+    expect(resolveMinimumThinkingLevel("openai:team-sol", null, providersConfig)).toBe("medium");
+    // Without providers config the alias is unknown: default 4-level policy clamps max down.
+    expect(enforceThinkingPolicy("openai:team-sol", "max")).toBe("high");
+    expect(getDefaultMinimumThinkingLevel("openai:team-sol")).toBe("off");
   });
 
   test("returns all 6 levels for Sonnet 5 (native xhigh)", () => {
@@ -843,5 +973,18 @@ describe("OpenAI-compatible vendor reasoning recognition", () => {
     ["moonshot:kimi-k2-0905-preview"],
   ])("does NOT recognize non-reasoning %s (off floor)", (model) => {
     expect(getDefaultMinimumThinkingLevel(model)).toBe("off");
+  });
+});
+
+describe("isXaiGrokFastVariantSwap", () => {
+  test("flags only off<->on transitions on xai:grok-4-1-fast", () => {
+    // off <-> non-off swaps the underlying reasoning/non-reasoning variant.
+    expect(isXaiGrokFastVariantSwap("xai:grok-4-1-fast", "off", "high")).toBe(true);
+    expect(isXaiGrokFastVariantSwap("xai:grok-4-1-fast", "high", "off")).toBe(true);
+    // non-off -> non-off stays on the reasoning variant (no swap).
+    expect(isXaiGrokFastVariantSwap("xai:grok-4-1-fast", "low", "high")).toBe(false);
+    // Other models never swap instances on thinking-level changes.
+    expect(isXaiGrokFastVariantSwap("xai:grok-4-1-fast-reasoning", "off", "high")).toBe(false);
+    expect(isXaiGrokFastVariantSwap("anthropic:claude-sonnet-4-5", "off", "high")).toBe(false);
   });
 });

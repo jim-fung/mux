@@ -731,7 +731,6 @@ function usePreserveSubagentsUntilArchiveSetting(api: ReturnType<typeof useAPI>[
   return preserveSubagentsUntilArchive;
 }
 
-
 interface ProjectTreeContextValue {
   workspaceDraftsByProject: Record<string, WorkspaceDraft[]>;
   workspaceDraftPromotionsByProject: Record<string, Record<string, FrontendWorkspaceMetadata>>;
@@ -760,11 +759,7 @@ interface ProjectTreeContextValue {
   handleStopRuntime: (workspaceId: string, buttonElement?: HTMLElement) => Promise<void>;
   handleArchiveWorkspace: (workspaceId: string, buttonElement?: HTMLElement) => Promise<void>;
   handleCancelWorkspaceCreation: (workspaceId: string) => Promise<void>;
-  handleDraftVisibilityChange: (
-    projectPath: string,
-    draftId: string,
-    isVisible: boolean
-  ) => void;
+  handleDraftVisibilityChange: (projectPath: string, draftId: string, isVisible: boolean) => void;
   handleOpenWorkspaceDraft: (projectPath: string, draftId: string) => void;
   openWorkspaceDraft: (projectPath: string, draftId: string) => void;
   navigateToProject: (path: string) => void;
@@ -794,7 +789,6 @@ interface ProjectWorkspacesTreeProps {
   ctx: ProjectTreeContextValue;
 }
 
-
 // Extracted from ProjectSidebarInner's inline IIFE to isolate tree-math re-renders
 // from trivial UI state changes (color picker drag, context menus, modals).
 const ProjectWorkspacesTree: React.FC<ProjectWorkspacesTreeProps> = ({
@@ -802,7 +796,7 @@ const ProjectWorkspacesTree: React.FC<ProjectWorkspacesTreeProps> = ({
   projectWorkspaces,
   projectName,
   ctx,
-  }) => {
+}) => {
   const workspaceStore = useWorkspaceStoreRaw();
 
   const {
@@ -852,10 +846,9 @@ const ProjectWorkspacesTree: React.FC<ProjectWorkspacesTreeProps> = ({
     const signal = getWorkspaceAttentionSignal(workspaceStore, workspaceId);
     return signal?.isWorking === true;
   };
-  const delegatedActivityByWorkspaceId = computeDelegatedActivityByWorkspaceId(
-    projectWorkspaces,
-    { isWorkspaceLiveActive }
-  );
+  const delegatedActivityByWorkspaceId = computeDelegatedActivityByWorkspaceId(projectWorkspaces, {
+    isWorkspaceLiveActive,
+  });
 
   // Subscribe to this project's workspace state changes so delegated activity
   // and attention indicators stay current without a global version counter.
@@ -865,782 +858,664 @@ const ProjectWorkspacesTree: React.FC<ProjectWorkspacesTreeProps> = ({
     const ids = projectWorkspaces.map((w) => w.id);
     if (ids.length === 0) return;
     const bump = () => setAttentionVersion((v) => v + 1);
-    const unsubscribers = [
-      ...ids.map((id) => workspaceStore.subscribeKey(id, bump)),
-    ];
+    const unsubscribers = [...ids.map((id) => workspaceStore.subscribeKey(id, bump))];
     for (const id of ids) {
       const evt = getStorageChangeEvent(getWorkspaceLastReadKey(id));
       window.addEventListener(evt, bump);
       unsubscribers.push(() => window.removeEventListener(evt, bump));
     }
-    return () => { for (const u of unsubscribers) u(); };
+    return () => {
+      for (const u of unsubscribers) u();
+    };
   }, [projectWorkspaces, workspaceStore]);
 
-                              const draftsForProject = workspaceDraftsByProject[projectPath] ?? [];
-                              const activeDraftIds = new Set(
-                                draftsForProject.map((draft) => draft.draftId)
-                              );
-                              const draftPromotionsForProject =
-                                workspaceDraftPromotionsByProject[projectPath] ?? {};
-                              const activeDraftPromotions = Object.fromEntries(
-                                Object.entries(draftPromotionsForProject).filter(([draftId]) =>
-                                  activeDraftIds.has(draftId)
-                                )
-                              );
-                              const promotedWorkspaceIds = new Set(
-                                Object.values(activeDraftPromotions).map((metadata) => metadata.id)
-                              );
-                              const workspacesForNormalRendering = projectWorkspaces.filter(
-                                (workspace) => !promotedWorkspaceIds.has(workspace.id)
-                              );
-                              const sections: SectionConfig[] = getSubProjectsForParent(
-                                projectPath,
-                                userProjects
-                              ).map(([subProjectPath, subProjectConfig]) => ({
-                                id: subProjectPath,
-                                name: getProjectDisplayName(subProjectPath, subProjectConfig),
-                                color: subProjectConfig.color,
-                              }));
-                              const depthByWorkspaceId =
-                                computeWorkspaceDepthMap(projectWorkspaces);
-                              // Track runs that are (or were, this session) active so their
-                              // groups stay mounted across step gaps where every member is
-                              // momentarily terminal (no flash-out between sequential steps).
-                              for (const key of collectActiveWorkflowGroupKeys(
-                                workspacesForNormalRendering,
-                                { isWorkspaceLiveActive }
-                              )) {
-                                sessionActiveTaskGroupKeysRef.current.add(key);
-                              }
-                              const visibleWorkspacesForNormalRendering =
-                                ensureWorkflowGroupMembersVisible({
-                                  allRows: workspacesForNormalRendering,
-                                  visibleRows: filterVisibleAgentRows(
-                                    workspacesForNormalRendering,
-                                    expandedCompletedParentIds
-                                  ),
-                                  sessionActiveGroupKeys: sessionActiveTaskGroupKeysRef.current,
-                                });
-                              const baseRowMetaByWorkspaceId = computeAgentRowRenderMeta(
-                                workspacesForNormalRendering,
-                                depthByWorkspaceId,
-                                expandedCompletedParentIds
-                              );
-                              const sortedDrafts = draftsForProject
-                                .slice()
-                                .sort((a, b) => b.createdAt - a.createdAt);
-                              const draftVisibilityForProject =
-                                draftVisibilityByProject[projectPath] ?? {};
-                              const hasVisibleDrafts = sortedDrafts.some((draft) => {
-                                const reactiveVisibility = draftVisibilityForProject[draft.draftId];
-                                return (
-                                  reactiveVisibility ?? isDraftVisible(projectPath, draft.draftId)
-                                );
-                              });
-                              const projectHasNoAgentsOrDrafts =
-                                projectWorkspaces.length === 0 && !hasVisibleDrafts;
-                              const draftNumberById = new Map(
-                                sortedDrafts.map(
-                                  (draft, index) => [draft.draftId, index + 1] as const
-                                )
-                              );
-                              const getDraftSectionId = (
-                                draft: (typeof sortedDrafts)[number]
-                              ): string | null =>
-                                typeof draft.subProjectPath === "string" &&
-                                userProjects.get(draft.subProjectPath)?.parentProjectPath ===
-                                  projectPath
-                                  ? draft.subProjectPath
-                                  : null;
+  const draftsForProject = workspaceDraftsByProject[projectPath] ?? [];
+  const activeDraftIds = new Set(draftsForProject.map((draft) => draft.draftId));
+  const draftPromotionsForProject = workspaceDraftPromotionsByProject[projectPath] ?? {};
+  const activeDraftPromotions = Object.fromEntries(
+    Object.entries(draftPromotionsForProject).filter(([draftId]) => activeDraftIds.has(draftId))
+  );
+  const promotedWorkspaceIds = new Set(
+    Object.values(activeDraftPromotions).map((metadata) => metadata.id)
+  );
+  const workspacesForNormalRendering = projectWorkspaces.filter(
+    (workspace) => !promotedWorkspaceIds.has(workspace.id)
+  );
+  const sections: SectionConfig[] = getSubProjectsForParent(projectPath, userProjects).map(
+    ([subProjectPath, subProjectConfig]) => ({
+      id: subProjectPath,
+      name: getProjectDisplayName(subProjectPath, subProjectConfig),
+      color: subProjectConfig.color,
+    })
+  );
+  const depthByWorkspaceId = computeWorkspaceDepthMap(projectWorkspaces);
+  // Track runs that are (or were, this session) active so their
+  // groups stay mounted across step gaps where every member is
+  // momentarily terminal (no flash-out between sequential steps).
+  for (const key of collectActiveWorkflowGroupKeys(workspacesForNormalRendering, {
+    isWorkspaceLiveActive,
+  })) {
+    sessionActiveTaskGroupKeysRef.current.add(key);
+  }
+  const visibleWorkspacesForNormalRendering = ensureWorkflowGroupMembersVisible({
+    allRows: workspacesForNormalRendering,
+    visibleRows: filterVisibleAgentRows(workspacesForNormalRendering, expandedCompletedParentIds),
+    sessionActiveGroupKeys: sessionActiveTaskGroupKeysRef.current,
+  });
+  const baseRowMetaByWorkspaceId = computeAgentRowRenderMeta(
+    workspacesForNormalRendering,
+    depthByWorkspaceId,
+    expandedCompletedParentIds
+  );
+  const sortedDrafts = draftsForProject.slice().sort((a, b) => b.createdAt - a.createdAt);
+  const draftVisibilityForProject = draftVisibilityByProject[projectPath] ?? {};
+  const hasVisibleDrafts = sortedDrafts.some((draft) => {
+    const reactiveVisibility = draftVisibilityForProject[draft.draftId];
+    return reactiveVisibility ?? isDraftVisible(projectPath, draft.draftId);
+  });
+  const projectHasNoAgentsOrDrafts = projectWorkspaces.length === 0 && !hasVisibleDrafts;
+  const draftNumberById = new Map(
+    sortedDrafts.map((draft, index) => [draft.draftId, index + 1] as const)
+  );
+  const getDraftSectionId = (draft: (typeof sortedDrafts)[number]): string | null =>
+    typeof draft.subProjectPath === "string" &&
+    userProjects.get(draft.subProjectPath)?.parentProjectPath === projectPath
+      ? draft.subProjectPath
+      : null;
 
-                              // Drafts can reference a section that has since been deleted.
-                              // Treat those as unsectioned so they remain accessible.
-                              const unsectionedDrafts: typeof sortedDrafts = [];
-                              const draftsBySectionId = new Map<string, typeof sortedDrafts>();
-                              for (const draft of sortedDrafts) {
-                                const sectionId = getDraftSectionId(draft);
-                                if (sectionId === null) {
-                                  unsectionedDrafts.push(draft);
-                                  continue;
-                                }
+  // Drafts can reference a section that has since been deleted.
+  // Treat those as unsectioned so they remain accessible.
+  const unsectionedDrafts: typeof sortedDrafts = [];
+  const draftsBySectionId = new Map<string, typeof sortedDrafts>();
+  for (const draft of sortedDrafts) {
+    const sectionId = getDraftSectionId(draft);
+    if (sectionId === null) {
+      unsectionedDrafts.push(draft);
+      continue;
+    }
 
-                                const existing = draftsBySectionId.get(sectionId);
-                                if (existing) {
-                                  existing.push(draft);
-                                } else {
-                                  draftsBySectionId.set(sectionId, [draft]);
-                                }
-                              }
+    const existing = draftsBySectionId.get(sectionId);
+    if (existing) {
+      existing.push(draft);
+    } else {
+      draftsBySectionId.set(sectionId, [draft]);
+    }
+  }
 
-                              const renderWorkspace = (
-                                metadata: FrontendWorkspaceMetadata,
-                                sectionId?: string,
-                                rowRenderMetaOverride?: AgentRowRenderMeta | null,
-                                depthOverride?: number,
-                                keyOverride?: string,
-                                subAgentConnectorLayout?: "default" | "task-group-member",
-                                taskGroupHeaderTitle?: string
-                              ) => {
-                                const rowRenderMeta =
-                                  rowRenderMetaOverride === undefined
-                                    ? baseRowMetaByWorkspaceId.get(metadata.id)
-                                    : (rowRenderMetaOverride ?? undefined);
+  const renderWorkspace = (
+    metadata: FrontendWorkspaceMetadata,
+    sectionId?: string,
+    rowRenderMetaOverride?: AgentRowRenderMeta | null,
+    depthOverride?: number,
+    keyOverride?: string,
+    subAgentConnectorLayout?: "default" | "task-group-member",
+    taskGroupHeaderTitle?: string
+  ) => {
+    const rowRenderMeta =
+      rowRenderMetaOverride === undefined
+        ? baseRowMetaByWorkspaceId.get(metadata.id)
+        : (rowRenderMetaOverride ?? undefined);
 
-                                return (
-                                  <AgentListItem
-                                    key={keyOverride ?? metadata.id}
-                                    metadata={metadata}
-                                    projectPath={projectPath}
-                                    projectName={projectName}
-                                    isSelected={selectedWorkspace?.workspaceId === metadata.id}
-                                    isArchiving={archivingWorkspaceIds.has(metadata.id)}
-                                    isRemoving={
-                                      removingWorkspaceIds.has(metadata.id) ||
-                                      metadata.isRemoving === true
-                                    }
-                                    onSelectWorkspace={handleSelectWorkspace}
-                                    onForkWorkspace={handleForkWorkspace}
-                                    onStopRuntime={handleStopRuntime}
-                                    onArchiveWorkspace={handleArchiveWorkspace}
-                                    onCancelCreation={handleCancelWorkspaceCreation}
-                                    depth={
-                                      depthOverride ??
-                                      rowRenderMeta?.depth ??
-                                      depthByWorkspaceId[metadata.id] ??
-                                      0
-                                    }
-                                    sectionId={sectionId}
-                                    rowRenderMeta={rowRenderMeta}
-                                    subAgentConnectorLayout={subAgentConnectorLayout}
-                                    taskGroupHeaderTitle={taskGroupHeaderTitle}
-                                    delegatedActivity={delegatedActivityByWorkspaceId.get(
-                                      metadata.id
-                                    )}
-                                    completedChildrenExpanded={expandedCompletedParentIds.has(
-                                      metadata.id
-                                    )}
-                                    onToggleCompletedChildren={toggleCompletedChildrenExpansion}
-                                  />
-                                );
-                              };
+    return (
+      <AgentListItem
+        key={keyOverride ?? metadata.id}
+        metadata={metadata}
+        projectPath={projectPath}
+        projectName={projectName}
+        isSelected={selectedWorkspace?.workspaceId === metadata.id}
+        isArchiving={archivingWorkspaceIds.has(metadata.id)}
+        isRemoving={removingWorkspaceIds.has(metadata.id) || metadata.isRemoving === true}
+        onSelectWorkspace={handleSelectWorkspace}
+        onForkWorkspace={handleForkWorkspace}
+        onStopRuntime={handleStopRuntime}
+        onArchiveWorkspace={handleArchiveWorkspace}
+        onCancelCreation={handleCancelWorkspaceCreation}
+        depth={depthOverride ?? rowRenderMeta?.depth ?? depthByWorkspaceId[metadata.id] ?? 0}
+        sectionId={sectionId}
+        rowRenderMeta={rowRenderMeta}
+        subAgentConnectorLayout={subAgentConnectorLayout}
+        taskGroupHeaderTitle={taskGroupHeaderTitle}
+        delegatedActivity={delegatedActivityByWorkspaceId.get(metadata.id)}
+        completedChildrenExpanded={expandedCompletedParentIds.has(metadata.id)}
+        onToggleCompletedChildren={toggleCompletedChildrenExpansion}
+      />
+    );
+  };
 
-                              const renderWorkspaceRowsWithTaskGroupCoalescing = ({
-                                rows,
-                                sectionId,
-                                rowMetaByWorkspaceId,
-                                taskGroups,
-                                memberMetaByWorkspaceId,
-                              }: {
-                                rows: FrontendWorkspaceMetadata[];
-                                sectionId?: string;
-                                rowMetaByWorkspaceId: ReadonlyMap<string, AgentRowRenderMeta>;
-                                taskGroups: SidebarTaskGroupsResult;
-                                memberMetaByWorkspaceId: ReadonlyMap<string, AgentRowRenderMeta>;
-                              }): React.ReactNode[] => {
-                                const renderedRows: React.ReactNode[] = [];
+  const renderWorkspaceRowsWithTaskGroupCoalescing = ({
+    rows,
+    sectionId,
+    rowMetaByWorkspaceId,
+    taskGroups,
+    memberMetaByWorkspaceId,
+  }: {
+    rows: FrontendWorkspaceMetadata[];
+    sectionId?: string;
+    rowMetaByWorkspaceId: ReadonlyMap<string, AgentRowRenderMeta>;
+    taskGroups: SidebarTaskGroupsResult;
+    memberMetaByWorkspaceId: ReadonlyMap<string, AgentRowRenderMeta>;
+  }): React.ReactNode[] => {
+    const renderedRows: React.ReactNode[] = [];
 
-                                for (const workspace of rows) {
-                                  const groupKey =
-                                    taskGroups.memberGroupStorageKeyByWorkspaceId.get(workspace.id);
-                                  const group =
-                                    groupKey != null
-                                      ? taskGroups.groupsByStorageKey.get(groupKey)
-                                      : undefined;
-                                  if (group == null) {
-                                    renderedRows.push(
-                                      renderWorkspace(
-                                        workspace,
-                                        sectionId,
-                                        rowMetaByWorkspaceId.get(workspace.id)
-                                      )
-                                    );
-                                    continue;
-                                  }
+    for (const workspace of rows) {
+      const groupKey = taskGroups.memberGroupStorageKeyByWorkspaceId.get(workspace.id);
+      const group = groupKey != null ? taskGroups.groupsByStorageKey.get(groupKey) : undefined;
+      if (group == null) {
+        renderedRows.push(
+          renderWorkspace(workspace, sectionId, rowMetaByWorkspaceId.get(workspace.id))
+        );
+        continue;
+      }
 
-                                  if (group.anchorId !== workspace.id) {
-                                    // Non-anchor members render under the group header at the
-                                    // anchor's position (D5), so suppress them here.
-                                    continue;
-                                  }
+      if (group.anchorId !== workspace.id) {
+        // Non-anchor members render under the group header at the
+        // anchor's position (D5), so suppress them here.
+        continue;
+      }
 
-                                  const headerMeta = rowMetaByWorkspaceId.get(group.storageKey);
-                                  const headerDepth =
-                                    headerMeta?.depth ?? depthByWorkspaceId[workspace.id] ?? 0;
+      const headerMeta = rowMetaByWorkspaceId.get(group.storageKey);
+      const headerDepth = headerMeta?.depth ?? depthByWorkspaceId[workspace.id] ?? 0;
 
-                                  // D6: groups seen active this session keep defaulting to
-                                  // expanded - no live auto-collapse on completion. An explicit
-                                  // (persisted) user toggle always wins.
-                                  if (group.kind === "workflow" && group.hasActiveMember) {
-                                    sessionActiveTaskGroupKeysRef.current.add(group.storageKey);
-                                  }
-                                  const defaultExpanded =
-                                    group.kind === "workflow" &&
-                                    (group.hasActiveMember ||
-                                      sessionActiveTaskGroupKeysRef.current.has(group.storageKey));
-                                  const isExpanded =
-                                    expandedTaskGroups[group.storageKey] ?? defaultExpanded;
-                                  const isGroupSelected = group.allMembers.some(
-                                    (member) => member.id === selectedWorkspace?.workspaceId
-                                  );
+      // D6: groups seen active this session keep defaulting to
+      // expanded - no live auto-collapse on completion. An explicit
+      // (persisted) user toggle always wins.
+      if (group.kind === "workflow" && group.hasActiveMember) {
+        sessionActiveTaskGroupKeysRef.current.add(group.storageKey);
+      }
+      const defaultExpanded =
+        group.kind === "workflow" &&
+        (group.hasActiveMember || sessionActiveTaskGroupKeysRef.current.has(group.storageKey));
+      const isExpanded = expandedTaskGroups[group.storageKey] ?? defaultExpanded;
+      const isGroupSelected = group.allMembers.some(
+        (member) => member.id === selectedWorkspace?.workspaceId
+      );
 
-                                  const headerRow = (
-                                    <TaskGroupListItem
-                                      groupId={group.id}
-                                      title={group.title}
-                                      kind={group.kind}
-                                      sectionId={sectionId}
-                                      depth={headerDepth}
-                                      totalCount={group.totalCount}
-                                      visibleCount={group.displayMembers.length}
-                                      completedCount={group.completedCount}
-                                      runningCount={group.runningCount}
-                                      queuedCount={group.queuedCount}
-                                      interruptedCount={group.interruptedCount}
-                                      isExpanded={isExpanded}
-                                      isSelected={isGroupSelected}
-                                      onToggle={() => {
-                                        toggleTaskGroupExpansion(group.storageKey, isExpanded);
-                                      }}
-                                    />
-                                  );
+      const headerRow = (
+        <TaskGroupListItem
+          groupId={group.id}
+          title={group.title}
+          kind={group.kind}
+          sectionId={sectionId}
+          depth={headerDepth}
+          totalCount={group.totalCount}
+          visibleCount={group.displayMembers.length}
+          completedCount={group.completedCount}
+          runningCount={group.runningCount}
+          queuedCount={group.queuedCount}
+          interruptedCount={group.interruptedCount}
+          isExpanded={isExpanded}
+          isSelected={isGroupSelected}
+          onToggle={() => {
+            toggleTaskGroupExpansion(group.storageKey, isExpanded);
+          }}
+        />
+      );
 
-                                  // Wrap the header in the same connector rail used by agent
-                                  // rows so trunks continue through the group header.
-                                  renderedRows.push(
-                                    headerMeta != null ? (
-                                      <SubAgentListItem
-                                        key={`task-group:${group.storageKey}`}
-                                        connectorPosition={headerMeta.connectorPosition}
-                                        connectorStartsAtParent={headerMeta.connectorStartsAtParent}
-                                        sharedTrunkActiveThroughRow={
-                                          headerMeta.sharedTrunkActiveThroughRow
-                                        }
-                                        sharedTrunkActiveBelowRow={
-                                          headerMeta.sharedTrunkActiveBelowRow
-                                        }
-                                        ancestorTrunks={headerMeta.ancestorTrunks.map((trunk) => ({
-                                          left: getAncestorRailX(trunk.depth, "default"),
-                                          active: trunk.active,
-                                        }))}
-                                        connectorRailX={getSubAgentParentRailX(
-                                          headerDepth,
-                                          "default"
-                                        )}
-                                        childStatusCenterX={getSubAgentChildStatusCenterX(
-                                          headerDepth
-                                        )}
-                                        isSelected={isGroupSelected}
-                                        isElbowActive={group.runningCount > 0}
-                                      >
-                                        {headerRow}
-                                      </SubAgentListItem>
-                                    ) : (
-                                      <React.Fragment key={`task-group:${group.storageKey}`}>
-                                        {headerRow}
-                                      </React.Fragment>
-                                    )
-                                  );
+      // Wrap the header in the same connector rail used by agent
+      // rows so trunks continue through the group header.
+      renderedRows.push(
+        headerMeta != null ? (
+          <SubAgentListItem
+            key={`task-group:${group.storageKey}`}
+            connectorPosition={headerMeta.connectorPosition}
+            connectorStartsAtParent={headerMeta.connectorStartsAtParent}
+            sharedTrunkActiveThroughRow={headerMeta.sharedTrunkActiveThroughRow}
+            sharedTrunkActiveBelowRow={headerMeta.sharedTrunkActiveBelowRow}
+            ancestorTrunks={headerMeta.ancestorTrunks.map((trunk) => ({
+              left: getAncestorRailX(trunk.depth, "default"),
+              active: trunk.active,
+            }))}
+            connectorRailX={getSubAgentParentRailX(headerDepth, "default")}
+            childStatusCenterX={getSubAgentChildStatusCenterX(headerDepth)}
+            isSelected={isGroupSelected}
+            isElbowActive={group.runningCount > 0}
+          >
+            {headerRow}
+          </SubAgentListItem>
+        ) : (
+          <React.Fragment key={`task-group:${group.storageKey}`}>{headerRow}</React.Fragment>
+        )
+      );
 
-                                  if (isExpanded) {
-                                    for (const member of group.displayMembers) {
-                                      renderedRows.push(
-                                        renderWorkspace(
-                                          member,
-                                          sectionId,
-                                          memberMetaByWorkspaceId.get(member.id) ?? null,
-                                          getTaskGroupMemberDepth(headerDepth),
-                                          `task-group-member:${group.storageKey}:${member.id}`,
-                                          "task-group-member",
-                                          group.title
-                                        )
-                                      );
-                                    }
-                                  }
-                                }
+      if (isExpanded) {
+        for (const member of group.displayMembers) {
+          renderedRows.push(
+            renderWorkspace(
+              member,
+              sectionId,
+              memberMetaByWorkspaceId.get(member.id) ?? null,
+              getTaskGroupMemberDepth(headerDepth),
+              `task-group-member:${group.storageKey}:${member.id}`,
+              "task-group-member",
+              group.title
+            )
+          );
+        }
+      }
+    }
 
-                                return renderedRows;
-                              };
+    return renderedRows;
+  };
 
-                              const renderDraft = (
-                                draft: (typeof sortedDrafts)[number]
-                              ): React.ReactNode => {
-                                const sectionId = getDraftSectionId(draft);
-                                const promotedMetadata = activeDraftPromotions[draft.draftId];
+  const renderDraft = (draft: (typeof sortedDrafts)[number]): React.ReactNode => {
+    const sectionId = getDraftSectionId(draft);
+    const promotedMetadata = activeDraftPromotions[draft.draftId];
 
-                                if (promotedMetadata) {
-                                  const liveMetadata =
-                                    projectWorkspaces.find(
-                                      (workspace) => workspace.id === promotedMetadata.id
-                                    ) ?? promotedMetadata;
-                                  return renderWorkspace(liveMetadata, sectionId ?? undefined);
-                                }
+    if (promotedMetadata) {
+      const liveMetadata =
+        projectWorkspaces.find((workspace) => workspace.id === promotedMetadata.id) ??
+        promotedMetadata;
+      return renderWorkspace(liveMetadata, sectionId ?? undefined);
+    }
 
-                                const draftNumber = draftNumberById.get(draft.draftId) ?? 0;
-                                const isSelected =
-                                  pendingNewWorkspaceProject === projectPath &&
-                                  pendingNewWorkspaceDraftId === draft.draftId;
+    const draftNumber = draftNumberById.get(draft.draftId) ?? 0;
+    const isSelected =
+      pendingNewWorkspaceProject === projectPath && pendingNewWorkspaceDraftId === draft.draftId;
 
-                                return (
-                                  <DraftAgentListItemWrapper
-                                    key={draft.draftId}
-                                    projectPath={projectPath}
-                                    draftId={draft.draftId}
-                                    draftNumber={draftNumber}
-                                    isSelected={isSelected}
-                                    sectionId={sectionId ?? undefined}
-                                    onVisibilityChange={(isVisible) => {
-                                      handleDraftVisibilityChange(
-                                        projectPath,
-                                        draft.draftId,
-                                        isVisible
-                                      );
-                                    }}
-                                    onOpen={() =>
-                                      handleOpenWorkspaceDraft(projectPath, draft.draftId)
-                                    }
-                                    onDelete={() => {
-                                      if (isSelected) {
-                                        const currentIndex = sortedDrafts.findIndex(
-                                          (d) => d.draftId === draft.draftId
-                                        );
-                                        const fallback =
-                                          currentIndex >= 0
-                                            ? (sortedDrafts[currentIndex + 1] ??
-                                              sortedDrafts[currentIndex - 1])
-                                            : undefined;
+    return (
+      <DraftAgentListItemWrapper
+        key={draft.draftId}
+        projectPath={projectPath}
+        draftId={draft.draftId}
+        draftNumber={draftNumber}
+        isSelected={isSelected}
+        sectionId={sectionId ?? undefined}
+        onVisibilityChange={(isVisible) => {
+          handleDraftVisibilityChange(projectPath, draft.draftId, isVisible);
+        }}
+        onOpen={() => handleOpenWorkspaceDraft(projectPath, draft.draftId)}
+        onDelete={() => {
+          if (isSelected) {
+            const currentIndex = sortedDrafts.findIndex((d) => d.draftId === draft.draftId);
+            const fallback =
+              currentIndex >= 0
+                ? (sortedDrafts[currentIndex + 1] ?? sortedDrafts[currentIndex - 1])
+                : undefined;
 
-                                        if (fallback) {
-                                          openWorkspaceDraft(projectPath, fallback.draftId);
-                                        } else {
-                                          navigateToProject(sectionId ?? projectPath);
-                                        }
-                                      }
+            if (fallback) {
+              openWorkspaceDraft(projectPath, fallback.draftId);
+            } else {
+              navigateToProject(sectionId ?? projectPath);
+            }
+          }
 
-                                      deleteWorkspaceDraft(projectPath, draft.draftId);
-                                    }}
-                                  />
-                                );
-                              };
+          deleteWorkspaceDraft(projectPath, draft.draftId);
+        }}
+      />
+    );
+  };
 
-                              // Render age tiers for a list of workspaces
-                              const renderAgeTiers = (
-                                workspaces: FrontendWorkspaceMetadata[],
-                                tierKeyPrefix: string,
-                                sectionId?: string,
-                                allRowsForTaskGroupCoalescing: FrontendWorkspaceMetadata[] = workspaces
-                              ): React.ReactNode => {
-                                const { recent: topVisibleRows, buckets } =
-                                  partitionWorkspacesByAge(workspaces, workspaceRecency);
+  // Render age tiers for a list of workspaces
+  const renderAgeTiers = (
+    workspaces: FrontendWorkspaceMetadata[],
+    tierKeyPrefix: string,
+    sectionId?: string,
+    allRowsForTaskGroupCoalescing: FrontendWorkspaceMetadata[] = workspaces
+  ): React.ReactNode => {
+    const { recent: topVisibleRows, buckets } = partitionWorkspacesByAge(
+      workspaces,
+      workspaceRecency
+    );
 
-                                const expandedTierVisibleIds = new Set<string>();
-                                const markExpandedTierRowsVisible = (tierIndex: number): void => {
-                                  const bucket = buckets[tierIndex];
-                                  const remainingCount = buckets
-                                    .slice(tierIndex)
-                                    .reduce((sum, bucketRows) => sum + bucketRows.length, 0);
-                                  if (remainingCount === 0) {
-                                    return;
-                                  }
+    const expandedTierVisibleIds = new Set<string>();
+    const markExpandedTierRowsVisible = (tierIndex: number): void => {
+      const bucket = buckets[tierIndex];
+      const remainingCount = buckets
+        .slice(tierIndex)
+        .reduce((sum, bucketRows) => sum + bucketRows.length, 0);
+      if (remainingCount === 0) {
+        return;
+      }
 
-                                  const tierKey = `${tierKeyPrefix}:${tierIndex}`;
-                                  const isTierExpanded = expandedOldWorkspaces[tierKey] ?? false;
-                                  if (!isTierExpanded) {
-                                    return;
-                                  }
+      const tierKey = `${tierKeyPrefix}:${tierIndex}`;
+      const isTierExpanded = expandedOldWorkspaces[tierKey] ?? false;
+      if (!isTierExpanded) {
+        return;
+      }
 
-                                  for (const workspace of bucket) {
-                                    expandedTierVisibleIds.add(workspace.id);
-                                  }
+      for (const workspace of bucket) {
+        expandedTierVisibleIds.add(workspace.id);
+      }
 
-                                  const nextTier = findNextNonEmptyTier(buckets, tierIndex + 1);
-                                  if (nextTier !== -1) {
-                                    markExpandedTierRowsVisible(nextTier);
-                                  }
-                                };
+      const nextTier = findNextNonEmptyTier(buckets, tierIndex + 1);
+      if (nextTier !== -1) {
+        markExpandedTierRowsVisible(nextTier);
+      }
+    };
 
-                                const firstTier = findNextNonEmptyTier(buckets, 0);
-                                if (firstTier !== -1) {
-                                  markExpandedTierRowsVisible(firstTier);
-                                }
+    const firstTier = findNextNonEmptyTier(buckets, 0);
+    if (firstTier !== -1) {
+      markExpandedTierRowsVisible(firstTier);
+    }
 
-                                // Connector geometry should match the rows users can currently see,
-                                // not hidden siblings parked behind collapsed age tiers.
-                                const visibleRowIds = new Set<string>([
-                                  ...topVisibleRows.map((workspace) => workspace.id),
-                                  ...expandedTierVisibleIds,
-                                ]);
-                                const visibleRows = workspaces.filter((workspace) =>
-                                  visibleRowIds.has(workspace.id)
-                                );
-                                // Coalesce grouped task rows (variants/best-of + workflow runs)
-                                // before deriving connector geometry: headers join the row model
-                                // as synthetic nodes so trunks/elbows stay continuous (D5).
-                                const taskGroups = computeSidebarTaskGroups({
-                                  rows: visibleRows,
-                                  allRows: allRowsForTaskGroupCoalescing,
-                                  selectedWorkspaceId: selectedWorkspace?.workspaceId,
-                                  isWorkspaceLiveActive,
-                                });
+    // Connector geometry should match the rows users can currently see,
+    // not hidden siblings parked behind collapsed age tiers.
+    const visibleRowIds = new Set<string>([
+      ...topVisibleRows.map((workspace) => workspace.id),
+      ...expandedTierVisibleIds,
+    ]);
+    const visibleRows = workspaces.filter((workspace) => visibleRowIds.has(workspace.id));
+    // Coalesce grouped task rows (variants/best-of + workflow runs)
+    // before deriving connector geometry: headers join the row model
+    // as synthetic nodes so trunks/elbows stay continuous (D5).
+    const taskGroups = computeSidebarTaskGroups({
+      rows: visibleRows,
+      allRows: allRowsForTaskGroupCoalescing,
+      selectedWorkspaceId: selectedWorkspace?.workspaceId,
+      isWorkspaceLiveActive,
+    });
 
-                                const rowNodes: SidebarVisibleRowNode[] = [];
-                                const seenGroupKeys = new Set<string>();
-                                for (const workspace of visibleRows) {
-                                  const groupKey =
-                                    taskGroups.memberGroupStorageKeyByWorkspaceId.get(workspace.id);
-                                  const group =
-                                    groupKey != null
-                                      ? taskGroups.groupsByStorageKey.get(groupKey)
-                                      : undefined;
-                                  if (group != null) {
-                                    if (seenGroupKeys.has(group.storageKey)) {
-                                      continue;
-                                    }
-                                    seenGroupKeys.add(group.storageKey);
-                                    const headerDepth =
-                                      baseRowMetaByWorkspaceId.get(workspace.id)?.depth ??
-                                      depthByWorkspaceId[workspace.id] ??
-                                      0;
-                                    rowNodes.push({
-                                      id: group.storageKey,
-                                      parentId: group.parentWorkspaceId,
-                                      depth: headerDepth,
-                                      isRunning: group.runningCount > 0,
-                                      baseMeta: {
-                                        depth: headerDepth,
-                                        rowKind: "subagent",
-                                        connectorPosition: "single",
-                                        connectorStartsAtParent: false,
-                                        sharedTrunkActiveThroughRow: false,
-                                        sharedTrunkActiveBelowRow: false,
-                                        ancestorTrunks: [],
-                                        hasHiddenCompletedChildren: false,
-                                        visibleCompletedChildrenCount: 0,
-                                      },
-                                    });
-                                    continue;
-                                  }
+    const rowNodes: SidebarVisibleRowNode[] = [];
+    const seenGroupKeys = new Set<string>();
+    for (const workspace of visibleRows) {
+      const groupKey = taskGroups.memberGroupStorageKeyByWorkspaceId.get(workspace.id);
+      const group = groupKey != null ? taskGroups.groupsByStorageKey.get(groupKey) : undefined;
+      if (group != null) {
+        if (seenGroupKeys.has(group.storageKey)) {
+          continue;
+        }
+        seenGroupKeys.add(group.storageKey);
+        const headerDepth =
+          baseRowMetaByWorkspaceId.get(workspace.id)?.depth ??
+          depthByWorkspaceId[workspace.id] ??
+          0;
+        rowNodes.push({
+          id: group.storageKey,
+          parentId: group.parentWorkspaceId,
+          depth: headerDepth,
+          isRunning: group.runningCount > 0,
+          baseMeta: {
+            depth: headerDepth,
+            rowKind: "subagent",
+            connectorPosition: "single",
+            connectorStartsAtParent: false,
+            sharedTrunkActiveThroughRow: false,
+            sharedTrunkActiveBelowRow: false,
+            ancestorTrunks: [],
+            hasHiddenCompletedChildren: false,
+            visibleCompletedChildrenCount: 0,
+          },
+        });
+        continue;
+      }
 
-                                  const baseRowMeta = baseRowMetaByWorkspaceId.get(workspace.id);
-                                  if (!baseRowMeta) {
-                                    continue;
-                                  }
-                                  rowNodes.push({
-                                    id: workspace.id,
-                                    parentId: workspace.parentWorkspaceId,
-                                    depth: baseRowMeta.depth,
-                                    isRunning: isRunningOrStartingTaskStatus(workspace.taskStatus),
-                                    baseMeta: baseRowMeta,
-                                  });
-                                }
-                                const rowMetaByVisibleWorkspaceId =
-                                  computeRowMetaForVisibleNodes(rowNodes);
+      const baseRowMeta = baseRowMetaByWorkspaceId.get(workspace.id);
+      if (!baseRowMeta) {
+        continue;
+      }
+      rowNodes.push({
+        id: workspace.id,
+        parentId: workspace.parentWorkspaceId,
+        depth: baseRowMeta.depth,
+        isRunning: isRunningOrStartingTaskStatus(workspace.taskStatus),
+        baseMeta: baseRowMeta,
+      });
+    }
+    const rowMetaByVisibleWorkspaceId = computeRowMetaForVisibleNodes(rowNodes);
 
-                                // Expanded members hang off their header row, so their connector
-                                // meta derives from the header's computed geometry.
-                                const memberMetaByWorkspaceId = new Map<
-                                  string,
-                                  AgentRowRenderMeta
-                                >();
-                                for (const group of taskGroups.groupsByStorageKey.values()) {
-                                  const headerMeta = rowMetaByVisibleWorkspaceId.get(
-                                    group.storageKey
-                                  );
-                                  if (headerMeta == null) {
-                                    continue;
-                                  }
-                                  for (const [
-                                    memberId,
-                                    memberMeta,
-                                  ] of computeTaskGroupMemberRowMeta({
-                                    group,
-                                    headerMeta,
-                                    headerDepth: headerMeta.depth,
-                                  })) {
-                                    memberMetaByWorkspaceId.set(memberId, memberMeta);
-                                  }
-                                }
+    // Expanded members hang off their header row, so their connector
+    // meta derives from the header's computed geometry.
+    const memberMetaByWorkspaceId = new Map<string, AgentRowRenderMeta>();
+    for (const group of taskGroups.groupsByStorageKey.values()) {
+      const headerMeta = rowMetaByVisibleWorkspaceId.get(group.storageKey);
+      if (headerMeta == null) {
+        continue;
+      }
+      for (const [memberId, memberMeta] of computeTaskGroupMemberRowMeta({
+        group,
+        headerMeta,
+        headerDepth: headerMeta.depth,
+      })) {
+        memberMetaByWorkspaceId.set(memberId, memberMeta);
+      }
+    }
 
-                                const renderTier = (tierIndex: number): React.ReactNode => {
-                                  const bucket = buckets[tierIndex];
-                                  const remainingCount = buckets
-                                    .slice(tierIndex)
-                                    .reduce((sum, b) => sum + b.length, 0);
+    const renderTier = (tierIndex: number): React.ReactNode => {
+      const bucket = buckets[tierIndex];
+      const remainingCount = buckets.slice(tierIndex).reduce((sum, b) => sum + b.length, 0);
 
-                                  if (remainingCount === 0) return null;
+      if (remainingCount === 0) return null;
 
-                                  const tierKey = `${tierKeyPrefix}:${tierIndex}`;
-                                  const isTierExpanded = expandedOldWorkspaces[tierKey] ?? false;
-                                  const thresholdDays = AGE_THRESHOLDS_DAYS[tierIndex];
-                                  const thresholdLabel = formatDaysThreshold(thresholdDays);
-                                  const displayCount = isTierExpanded
-                                    ? bucket.length
-                                    : remainingCount;
+      const tierKey = `${tierKeyPrefix}:${tierIndex}`;
+      const isTierExpanded = expandedOldWorkspaces[tierKey] ?? false;
+      const thresholdDays = AGE_THRESHOLDS_DAYS[tierIndex];
+      const thresholdLabel = formatDaysThreshold(thresholdDays);
+      const displayCount = isTierExpanded ? bucket.length : remainingCount;
 
-                                  return (
-                                    <React.Fragment key={tierKey}>
-                                      <button
-                                        onClick={() => {
-                                          setExpandedOldWorkspaces((prev) => ({
-                                            ...prev,
-                                            [tierKey]: !prev[tierKey],
-                                          }));
-                                        }}
-                                        aria-label={
-                                          isTierExpanded
-                                            ? `Collapse workspaces older than ${thresholdLabel}`
-                                            : `Expand workspaces older than ${thresholdLabel}`
-                                        }
-                                        aria-expanded={isTierExpanded}
-                                        className="text-muted border-hover hover:text-label [&:hover_.arrow]:text-label flex w-full cursor-pointer items-center gap-1 border-t border-none bg-transparent px-3 py-2 pl-7 text-xs font-medium transition-all duration-150 hover:bg-white/3"
-                                      >
-                                        <span
-                                          className="arrow text-dim text-[11px] transition-transform duration-200 ease-in-out"
-                                          style={{
-                                            transform: isTierExpanded
-                                              ? "rotate(90deg)"
-                                              : "rotate(0deg)",
-                                          }}
-                                        >
-                                          <ChevronRight className="h-4 w-4" />
-                                        </span>
-                                        <div className="flex items-center gap-1.5">
-                                          <span>Older than {thresholdLabel}</span>
-                                          <span className="text-dim font-normal">
-                                            ({displayCount})
-                                          </span>
-                                        </div>
-                                      </button>
-                                      {isTierExpanded && (
-                                        <>
-                                          {renderWorkspaceRowsWithTaskGroupCoalescing({
-                                            rows: bucket,
-                                            sectionId,
-                                            rowMetaByWorkspaceId: rowMetaByVisibleWorkspaceId,
-                                            taskGroups,
-                                            memberMetaByWorkspaceId,
-                                          })}
-                                          {(() => {
-                                            const nextTier = findNextNonEmptyTier(
-                                              buckets,
-                                              tierIndex + 1
-                                            );
-                                            return nextTier !== -1 ? renderTier(nextTier) : null;
-                                          })()}
-                                        </>
-                                      )}
-                                    </React.Fragment>
-                                  );
-                                };
+      return (
+        <React.Fragment key={tierKey}>
+          <button
+            onClick={() => {
+              setExpandedOldWorkspaces((prev) => ({
+                ...prev,
+                [tierKey]: !prev[tierKey],
+              }));
+            }}
+            aria-label={
+              isTierExpanded
+                ? `Collapse workspaces older than ${thresholdLabel}`
+                : `Expand workspaces older than ${thresholdLabel}`
+            }
+            aria-expanded={isTierExpanded}
+            className="text-muted border-hover hover:text-label [&:hover_.arrow]:text-label flex w-full cursor-pointer items-center gap-1 border-t border-none bg-transparent px-3 py-2 pl-7 text-xs font-medium transition-all duration-150 hover:bg-white/3"
+          >
+            <span
+              className="arrow text-dim text-[11px] transition-transform duration-200 ease-in-out"
+              style={{
+                transform: isTierExpanded ? "rotate(90deg)" : "rotate(0deg)",
+              }}
+            >
+              <ChevronRight className="h-4 w-4" />
+            </span>
+            <div className="flex items-center gap-1.5">
+              <span>Older than {thresholdLabel}</span>
+              <span className="text-dim font-normal">({displayCount})</span>
+            </div>
+          </button>
+          {isTierExpanded && (
+            <>
+              {renderWorkspaceRowsWithTaskGroupCoalescing({
+                rows: bucket,
+                sectionId,
+                rowMetaByWorkspaceId: rowMetaByVisibleWorkspaceId,
+                taskGroups,
+                memberMetaByWorkspaceId,
+              })}
+              {(() => {
+                const nextTier = findNextNonEmptyTier(buckets, tierIndex + 1);
+                return nextTier !== -1 ? renderTier(nextTier) : null;
+              })()}
+            </>
+          )}
+        </React.Fragment>
+      );
+    };
 
-                                return (
-                                  <>
-                                    {renderWorkspaceRowsWithTaskGroupCoalescing({
-                                      rows: topVisibleRows,
-                                      sectionId,
-                                      rowMetaByWorkspaceId: rowMetaByVisibleWorkspaceId,
-                                      taskGroups,
-                                      memberMetaByWorkspaceId,
-                                    })}
-                                    {firstTier !== -1 && renderTier(firstTier)}
-                                  </>
-                                );
-                              };
+    return (
+      <>
+        {renderWorkspaceRowsWithTaskGroupCoalescing({
+          rows: topVisibleRows,
+          sectionId,
+          rowMetaByWorkspaceId: rowMetaByVisibleWorkspaceId,
+          taskGroups,
+          memberMetaByWorkspaceId,
+        })}
+        {firstTier !== -1 && renderTier(firstTier)}
+      </>
+    );
+  };
 
-                              // Partition both the full section membership and the filtered visible rows.
-                              // Best-of grouping stays leaf-only by consulting the unfiltered section data,
-                              // while actual rendering still follows the visible hierarchy.
-                              const {
-                                unsectioned: allUnsectionedForNormalRendering,
-                                bySectionId: allBySectionIdForNormalRendering,
-                              } = partitionWorkspacesBySection(
-                                workspacesForNormalRendering,
-                                sections
-                              );
-                              const { unsectioned, bySectionId } = partitionWorkspacesBySection(
-                                visibleWorkspacesForNormalRendering,
-                                sections
-                              );
+  // Partition both the full section membership and the filtered visible rows.
+  // Best-of grouping stays leaf-only by consulting the unfiltered section data,
+  // while actual rendering still follows the visible hierarchy.
+  const {
+    unsectioned: allUnsectionedForNormalRendering,
+    bySectionId: allBySectionIdForNormalRendering,
+  } = partitionWorkspacesBySection(workspacesForNormalRendering, sections);
+  const { unsectioned, bySectionId } = partitionWorkspacesBySection(
+    visibleWorkspacesForNormalRendering,
+    sections
+  );
 
-                              // Handle workspace drop into section
-                              const handleWorkspaceSectionDrop = (
-                                workspaceId: string,
-                                targetSectionId: string | null
-                              ) => {
-                                void (async () => {
-                                  const result = await assignWorkspaceToSubProject(
-                                    projectPath,
-                                    workspaceId,
-                                    targetSectionId
-                                  );
-                                  if (result.success) {
-                                    // Refresh workspace metadata so UI shows updated sectionId
-                                    await refreshWorkspaceMetadata();
-                                  }
-                                })();
-                              };
+  // Handle workspace drop into section
+  const handleWorkspaceSectionDrop = (workspaceId: string, targetSectionId: string | null) => {
+    void (async () => {
+      const result = await assignWorkspaceToSubProject(projectPath, workspaceId, targetSectionId);
+      if (result.success) {
+        // Refresh workspace metadata so UI shows updated sectionId
+        await refreshWorkspaceMetadata();
+      }
+    })();
+  };
 
-                              // Render section with its workspaces
-                              const renderSection = (section: SectionConfig) => {
-                                const sectionWorkspaces = bySectionId.get(section.id) ?? [];
-                                const sectionAllWorkspaces =
-                                  allBySectionIdForNormalRendering.get(section.id) ?? [];
-                                const sectionDrafts = draftsBySectionId.get(section.id) ?? [];
-                                const sectionHasPromotedAttention = sectionDrafts.some((draft) => {
-                                  const promotedMetadata = activeDraftPromotions[draft.draftId];
-                                  return promotedMetadata
-                                    ? checkWorkspaceHasAttention(
-                                        promotedMetadata.id,
-                                        workspaceStore,
-                                        workspaceRecency,
-                                        selectedWorkspace?.workspaceId,
-                                        archivingWorkspaceIds
-                                      ) ||
-                                      (delegatedActivityByWorkspaceId.get(promotedMetadata.id)?.activeCount ?? 0) > 0
-                                    : false;
-                                });
-                                const sectionHasAttention =
-                                  sectionAllWorkspaces.some(
-                                    (workspace) =>
-                                      checkWorkspaceHasAttention(
-                                        workspace.id,
-                                        workspaceStore,
-                                        workspaceRecency,
-                                        selectedWorkspace?.workspaceId,
-                                        archivingWorkspaceIds
-                                      ) ||
-                                      (delegatedActivityByWorkspaceId.get(workspace.id)?.activeCount ?? 0) > 0
-                                  ) || sectionHasPromotedAttention;
+  // Render section with its workspaces
+  const renderSection = (section: SectionConfig) => {
+    const sectionWorkspaces = bySectionId.get(section.id) ?? [];
+    const sectionAllWorkspaces = allBySectionIdForNormalRendering.get(section.id) ?? [];
+    const sectionDrafts = draftsBySectionId.get(section.id) ?? [];
+    const sectionHasPromotedAttention = sectionDrafts.some((draft) => {
+      const promotedMetadata = activeDraftPromotions[draft.draftId];
+      return promotedMetadata
+        ? checkWorkspaceHasAttention(
+            promotedMetadata.id,
+            workspaceStore,
+            workspaceRecency,
+            selectedWorkspace?.workspaceId,
+            archivingWorkspaceIds
+          ) || (delegatedActivityByWorkspaceId.get(promotedMetadata.id)?.activeCount ?? 0) > 0
+        : false;
+    });
+    const sectionHasAttention =
+      sectionAllWorkspaces.some(
+        (workspace) =>
+          checkWorkspaceHasAttention(
+            workspace.id,
+            workspaceStore,
+            workspaceRecency,
+            selectedWorkspace?.workspaceId,
+            archivingWorkspaceIds
+          ) || (delegatedActivityByWorkspaceId.get(workspace.id)?.activeCount ?? 0) > 0
+      ) || sectionHasPromotedAttention;
 
-                                const sectionExpandedKey = getSectionExpandedKey(
-                                  projectPath,
-                                  section.id
-                                );
-                                const isSectionExpanded =
-                                  expandedSections[sectionExpandedKey] ?? true;
-                                const shouldAutoEditSection =
-                                  autoEditingSection?.projectPath === projectPath &&
-                                  autoEditingSection?.sectionId === section.id;
+    const sectionExpandedKey = getSectionExpandedKey(projectPath, section.id);
+    const isSectionExpanded = expandedSections[sectionExpandedKey] ?? true;
+    const shouldAutoEditSection =
+      autoEditingSection?.projectPath === projectPath &&
+      autoEditingSection?.sectionId === section.id;
 
-                                return (
-                                  <WorkspaceSectionDropZone
-                                    key={section.id}
-                                    projectPath={projectPath}
-                                    sectionId={section.id}
-                                    onDrop={handleWorkspaceSectionDrop}
-                                  >
-                                    <SectionHeader
-                                      section={section}
-                                      isExpanded={isSectionExpanded}
-                                      workspaceCount={
-                                        sectionWorkspaces.length + sectionDrafts.length
-                                      }
-                                      hasAttention={sectionHasAttention}
-                                      onToggleExpand={() => toggleSection(projectPath, section.id)}
-                                      onAddWorkspace={() => {
-                                        // Create workspace in this section
-                                        handleAddWorkspace(projectPath, section.id);
-                                      }}
-                                      onRename={(name) => {
-                                        if (shouldAutoEditSection) {
-                                          setAutoEditingSection(null);
-                                        }
-                                        void updateDisplayName(section.id, name);
-                                      }}
-                                      onChangeColor={(color) => {
-                                        void updateProjectColor(section.id, color);
-                                      }}
-                                      autoStartEditing={shouldAutoEditSection}
-                                      onAutoCreateAbandon={
-                                        shouldAutoEditSection
-                                          ? () => {
-                                              void (async () => {
-                                                setAutoEditingSection(null);
-                                                await handleRemoveSection(projectPath, section.id);
-                                              })();
-                                            }
-                                          : undefined
-                                      }
-                                      onAutoCreateRenameCancel={
-                                        shouldAutoEditSection
-                                          ? () => {
-                                              setAutoEditingSection(null);
-                                            }
-                                          : undefined
-                                      }
-                                      onDelete={(anchorEl) => {
-                                        void handleRemoveSection(projectPath, section.id, anchorEl);
-                                      }}
-                                    />
-                                    {isSectionExpanded && (
-                                      <div className="pb-1">
-                                        {sectionDrafts.map((draft) => renderDraft(draft))}
-                                        {sectionWorkspaces.length > 0 ? (
-                                          renderAgeTiers(
-                                            sectionWorkspaces,
-                                            getSectionTierKey(projectPath, section.id, 0).replace(
-                                              ":tier:0",
-                                              ":tier"
-                                            ),
-                                            section.id,
-                                            sectionAllWorkspaces
-                                          )
-                                        ) : sectionDrafts.length === 0 ? (
-                                          <div className="text-muted px-3 py-2 text-center text-xs italic">
-                                            No chats in this sub-project
-                                          </div>
-                                        ) : null}
-                                      </div>
-                                    )}
-                                  </WorkspaceSectionDropZone>
-                                );
-                              };
+    return (
+      <WorkspaceSectionDropZone
+        key={section.id}
+        projectPath={projectPath}
+        sectionId={section.id}
+        onDrop={handleWorkspaceSectionDrop}
+      >
+        <SectionHeader
+          section={section}
+          isExpanded={isSectionExpanded}
+          workspaceCount={sectionWorkspaces.length + sectionDrafts.length}
+          hasAttention={sectionHasAttention}
+          onToggleExpand={() => toggleSection(projectPath, section.id)}
+          onAddWorkspace={() => {
+            // Create workspace in this section
+            handleAddWorkspace(projectPath, section.id);
+          }}
+          onRename={(name) => {
+            if (shouldAutoEditSection) {
+              setAutoEditingSection(null);
+            }
+            void updateDisplayName(section.id, name);
+          }}
+          onChangeColor={(color) => {
+            void updateProjectColor(section.id, color);
+          }}
+          autoStartEditing={shouldAutoEditSection}
+          onAutoCreateAbandon={
+            shouldAutoEditSection
+              ? () => {
+                  void (async () => {
+                    setAutoEditingSection(null);
+                    await handleRemoveSection(projectPath, section.id);
+                  })();
+                }
+              : undefined
+          }
+          onAutoCreateRenameCancel={
+            shouldAutoEditSection
+              ? () => {
+                  setAutoEditingSection(null);
+                }
+              : undefined
+          }
+          onDelete={(anchorEl) => {
+            void handleRemoveSection(projectPath, section.id, anchorEl);
+          }}
+        />
+        {isSectionExpanded && (
+          <div className="pb-1">
+            {sectionDrafts.map((draft) => renderDraft(draft))}
+            {sectionWorkspaces.length > 0 ? (
+              renderAgeTiers(
+                sectionWorkspaces,
+                getSectionTierKey(projectPath, section.id, 0).replace(":tier:0", ":tier"),
+                section.id,
+                sectionAllWorkspaces
+              )
+            ) : sectionDrafts.length === 0 ? (
+              <div className="text-muted px-3 py-2 text-center text-xs italic">
+                No chats in this sub-project
+              </div>
+            ) : null}
+          </div>
+        )}
+      </WorkspaceSectionDropZone>
+    );
+  };
 
-                              return (
-                                <>
-                                  {projectHasNoAgentsOrDrafts && (
-                                    <div className="text-content-disabled py-2 pl-12 text-xs">
-                                      Empty
-                                    </div>
-                                  )}
-                                  {/* Unsectioned workspaces first - always show drop zone when sections exist */}
-                                  {sections.length > 0 ? (
-                                    <WorkspaceSectionDropZone
-                                      projectPath={projectPath}
-                                      sectionId={null}
-                                      onDrop={handleWorkspaceSectionDrop}
-                                      testId="unsectioned-drop-zone"
-                                    >
-                                      {unsectionedDrafts.map((draft) => renderDraft(draft))}
-                                      {unsectioned.length > 0 ? (
-                                        renderAgeTiers(
-                                          unsectioned,
-                                          getTierKey(projectPath, 0).replace(":0", ""),
-                                          undefined,
-                                          allUnsectionedForNormalRendering
-                                        )
-                                      ) : unsectionedDrafts.length === 0 ? (
-                                        <div className="text-muted px-3 py-2 text-center text-xs italic">
-                                          No unsectioned chats
-                                        </div>
-                                      ) : null}
-                                    </WorkspaceSectionDropZone>
-                                  ) : (
-                                    <>
-                                      {unsectionedDrafts.map((draft) => renderDraft(draft))}
-                                      {unsectioned.length > 0 &&
-                                        renderAgeTiers(
-                                          unsectioned,
-                                          getTierKey(projectPath, 0).replace(":0", ""),
-                                          undefined,
-                                          allUnsectionedForNormalRendering
-                                        )}
-                                    </>
-                                  )}
+  return (
+    <>
+      {projectHasNoAgentsOrDrafts && (
+        <div className="text-content-disabled py-2 pl-12 text-xs">Empty</div>
+      )}
+      {/* Unsectioned workspaces first - always show drop zone when sections exist */}
+      {sections.length > 0 ? (
+        <WorkspaceSectionDropZone
+          projectPath={projectPath}
+          sectionId={null}
+          onDrop={handleWorkspaceSectionDrop}
+          testId="unsectioned-drop-zone"
+        >
+          {unsectionedDrafts.map((draft) => renderDraft(draft))}
+          {unsectioned.length > 0 ? (
+            renderAgeTiers(
+              unsectioned,
+              getTierKey(projectPath, 0).replace(":0", ""),
+              undefined,
+              allUnsectionedForNormalRendering
+            )
+          ) : unsectionedDrafts.length === 0 ? (
+            <div className="text-muted px-3 py-2 text-center text-xs italic">
+              No unsectioned chats
+            </div>
+          ) : null}
+        </WorkspaceSectionDropZone>
+      ) : (
+        <>
+          {unsectionedDrafts.map((draft) => renderDraft(draft))}
+          {unsectioned.length > 0 &&
+            renderAgeTiers(
+              unsectioned,
+              getTierKey(projectPath, 0).replace(":0", ""),
+              undefined,
+              allUnsectionedForNormalRendering
+            )}
+        </>
+      )}
 
-                                  {/* Sections */}
-                                  {sections.map(renderSection)}
-                                </>
-                              );
+      {/* Sections */}
+      {sections.map(renderSection)}
+    </>
+  );
 };
 
 const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({

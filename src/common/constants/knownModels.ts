@@ -47,8 +47,24 @@ const MODEL_DEFINITIONS = {
     providerModelId: "claude-fable-5",
     aliases: ["fable"],
     warm: true,
-    // Fable tokenizer not published upstream; reuse Opus 4.5 (Claude tokenization is
-    // unchanged across the 4.x / Mythos line) for approximate counting.
+    // Fable/Mythos use the newer Opus 4.7+ tokenizer, which isn't published upstream;
+    // reuse Opus 4.5 (the newest Anthropic tokenizer in ai-tokenizer) for approximate
+    // counting. Anthropic says the newer tokenizer produces ~30% more tokens for the
+    // same text, so real usage can run ~1.0-1.3x higher than this estimate.
+    tokenizerOverride: "anthropic/claude-opus-4.5",
+  },
+  // Claude Mythos 5 - released June 9, 2026 alongside Fable 5. Same underlying model,
+  // specs, and pricing as Fable 5 ($10/M input, $50/M output) but with safeguards lifted
+  // in some areas. Limited availability: restricted to approved Project Glasswing /
+  // trusted-access customers (no self-serve sign-up). API id `claude-mythos-5`.
+  // Not warmed: most users cannot access it, and its tokenizer override is already
+  // warmed via FABLE.
+  MYTHOS: {
+    provider: "anthropic",
+    providerModelId: "claude-mythos-5",
+    aliases: ["mythos"],
+    // Same tokenizer situation as Fable 5 (see FABLE above): reuse Opus 4.5 for
+    // approximate counting; real usage can run ~1.0-1.3x higher.
     tokenizerOverride: "anthropic/claude-opus-4.5",
   },
   OPUS: {
@@ -80,12 +96,34 @@ const MODEL_DEFINITIONS = {
     aliases: ["haiku"],
     tokenizerOverride: "anthropic/claude-3.5-haiku",
   },
-  // GPT alias tracks the latest stable GPT-5 tier.
+  // GPT-5.6 Sol - flagship tier of the GPT-5.6 family, released July 9, 2026.
+  // Sol/Terra/Luna are durable capability tiers; the bare `gpt` alias tracks the
+  // latest flagship GPT tier (previously gpt-5.5, which stays usable as the
+  // custom model string `openai:gpt-5.5`). $5/M input, $30/M output; 1M context
+  // (launch value). Native "max" reasoning effort is available across the GPT-5.6 family.
   GPT: {
     provider: "openai",
-    providerModelId: "gpt-5.5",
-    aliases: ["gpt", "gpt-5.5"],
+    providerModelId: "gpt-5.6-sol",
+    aliases: ["gpt", "sol"],
     warm: true,
+    // GPT-5.6 tokenizer not published upstream; reuse gpt-5 for approximate
+    // counting (same approach as gpt-5.5).
+    tokenizerOverride: "openai/gpt-5",
+  },
+  // GPT-5.6 Terra - balanced everyday tier, released July 9, 2026.
+  // GPT-5.5-class quality at half the cost: $2.50/M input, $15/M output; 1.05M context.
+  GPT_56_TERRA: {
+    provider: "openai",
+    providerModelId: "gpt-5.6-terra",
+    aliases: ["terra"],
+    tokenizerOverride: "openai/gpt-5",
+  },
+  // GPT-5.6 Luna - fastest, most cost-efficient tier, released July 9, 2026.
+  // $1/M input, $6/M output; 1.05M context (GA model page; 400K was a stale launch value).
+  GPT_56_LUNA: {
+    provider: "openai",
+    providerModelId: "gpt-5.6-luna",
+    aliases: ["luna"],
     tokenizerOverride: "openai/gpt-5",
   },
   // GPT Pro alias tracks the latest GPT-5 Pro tier.

@@ -64,6 +64,8 @@ import {
   HEARTBEAT_CONTEXT_MODE_VALUES,
   HEARTBEAT_MAX_INTERVAL_MS,
   HEARTBEAT_MIN_INTERVAL_MS,
+  HEARTBEAT_TRIGGER_VALUES,
+  HEARTBEAT_WHEN_BUSY_VALUES,
 } from "@/constants/heartbeat";
 
 // -----------------------------------------------------------------------------
@@ -203,6 +205,18 @@ export const HeartbeatToolArgsSchema = z
       .nullish()
       .describe(
         'set: context preparation for heartbeat turns: "normal" uses current context, "compact" compacts first, and "reset" appends a reset boundary first. Omit to preserve the current mode.'
+      ),
+    trigger: z
+      .enum(HEARTBEAT_TRIGGER_VALUES)
+      .nullish()
+      .describe(
+        'set: countdown anchoring: "idle" resets on workspace activity (fires only after a full quiet interval), "interval" fires on a fixed wall-clock cadence regardless of activity. Omit to preserve the current value; unset resolves to "idle" at read time.'
+      ),
+    whenBusy: z
+      .enum(HEARTBEAT_WHEN_BUSY_VALUES)
+      .nullish()
+      .describe(
+        'set: behavior when a heartbeat fires while the workspace is busy: "skip" misses the slot, "tool-end" queues the heartbeat into the current turn at the next tool boundary, "turn-end" queues it as its own turn after the current one. Omit to preserve the current value; unset resolves at read time to "skip" for trigger "idle" and "turn-end" for trigger "interval".'
       ),
   })
   .strict();
@@ -1194,7 +1208,7 @@ export const WorkflowRunToolArgsSchema = z
       .min(1)
       .nullish()
       .describe(
-        "Inline JavaScript workflow source for compact one-off conductors. The exact source is snapshotted into the durable run for replay/resume."
+        "Inline JavaScript workflow source for one-off conductors, including prose-described processes codified in place. The exact source is snapshotted into the durable run for replay/resume."
       ),
     args: z.unknown().nullish(),
     run_in_background: z
@@ -1659,9 +1673,9 @@ export const TOOL_DEFINITIONS = {
   },
   attach_file: {
     description:
-      "Attach a supported file from the filesystem so later model steps receive it as a real attachment instead of a huge base64 JSON blob. " +
-      "Accepts absolute or relative paths, including files outside the workspace. " +
-      "Currently supports raster images, SVG, and PDF as model attachments. Markdown files are shown to the user for preview/download only. Unsupported file types are shown to the user in chat when possible, but only a notice is sent to the model.",
+      "Attach a file from the filesystem so later model steps receive it as a real attachment instead of a huge base64 JSON blob. " +
+      "Accepts absolute or relative paths, including files outside the workspace. Accepts any file type. " +
+      "Raster images, SVG, and PDF are sent to the model as real attachments. Every other file type (text, source, diffs, logs, video, audio, archives, etc.) is shown to the user in chat for preview/download, but its contents are NOT sent to the model — you only receive a notice. Use file_read when you need to read a text file's contents yourself.",
     schema: z.preprocess(
       normalizeFilePath,
       z
@@ -2143,7 +2157,9 @@ export const TOOL_DEFINITIONS = {
     // Prefer foreground workflows so callers do not waste a turn polling when no other work can proceed.
     description:
       "Start a durable workflow run from exactly one launch source: script_path for a JavaScript file/skill workflow, or script_source for compact one-off inline workflow source. Workflows coordinate delegated agent tasks and preserve run state for replay/resume. " +
-      "Prefer script_path for reusable, reviewable, shared, slash/CLI-invokable, or skill-packaged workflows; use script_source only for small one-off conductors whose exact source should be snapshotted into the durable run. " +
+      "Prefer script_path for reusable, reviewable, shared, slash/CLI-invokable, or skill-packaged workflows; use script_source for one-off conductors whose exact source should be snapshotted into the durable run. " +
+      "When a skill, instruction block, or plan describes a multi-phase, looping, or multi-agent process in prose and ships no packaged workflow script, prefer codifying that process as a one-off script_source workflow over executing every phase in-context: " +
+      "the conductor follows the documented phases more faithfully and gains durable checkpoints, resume, and fresh delegated context per phase. " +
       "Use agent_skill_read / agent_skill_read_file to discover and inspect skill-packaged workflows; non-skill workflow files must be addressed by an explicit known path and can be inspected with normal file tools. " +
       "Prefer the default foreground mode (`run_in_background` omitted or false) so completed workflows return their result without an extra task_await round-trip. " +
       "If workflow_run returns status=running or status=backgrounded, await the returned runId with task_await before using or reporting the workflow output. " +
@@ -2248,7 +2264,10 @@ export const TOOL_DEFINITIONS = {
     description:
       "Read or change this workspace's scheduled heartbeat. " +
       "The tool only affects the current workspace; it does not accept a workspaceId. " +
-      "Use action='set' to enable or configure the heartbeat interval, custom message, context mode, or enabled flag. " +
+      "Use action='set' to enable or configure the heartbeat interval, custom message, context mode, trigger, when-busy behavior, or enabled flag. " +
+      "trigger chooses the countdown anchor: 'idle' (default) fires only after the workspace has been quiet for a full interval; 'interval' fires on a fixed wall-clock cadence. " +
+      "whenBusy chooses what happens when a heartbeat fires while the workspace is busy: 'skip' misses the slot, 'tool-end'/'turn-end' queue the heartbeat for the matching boundary. " +
+      "Unset whenBusy defaults to 'skip' for trigger 'idle' and 'turn-end' for trigger 'interval'. " +
       "Use action='unset' to remove this workspace's heartbeat settings entirely. " +
       "Use action='get' before changing settings when you need to preserve existing values.",
     schema: HeartbeatToolArgsSchema,
@@ -2516,6 +2535,30 @@ CREATE TABLE IF NOT EXISTS delegation_rollups (
       .strict(),
   },
   // #endregion NOTIFY_DOCS
+  tool_catalog_search: {
+    description:
+      "Search the catalog of deferred tools. Some tools (provided by MCP servers) are deferred: " +
+      "they exist but are not currently visible in your tool list. " +
+      "Call tool_catalog_search with task/capability keywords to discover them; matched tools become available on the next step. " +
+      "Returns matched tool names and descriptions plus the total number of deferred tools (there may be more undiscovered — refine the query to find them).",
+    schema: z
+      .object({
+        query: z
+          .string()
+          .min(1)
+          .describe(
+            "Task or capability keywords to search for (matched against tool names, descriptions, and parameter names)"
+          ),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(25)
+          .nullish()
+          .describe("Maximum number of matches to return (default 10, max 25)"),
+      })
+      .strict(),
+  },
 } as const;
 
 // -----------------------------------------------------------------------------
@@ -3071,6 +3114,8 @@ export function getAvailableTools(
     enableDynamicWorkflows?: boolean;
     /** Whether the agent memory tool is available (memory experiment enabled). */
     enableMemory?: boolean;
+    /** Whether tool_catalog_search is available (tool-search experiment + deferred MCP tools present). */
+    enableToolSearch?: boolean;
     /**
      * Whether the code_outline tool is available (ast-grep-outline experiment
      * enabled). On by default; off => no tool or context cost. The tool is read-only and
@@ -3095,6 +3140,7 @@ export function getAvailableTools(
   const enableDynamicWorkflows = options?.enableDynamicWorkflows ?? false;
   const enableMemory = options?.enableMemory ?? false;
   const enableAstGrepOutline = options?.enableAstGrepOutline ?? true;
+  const enableToolSearch = options?.enableToolSearch ?? false;
   const enableReviewPane = options?.enableReviewPane ?? true;
 
   // Base tools available for all models
@@ -3127,6 +3173,7 @@ export function getAvailableTools(
     ...(enableMemory ? ["memory"] : []),
     ...(enableAstGrepOutline ? ["code_outline"] : []),
     ...(enableAdvisor ? ["advisor"] : []),
+    ...(enableToolSearch ? ["tool_catalog_search"] : []),
     "ask_user_question",
     "propose_plan",
     "bash",

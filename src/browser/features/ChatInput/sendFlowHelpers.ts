@@ -6,6 +6,7 @@ import type {
   ReviewNoteDataForDisplay,
 } from "@/common/types/message";
 import type { ParsedCommand } from "@/browser/utils/slashCommands/types";
+import type { ThinkingLevel } from "@/common/types/thinking";
 import type { RouterClient } from "@orpc/server";
 import type { AppRouter } from "@/node/orpc/router";
 import {
@@ -40,7 +41,7 @@ export interface WorkspaceSendOptionsInput {
   sendMessageOptions: SendMessageOptions;
   compactionOptions: Partial<SendMessageOptions>;
   modelOverride: string | undefined;
-  thinkingOverride: string | undefined;
+  thinkingOverride: ThinkingLevel | undefined;
   isModelOneShot: boolean;
   goalInterventionPolicy: SendMessageOptions["goalInterventionPolicy"];
   queueDispatchMode: SendMessageOptions["queueDispatchMode"] | undefined;
@@ -164,7 +165,7 @@ export function regenerateCompactionEditMessage(input: {
     existingMetadata,
   } = input;
 
-  if (!parsed || parsed.type !== "compact") {
+  if (parsed?.type !== "compact") {
     return {
       actualMessageText: messageText,
       muxMetadata: existingMetadata,
@@ -196,12 +197,13 @@ export function regenerateCompactionEditMessage(input: {
     sendMessageOptions,
   });
 
-  return {
+  const options: CompactionRegenResult = {
     actualMessageText: regeneratedText,
     muxMetadata: metadata,
     compactionOptions: sendOptions,
     appendStagedNoticeToUserMessage: false,
   };
+  return options;
 }
 
 /**
@@ -226,7 +228,7 @@ export function assembleWorkspaceSendOptions(input: WorkspaceSendOptionsInput): 
     muxMetadata,
   } = input;
 
-  return {
+  const options: SendMessageOptions & { fileParts?: FilePart[] } = {
     ...sendMessageOptions,
     ...compactionOptions,
     ...(modelOverride ? { model: modelOverride } : {}),
@@ -244,10 +246,9 @@ export function assembleWorkspaceSendOptions(input: WorkspaceSendOptionsInput): 
     additionalSystemInstructions,
     editMessageId,
     muxMetadata,
-    // fileParts is accepted by the sendMessage endpoint but not in the
-    // zod-inferred SendMessageOptions type. Spread to avoid type error.
     ...(fileParts ? { fileParts } : {}),
-  } as SendMessageOptions;
+  };
+  return options;
 }
 
 /**

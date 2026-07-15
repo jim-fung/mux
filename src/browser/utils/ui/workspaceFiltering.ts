@@ -2,6 +2,7 @@ import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { ProjectConfig } from "@/common/types/project";
 import { hasCompletedAgentReport } from "@/common/utils/agentTaskCompletion";
 import { assert } from "@/common/utils/assert";
+import { comparePinnedOrder, isWorkspacePinned } from "@/common/utils/pin";
 
 interface WorkspaceGroupConfig {
   id: string;
@@ -598,6 +599,47 @@ export const AGE_THRESHOLDS_DAYS = [1, 7, 30] as const;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 /**
+ * Parse an optional ISO timestamp string to epoch milliseconds, treating missing
+ * or unparseable values as 0. Used as a sort key so absent/malformed timestamps
+ * deterministically sort last (oldest) instead of leaking NaN into comparisons.
+ */
+function parseTimestampMs(value: string | undefined): number {
+  const parsed = Date.parse(value ?? "");
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+/**
+ * Ascending lexicographic comparison for use as an Array.sort tie-breaker,
+ * returning the standard -1 / 0 / 1 so equal values fall through to the next
+ * tie-breaker instead of short-circuiting the sort.
+ */
+function compareStringsAsc(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/**
+ * Pinned rows float above unpinned ones in stable pin order (pinnedAt asc: new
+ * pins append at the bottom of the pinned block); recency is intentionally
+ * ignored for pinned rows so activity never reshuffles them. Returns the pinned
+ * placement delta, or null when both rows share the same pinned status so the
+ * caller can fall through to its own tie-breakers (recency, stable order, ...).
+ */
+function comparePinnedPlacement(
+  a: FrontendWorkspaceMetadata,
+  b: FrontendWorkspaceMetadata
+): number | null {
+  const aPinned = isWorkspacePinned(a);
+  const bPinned = isWorkspacePinned(b);
+  if (aPinned !== bPinned) {
+    return aPinned ? -1 : 1;
+  }
+  if (aPinned && bPinned) {
+    return comparePinnedOrder(a, b);
+  }
+  return null;
+}
+
+/**
  * Build a map of project paths to sorted workspace metadata lists.
  * Includes both persisted workspaces (from config) and workspaces from
  * metadata that haven't yet appeared in config (handles race condition
@@ -642,29 +684,29 @@ export function buildSortedWorkspacesByProject(
   // flip ordering when multiple workspaces have equal recency.
   for (const metadataList of result.values()) {
     metadataList.sort((a, b) => {
+      const pinnedPlacement = comparePinnedPlacement(a, b);
+      if (pinnedPlacement !== null) {
+        return pinnedPlacement;
+      }
+
       const aTimestamp = workspaceRecency[a.id] ?? 0;
       const bTimestamp = workspaceRecency[b.id] ?? 0;
       if (aTimestamp !== bTimestamp) {
         return bTimestamp - aTimestamp;
       }
 
-      const aCreatedAtRaw = Date.parse(a.createdAt ?? "");
-      const bCreatedAtRaw = Date.parse(b.createdAt ?? "");
-      const aCreatedAt = Number.isFinite(aCreatedAtRaw) ? aCreatedAtRaw : 0;
-      const bCreatedAt = Number.isFinite(bCreatedAtRaw) ? bCreatedAtRaw : 0;
+      const aCreatedAt = parseTimestampMs(a.createdAt);
+      const bCreatedAt = parseTimestampMs(b.createdAt);
       if (aCreatedAt !== bCreatedAt) {
         return bCreatedAt - aCreatedAt;
       }
 
-      if (a.name !== b.name) {
-        return a.name < b.name ? -1 : 1;
+      const nameOrder = compareStringsAsc(a.name, b.name);
+      if (nameOrder !== 0) {
+        return nameOrder;
       }
 
-      if (a.id !== b.id) {
-        return a.id < b.id ? -1 : 1;
-      }
-
-      return 0;
+      return compareStringsAsc(a.id, b.id);
     });
   }
 
@@ -674,6 +716,27 @@ export function buildSortedWorkspacesByProject(
   }
 
   return result;
+}
+
+/**
+ * Order rows for the flat Multi-Project section. The rows are collected across
+ * per-primary-project buckets of the sorted map, so without this pass two
+ * pinned multi-project chats with different primary projects would render in
+ * bucket order and a cross-primary pinned reorder would visually snap back.
+ * Pinned roots float to the top in global pinnedAt order (matching every other
+ * pinned block); unpinned rows keep their collected relative order (stable
+ * sort), and the tree flatten restores sub-agent adjacency under parents.
+ *
+ * Shared by the sidebar renderer and pinned-reorder block resolution so drag
+ * targets always match what is on screen.
+ */
+export function orderMultiProjectSectionRows(
+  rows: FrontendWorkspaceMetadata[]
+): FrontendWorkspaceMetadata[] {
+  // Unpinned rows keep their collected relative order (comparePinnedPlacement
+  // returns null -> 0, and Array.sort is stable).
+  const sorted = rows.slice().sort((a, b) => comparePinnedPlacement(a, b) ?? 0);
+  return flattenWorkspaceTree(sorted);
 }
 
 /**
@@ -746,6 +809,12 @@ export function partitionWorkspacesByAge(
   const visiting = new Set<string>();
 
   const classifyByOwnRecency = (workspace: FrontendWorkspaceMetadata): number => {
+    // Pinned chats never age out into the collapsed "Older than N days" buckets;
+    // children inherit this tier via resolveTierIndex so the whole subtree stays visible.
+    if (isWorkspacePinned(workspace)) {
+      return -1;
+    }
+
     const recencyTimestamp = workspaceRecency[workspace.id] ?? 0;
     const age = now - recencyTimestamp;
 

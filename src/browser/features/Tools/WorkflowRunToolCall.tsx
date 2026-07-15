@@ -79,6 +79,8 @@ interface WorkflowRunToolCallProps {
   workspaceId?: string;
   toolCallId?: string;
   startedAt?: number;
+  /** When the model emitted the call; freshness fallback when startedAt is unknown. */
+  toolCallTimestamp?: number;
   /** Which tool rendered this card; controls the header icon. */
   toolName?: "workflow_run" | "workflow_resume";
   /**
@@ -368,6 +370,8 @@ function getWorkflowEventLabel(event: WorkflowRunEvent): string {
       return event.name;
     case "log":
       return event.message;
+    case "agent-step":
+      return `${event.title ?? event.stepId} / ${event.status}`;
     case "task":
       // Prefer the human-readable sub-agent title (matches the spawned
       // workspace title); fall back to stepId for legacy events without one.
@@ -407,20 +411,19 @@ function getWorkflowEventLabel(event: WorkflowRunEvent): string {
 
 function getWorkflowEventDetail(event: WorkflowRunEvent): unknown {
   switch (event.type) {
+    // Every event type carrying an opaque `details` payload surfaces it as-is;
+    // group them so a new details-bearing event can't drift from the others.
     case "phase":
+    case "workflow":
+    case "patch":
+    case "agent-step":
+    case "timeout":
+    case "action":
       return event.details;
     case "log":
       return event.data;
     case "result":
       return event.result;
-    case "workflow":
-      return event.details;
-    case "patch":
-      return event.details;
-    case "timeout":
-      return event.details;
-    case "action":
-      return event.details;
     case "task":
     case "validation":
     case "error":
@@ -442,6 +445,9 @@ function getEventTone(event: WorkflowRunEvent): "normal" | "success" | "warning"
       : event.status === "started"
         ? "normal"
         : "warning";
+  }
+  if (event.type === "agent-step") {
+    return event.status === "failed" ? "warning" : "normal";
   }
   if (event.type === "action") {
     if (
@@ -1155,10 +1161,14 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
   workspaceId,
   toolCallId,
   startedAt,
+  toolCallTimestamp,
   toolName = "workflow_run",
   knownRunId,
   workflowRunHint: explicitWorkflowRunHint,
 }) => {
+  // Freshness bound for run discovery: prefer the true execution start, but fall back to
+  // the model-emission timestamp for parts without execution-start tracking (history replay).
+  const discoveryFreshnessBound = startedAt ?? toolCallTimestamp;
   const apiState = useContext(APIContext);
   const commandRegistry = useOptionalCommandRegistry();
   const registerCommandSource = commandRegistry?.registerSource;
@@ -1391,7 +1401,11 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
     const discover = async () => {
       try {
         const runs = await apiState.api.workflows.listRuns({ workspaceId });
-        const foregroundRun = findForegroundWorkflowRun({ runs, args, startedAt });
+        const foregroundRun = findForegroundWorkflowRun({
+          runs,
+          args,
+          startedAt: discoveryFreshnessBound,
+        });
         if (!ignore && foregroundRun != null) {
           setRefreshedRun((current) => getNewestWorkflowRunSnapshot(current, foregroundRun));
         }
@@ -1408,7 +1422,7 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
       ignore = true;
       window.clearInterval(interval);
     };
-  }, [apiState?.api, args, runId, startedAt, status, workspaceId]);
+  }, [apiState?.api, args, runId, discoveryFreshnessBound, status, workspaceId]);
 
   const exactDiscoveryRunId = knownRunId ?? workflowRunHint?.runId;
 

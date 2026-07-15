@@ -30,6 +30,14 @@ describe("Config", () => {
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
+  // Load-time migrations persist through the serialized editConfig queue (an async
+  // identity transform) instead of a synchronous write-back, so tests asserting the
+  // migrated on-disk form must flush the queue first. Awaiting an identity edit is
+  // sufficient: it re-runs the idempotent load migrations and writes the result.
+  async function flushConfigEdits(): Promise<void> {
+    await config.editConfig((cfg) => cfg);
+  }
+
   describe("loadConfigOrDefault with trailing slash migration", () => {
     it("should strip trailing slashes from project paths on load", () => {
       // Create config file with trailing slashes in project paths
@@ -200,6 +208,102 @@ describe("Config", () => {
       const metadata = await new Config(tempDir).getAllWorkspaceMetadata();
       const tagged = metadata.find((m) => m.id === "tagged-ws-1");
       expect(tagged?.tags).toEqual({ workItemKey: "issue-1-investigate" });
+    });
+  });
+
+  describe("legacy workspace migration identity", () => {
+    // Regression (PR #3694 Codex P2): the queued ??= migration preserves values already
+    // persisted in config. Returned metadata must use those same values — returning a
+    // generated legacyId for a partially-migrated entry (id present, name missing) hands
+    // the UI an ID that findWorkspace cannot resolve until the next reload.
+    it("returns the persisted id for a partially-migrated entry and persists the same value", async () => {
+      await config.editConfig((cfg) => {
+        cfg.projects.set("/repo", {
+          workspaces: [
+            // id present, name missing -> legacy fallback path (no metadata.json on disk).
+            { path: "/repo/partial", id: "persisted-id-1" },
+          ],
+        });
+        return cfg;
+      });
+
+      const metadata = await new Config(tempDir).getAllWorkspaceMetadata();
+      expect(metadata).toHaveLength(1);
+      expect(metadata[0]?.id).toBe("persisted-id-1");
+
+      // The migration must persist exactly what was returned.
+      const persisted = new Config(tempDir).loadConfigOrDefault().projects.get("/repo")
+        ?.workspaces[0];
+      expect(persisted?.id).toBe("persisted-id-1");
+      expect(persisted?.name).toBe(metadata[0]?.name);
+    });
+
+    // Regression (PR #3694 Codex P2): paths are reusable after deletion. A queued
+    // migration replay recorded for a legacy entry must not apply the old workspace's
+    // settings to a replacement workspace created at the same path while the replay
+    // waited in the editConfig queue.
+    it("does not retarget queued migrations onto a replacement workspace at the same path", async () => {
+      const sharedPath = "/repo/reused";
+      const staleHeartbeat = { enabled: true, intervalMs: 45 * 60 * 1000 };
+      await config.editConfig((cfg) => {
+        cfg.projects.set("/repo", {
+          // Legacy entry (no id/name) with settings the migration would carry over.
+          workspaces: [
+            { path: sharedPath, aiSettings: { model: "old:model", thinkingLevel: "medium" } },
+          ],
+        });
+        return cfg;
+      });
+
+      // Enqueue remove+recreate FIFO-ahead of getAllWorkspaceMetadata's queued replay:
+      // its snapshot read (sync) sees the legacy entry, but by the time its editConfig
+      // transform runs, the path belongs to a NEW workspace with a different id.
+      const loader = new Config(tempDir);
+      const removal = loader.editConfig((cfg) => {
+        cfg.projects.set("/repo", { workspaces: [] });
+        return cfg;
+      });
+      const recreate = loader.editConfig((cfg) => {
+        cfg.projects.get("/repo")?.workspaces.push({
+          id: "replacement-id",
+          name: "replacement",
+          path: sharedPath,
+          heartbeat: staleHeartbeat,
+        });
+        return cfg;
+      });
+      await loader.getAllWorkspaceMetadata();
+      await Promise.all([removal, recreate]);
+
+      const persisted = new Config(tempDir).loadConfigOrDefault().projects.get("/repo")?.workspaces;
+      expect(persisted).toHaveLength(1);
+      const replacement = persisted?.[0];
+      // The replacement keeps its own identity and never inherits the legacy entry's
+      // migrated defaults: pre-fix the path-only replay match filled the replacement's
+      // missing createdAt/runtimeConfig from the removed legacy workspace's migration.
+      expect(replacement?.id).toBe("replacement-id");
+      expect(replacement?.name).toBe("replacement");
+      expect(replacement?.createdAt).toBeUndefined();
+      expect(replacement?.runtimeConfig).toBeUndefined();
+      expect(replacement?.heartbeat).toEqual(staleHeartbeat);
+    });
+
+    it("returns the persisted name for an entry missing only an id", async () => {
+      await config.editConfig((cfg) => {
+        cfg.projects.set("/repo", {
+          workspaces: [{ path: "/repo/named", name: "persisted-name" }],
+        });
+        return cfg;
+      });
+
+      const metadata = await new Config(tempDir).getAllWorkspaceMetadata();
+      expect(metadata).toHaveLength(1);
+      expect(metadata[0]?.name).toBe("persisted-name");
+
+      const persisted = new Config(tempDir).loadConfigOrDefault().projects.get("/repo")
+        ?.workspaces[0];
+      expect(persisted?.name).toBe("persisted-name");
+      expect(persisted?.id).toBe(metadata[0]?.id);
     });
   });
 
@@ -427,7 +531,7 @@ describe("Config", () => {
     const OPUS = KNOWN_MODELS.OPUS.id;
     const configFilePath = () => path.join(tempDir, "config.json");
 
-    it("seeds the default chain once on first load and persists the migration flag", () => {
+    it("seeds the default chain once on first load and persists the migration flag", async () => {
       fs.writeFileSync(configFilePath(), JSON.stringify({ projects: [] }));
 
       const loaded = config.loadConfigOrDefault();
@@ -435,6 +539,7 @@ describe("Config", () => {
       expect(loaded.migrations?.defaultModelFallbacksSeeded).toBe(true);
 
       // Seed is written back so the flag survives restarts even without saves.
+      await flushConfigEdits();
       const raw = JSON.parse(fs.readFileSync(configFilePath(), "utf-8")) as {
         modelFallbacks?: unknown;
         migrations?: { defaultModelFallbacksSeeded?: unknown };
@@ -455,7 +560,7 @@ describe("Config", () => {
       expect(config.loadConfigOrDefault().modelFallbacks).toBeUndefined();
     });
 
-    it("merges the seeded default with pre-existing chains for other source models", () => {
+    it("merges the seeded default with pre-existing chains for other source models", async () => {
       fs.writeFileSync(
         configFilePath(),
         JSON.stringify({
@@ -473,6 +578,7 @@ describe("Config", () => {
       });
 
       // The user's chain must survive the seed write-back on disk unchanged.
+      await flushConfigEdits();
       const raw = JSON.parse(fs.readFileSync(configFilePath(), "utf-8")) as {
         modelFallbacks?: unknown;
         migrations?: { defaultModelFallbacksSeeded?: unknown };
@@ -961,7 +1067,7 @@ describe("Config", () => {
       );
     });
 
-    it("removes mirrored exec subagent fields on first load", () => {
+    it("removes mirrored exec subagent fields on first load", async () => {
       fs.writeFileSync(
         path.join(tempDir, "config.json"),
         JSON.stringify({
@@ -981,6 +1087,7 @@ describe("Config", () => {
       expect(loaded.subagentAiDefaults?.worker?.modelString).toBe("openai:gpt-5.2");
       expect(loaded.migrations?.execSubagentDefaultsSplit).toBe(true);
 
+      await flushConfigEdits();
       const raw = JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
         subagentAiDefaults?: Record<string, unknown>;
         migrations?: { execSubagentDefaultsSplit?: boolean };
@@ -989,7 +1096,7 @@ describe("Config", () => {
       expect(raw.migrations?.execSubagentDefaultsSplit).toBe(true);
     });
 
-    it("preserves session usage cache when only exec-split cleanup modifies config", () => {
+    it("preserves session usage cache when only exec-split cleanup modifies config", async () => {
       fs.writeFileSync(
         path.join(tempDir, "config.json"),
         JSON.stringify({
@@ -1014,6 +1121,7 @@ describe("Config", () => {
       expect(loaded.subagentAiDefaults?.worker?.modelString).toBe("openai:gpt-5.2");
       expect(loaded.migrations?.execSubagentDefaultsSplit).toBe(true);
 
+      await flushConfigEdits();
       const raw = JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
         subagentAiDefaults?: Record<string, unknown>;
         migrations?: { execSubagentDefaultsSplit?: boolean };
@@ -1350,7 +1458,7 @@ describe("Config", () => {
       });
     }
 
-    it("preserves legacy fields on disk alongside synthesized modern routing state", () => {
+    it("preserves legacy fields on disk alongside synthesized modern routing state", async () => {
       writeRawConfig({
         muxGatewayEnabled: true,
         muxGatewayModels: ["anthropic/claude-sonnet-4-6"],
@@ -1365,6 +1473,7 @@ describe("Config", () => {
         "anthropic:claude-sonnet-4-6": "mux-gateway",
       });
 
+      await flushConfigEdits();
       expect(readRawConfig()).toMatchObject({
         muxGatewayEnabled: true,
         muxGatewayModels: ["anthropic/claude-sonnet-4-6"],
@@ -1408,7 +1517,7 @@ describe("Config", () => {
       expect(loaded.routeOverrides).toBeUndefined();
     });
 
-    it("clears stale muxGatewayEnabled disables when routePriority already includes mux-gateway", () => {
+    it("clears stale muxGatewayEnabled disables when routePriority already includes mux-gateway", async () => {
       writeRawConfig({
         muxGatewayEnabled: false,
         routePriority: ["mux-gateway", "direct"],
@@ -1418,6 +1527,7 @@ describe("Config", () => {
 
       expect(loaded.routePriority).toEqual(["mux-gateway", "direct"]);
       expect(loaded.muxGatewayEnabled).toBeUndefined();
+      await flushConfigEdits();
       expect(readRawConfig().muxGatewayEnabled).toBeUndefined();
       expect(new Config(tempDir).loadConfigOrDefault().muxGatewayEnabled).toBeUndefined();
     });
@@ -1693,6 +1803,43 @@ describe("Config", () => {
       expect(metadata.heartbeat).toEqual({
         enabled: true,
         intervalMs: 45 * 60 * 1000,
+      });
+    });
+
+    it("preserves valid heartbeat schedule fields and drops invalid ones in workspace metadata", async () => {
+      const projectPath = "/fake/project";
+      const workspacePath = path.join(config.srcDir, "project", "heartbeat-schedule");
+      // trigger is valid and must survive normalization; whenBusy simulates a corrupt
+      // persisted value and must be dropped (self-healing) rather than passed through.
+      const persistedHeartbeat = {
+        enabled: true,
+        intervalMs: 30 * 60 * 1000,
+        trigger: "interval",
+        whenBusy: "not-a-mode",
+      };
+
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: [
+            {
+              path: workspacePath,
+              id: "workspace-heartbeat-schedule",
+              name: "heartbeat-schedule",
+              createdAt: "2025-01-01T00:00:00.000Z",
+              runtimeConfig: { type: "local" },
+              heartbeat: persistedHeartbeat as NonNullable<WorkspaceMetadata["heartbeat"]>,
+            },
+          ],
+        });
+        return cfg;
+      });
+
+      const [metadata] = await config.getAllWorkspaceMetadata();
+
+      expect(metadata.heartbeat).toEqual({
+        enabled: true,
+        intervalMs: 30 * 60 * 1000,
+        trigger: "interval",
       });
     });
 

@@ -234,11 +234,11 @@ function renderAgentHarness(props: {
     <APIProvider client={createApiClient()}>
       <RouterProvider>
         <ProjectProvider>
-            <WorkspaceProvider>
-              <AgentProvider workspaceId={props.workspaceId} projectPath={props.projectPath}>
-                <Harness onChange={props.onChange} onRender={props.onRender} />
-              </AgentProvider>
-            </WorkspaceProvider>
+          <WorkspaceProvider>
+            <AgentProvider workspaceId={props.workspaceId} projectPath={props.projectPath}>
+              <Harness onChange={props.onChange} onRender={props.onRender} />
+            </AgentProvider>
+          </WorkspaceProvider>
         </ProjectProvider>
       </RouterProvider>
     </APIProvider>

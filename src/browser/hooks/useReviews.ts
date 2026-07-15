@@ -382,14 +382,6 @@ export function useReviews(workspaceId: string): UseReviewsReturn {
       ...actions,
       getReview,
     }),
-    [
-      reviews,
-      pendingCount,
-      attachedCount,
-      checkedCount,
-      attachedReviews,
-      actions,
-      getReview,
-    ]
+    [reviews, pendingCount, attachedCount, checkedCount, attachedReviews, actions, getReview]
   );
 }

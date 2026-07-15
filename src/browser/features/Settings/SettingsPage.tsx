@@ -121,7 +121,10 @@ interface SettingsSectionRedirect {
   replace?: boolean;
 }
 
-export function getSettingsSections(governorEnabled: boolean, memoryEnabled: boolean): SettingsSection[] {
+export function getSettingsSections(
+  governorEnabled: boolean,
+  memoryEnabled: boolean
+): SettingsSection[] {
   const sections = [...BASE_SECTIONS];
   if (memoryEnabled) {
     sections.push({
@@ -174,11 +177,7 @@ export function SettingsPage(props: SettingsPageProps) {
   const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
   // Keep routing on a valid section when experiment-owned settings move or disappear.
   useEffect(() => {
-    const redirect = getSettingsSectionRedirect(
-      activeSection,
-      governorEnabled,
-      memoryEnabled
-    );
+    const redirect = getSettingsSectionRedirect(activeSection, governorEnabled, memoryEnabled);
     if (!redirect) {
       return;
     }

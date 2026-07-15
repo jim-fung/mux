@@ -11,7 +11,9 @@ export interface ExternalEventsConfig {
   workspaceIdForComposerClear: string | null;
   onDetachAllReviewsForComposerClear: (() => void) | undefined;
   setInput: (value: string | ((prev: string) => string)) => void;
-  setAttachments: (value: ChatAttachment[] | ((prev: ChatAttachment[]) => ChatAttachment[])) => void;
+  setAttachments: (
+    value: ChatAttachment[] | ((prev: ChatAttachment[]) => ChatAttachment[])
+  ) => void;
   setDraftReviews: React.Dispatch<React.SetStateAction<ReviewNoteDataForDisplay[] | null>>;
   inputRef: RefObject<HTMLTextAreaElement | null>;
   modelSelectorRef: RefObject<ModelSelectorRef | null>;
@@ -93,14 +95,7 @@ export function useChatInputExternalEvents(config: ExternalEventsConfig): void {
     window.addEventListener(CUSTOM_EVENTS.UPDATE_CHAT_INPUT, handler as EventListener);
     return () =>
       window.removeEventListener(CUSTOM_EVENTS.UPDATE_CHAT_INPUT, handler as EventListener);
-  }, [
-    appendText,
-    restoreText,
-    restoreDraft,
-    applyDraftFromPending,
-    getDraft,
-    editingMessageForUi,
-  ]);
+  }, [appendText, restoreText, restoreDraft, applyDraftFromPending, getDraft, editingMessageForUi]);
 
   useEffect(() => {
     const handler = (event: CustomEvent<{ workspaceId: string }>) => {

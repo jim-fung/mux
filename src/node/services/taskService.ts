@@ -3,6 +3,11 @@ import * as fsPromises from "fs/promises";
 
 import type { z } from "zod";
 
+import {
+  TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS,
+  TASK_TERMINATION_WORKSPACE_REMOVE_TIMEOUT_MS,
+} from "@/constants/terminationTimeouts";
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import type { Config, ProjectsConfig, Workspace as WorkspaceConfigEntry } from "@/node/config";
@@ -63,6 +68,7 @@ import {
 } from "@/node/services/utils/messageIds";
 import { defaultModel, normalizeToCanonical } from "@/common/utils/ai/models";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { runtimeModeSupportsSharedTaskWorkspace, type RuntimeConfig } from "@/common/types/runtime";
 import type { ProjectRef, WorkspaceMetadata } from "@/common/types/workspace";
@@ -78,7 +84,12 @@ import { getWorkspaceProjectRepos } from "@/node/services/workspaceProjectRepos"
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 import { getTotalCost, sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
-import type { ParsedThinkingInput, ThinkingLevel } from "@/common/types/thinking";
+import {
+  coerceOpenAIReasoningMode,
+  type OpenAIReasoningMode,
+  type ParsedThinkingInput,
+  type ThinkingLevel,
+} from "@/common/types/thinking";
 import type { ErrorEvent, StreamAbortEvent, StreamEndEvent } from "@/common/types/stream";
 import {
   isActiveWorkflowRunStatus,
@@ -88,6 +99,7 @@ import {
 import { isDynamicToolPart, type DynamicToolPart } from "@/common/types/toolParts";
 import {
   buildWorkflowResultContextMessage,
+  isTerminalWorkflowRunToolOutput,
   isWorkflowDisplayOnlyMessage,
   isWorkflowRunEmittingToolName,
 } from "@/common/utils/workflowRunMessages";
@@ -164,6 +176,8 @@ export type AgentTaskStatus = NonNullable<WorkspaceConfigEntry["taskStatus"]>;
 interface ResolvedWorkspaceAiSettings {
   model: string;
   thinkingLevel?: ThinkingLevel;
+  /** OpenAI pro reasoning mode; per-workspace choice inherited by spawned tasks. */
+  reasoningMode?: OpenAIReasoningMode;
 }
 
 export interface AgentTaskStatusLookup {
@@ -566,9 +580,12 @@ interface TaskLaunchPlan {
   createdAt: string;
   taskRuntimeConfig: RuntimeConfig;
   parentRuntimeConfig: RuntimeConfig;
+  configProjectPath: string;
+  workspaceKind?: "scratch";
   taskModelString: string;
   canonicalModel: string;
   effectiveThinkingLevel?: ThinkingLevel;
+  effectiveReasoningMode?: OpenAIReasoningMode;
   skipInitHook: boolean;
   preferredTrunkBranch?: string;
   workflowTask?: TaskCreateArgs["workflowTask"];
@@ -981,6 +998,15 @@ function hasTerminalWorkflowTaskAwaitInParts(parts: readonly unknown[], runId: s
   });
 }
 
+function hasTerminalWorkflowToolOutputInParts(parts: readonly unknown[], runId: string): boolean {
+  return parts.some(
+    (part) =>
+      isDynamicToolPart(part) &&
+      part.state === "output-available" &&
+      isTerminalWorkflowRunToolOutput(part.toolName, part.output, runId)
+  );
+}
+
 function sanitizeAgentTypeForName(agentType: string): string {
   const normalized = agentType
     .trim()
@@ -1127,6 +1153,12 @@ export class TaskService {
   // Cache completed reports so callers can retrieve them without re-reading disk.
   // Bounded by max entries; disk persistence is the source of truth for restart-safety.
   private readonly completedReportsByTaskId = new Map<string, CompletedAgentReportCacheEntry>();
+
+  // Task workspace removals that outlived their termination timeout. Retries must
+  // await the ORIGINAL removal outcome: WorkspaceService.remove() short-circuits Ok
+  // for IDs already being removed, so re-calling it would count a still-in-flight
+  // (possibly failing) removal as success and let ancestor deletion orphan the child.
+  private readonly pendingTaskWorkspaceRemovals = new Map<string, Promise<Result<void>>>();
   private readonly gitPatchArtifactService: GitPatchArtifactService;
   private readonly handoffInProgress = new Set<string>();
   /**
@@ -1299,7 +1331,13 @@ export class TaskService {
         if (!isTerminalWorkflowRunStatus(run.status)) {
           continue;
         }
-        if (hasTerminalWorkflowTaskAwaitInParts(currentParts, run.id)) {
+        // A foreground workflow_run/workflow_resume terminal result is already visible to this
+        // turn, so requiring a second task_await would be redundant (and impossible for agents
+        // whose read-only policy only permits task_await as a recovery tool).
+        if (
+          hasTerminalWorkflowTaskAwaitInParts(currentParts, run.id) ||
+          hasTerminalWorkflowToolOutputInParts(currentParts, run.id)
+        ) {
           continue;
         }
         const isCurrent = await this.workspaceService.isWorkflowInvocationCurrent(
@@ -1578,6 +1616,8 @@ export class TaskService {
   private resolveTaskAISettings(params: {
     cfg: ReturnType<Config["loadConfigOrDefault"]>;
     parentMeta: {
+      /** Parent's persisted selected agent (see persistSelectedAgentId). */
+      agentId?: string;
       aiSettingsByAgent?: Record<string, ResolvedWorkspaceAiSettings>;
       aiSettings?: ResolvedWorkspaceAiSettings;
     };
@@ -1589,6 +1629,7 @@ export class TaskService {
     taskModelString: string;
     canonicalModel: string;
     effectiveThinkingLevel: ThinkingLevel;
+    effectiveReasoningMode?: OpenAIReasoningMode;
   } {
     const parentAiSettings = this.resolveWorkspaceAISettings(params.parentMeta, params.agentId);
     // Sub-agent defaults take priority over UI agent defaults per field for any agent invoked as a sub-agent.
@@ -1608,9 +1649,13 @@ export class TaskService {
 
     // Resolve an explicit override first so numeric thinking indices map into the
     // chosen model's allowed levels (named levels pass through unchanged).
+    // Providers config threads through so mapped aliases (mappedToModel, e.g.
+    // openai:team-sol -> gpt-5.6-sol) keep their target's native levels instead
+    // of being clamped to the default four-level ladder.
+    const providersConfig = this.aiService.getProvidersConfig();
     const overrideThinkingLevel =
       params.thinkingLevel != null
-        ? resolveThinkingInput(params.thinkingLevel, canonicalModel)
+        ? resolveThinkingInput(params.thinkingLevel, canonicalModel, providersConfig)
         : undefined;
     const requestedThinkingLevel: ThinkingLevel =
       overrideThinkingLevel ??
@@ -1619,9 +1664,34 @@ export class TaskService {
       parentRuntimeAiSettings?.thinkingLevel ??
       parentAiSettings?.thinkingLevel ??
       "off";
-    const effectiveThinkingLevel = enforceThinkingPolicy(canonicalModel, requestedThinkingLevel);
+    const effectiveThinkingLevel = enforceThinkingPolicy(
+      canonicalModel,
+      requestedThinkingLevel,
+      undefined,
+      providersConfig
+    );
 
-    return { taskModelString, canonicalModel, effectiveThinkingLevel };
+    // Pro reasoning mode is a per-workspace choice (agent/subagent defaults do
+    // not carry it), so tasks inherit it from the parent's persisted settings.
+    // The user toggles pro on the parent's ACTIVE agent, so the target agent's
+    // bucket rarely carries one — fall back to the parent's active-agent bucket
+    // (persisted selected agent, defaulting to exec), then legacy settings.
+    // Safe to pass through unconditionally: the send path re-gates per model
+    // (buildRequestHeaders is inert for unsupported models/routes).
+    const activeParentAiSettings = this.resolveWorkspaceAISettings(
+      params.parentMeta,
+      normalizeAgentId(params.parentMeta.agentId)
+    );
+    const effectiveReasoningMode = coerceOpenAIReasoningMode(
+      parentAiSettings?.reasoningMode ?? activeParentAiSettings?.reasoningMode
+    );
+
+    return {
+      taskModelString,
+      canonicalModel,
+      effectiveThinkingLevel,
+      ...(effectiveReasoningMode != null ? { effectiveReasoningMode } : {}),
+    };
   }
 
   /**
@@ -1640,7 +1710,12 @@ export class TaskService {
     },
     fallbackModel: string,
     hint?: ParentAutoResumeHint
-  ): Promise<{ model: string; agentId: string; thinkingLevel?: ThinkingLevel }> {
+  ): Promise<{
+    model: string;
+    agentId: string;
+    thinkingLevel?: ThinkingLevel;
+    reasoningMode?: OpenAIReasoningMode;
+  }> {
     // 1) Try stream-end hint metadata (available in handleStreamEnd path)
     let agentId = hint?.agentId;
 
@@ -1668,10 +1743,14 @@ export class TaskService {
     agentId = agentId ?? TASK_RECOVERY_FALLBACK_AGENT_ID;
 
     const aiSettings = this.resolveWorkspaceAISettings(parentEntry.workspace, agentId);
+    const reasoningMode = coerceOpenAIReasoningMode(aiSettings?.reasoningMode);
     return {
       model: aiSettings?.model ?? fallbackModel,
       agentId,
       thinkingLevel: aiSettings?.thinkingLevel,
+      // Per-workspace pro mode carries into synthetic auto-resumes; the send
+      // path re-gates per model/route so this is inert for unsupported models.
+      ...(reasoningMode != null ? { reasoningMode } : {}),
     };
   }
 
@@ -2017,6 +2096,7 @@ export class TaskService {
           model,
           agentId,
           thinkingLevel: task.taskThinkingLevel,
+          reasoningMode: coerceOpenAIReasoningMode(task.aiSettings?.reasoningMode),
           experiments: task.taskExperiments,
         },
         { synthetic: true, agentInitiated: true }
@@ -2111,6 +2191,17 @@ export class TaskService {
       await this.cleanupReportedLeafTask(task.id);
     }
     const cleanupReportedTasksMs = Date.now() - cleanupReportedTasksStartedAt;
+
+    // Startup self-heal for leftover workflow task garbage: interrupted-without-report
+    // workflow-owned children of inactive runs (both the ones the prepass above just
+    // interrupted and historical leftovers) are archived out of the active sidebar.
+    // Startup-time rule: never crash the app — archive failures are logged and retried
+    // on the next launch.
+    try {
+      await this.archiveLeftoverTasksOfInactiveWorkflowRuns();
+    } catch (error: unknown) {
+      log.error("Startup workflow task archive sweep failed", { error });
+    }
 
     const recoveredTerminalWorkflowRunNotificationCount =
       await this.recoverTerminalWorkflowRunAttentionNotifications();
@@ -2252,15 +2343,18 @@ export class TaskService {
         return Err(`Task.createMany: parent workspace not found (${parentMetaResult.error})`);
       }
       const parentMeta = parentMetaResult.data;
-
-      const taskProjectConfig = cfg.projects.get(stripTrailingSlashes(parentMeta.projectPath));
+      const parentEntry = findWorkspaceEntry(cfg, parentWorkspaceId);
+      const parentIsScratch = parentEntry?.workspace.kind === "scratch";
+      const configProjectPath = parentIsScratch
+        ? SCRATCH_PROJECT_CONFIG_KEY
+        : stripTrailingSlashes(parentMeta.projectPath);
+      const taskProjectConfig = cfg.projects.get(configProjectPath);
       if (!taskProjectConfig?.trusted) {
         return Err(
           "This project must be trusted before creating workspaces. Trust the project in Settings → Security, or create a workspace from the project page."
         );
       }
 
-      const parentEntry = findWorkspaceEntry(cfg, parentWorkspaceId);
       if (parentEntry?.workspace.taskStatus === "reported") {
         return Err("Task.createMany: cannot spawn new tasks after agent_report");
       }
@@ -2281,7 +2375,7 @@ export class TaskService {
         );
       }
 
-      const { taskModelString, canonicalModel, effectiveThinkingLevel } =
+      const { taskModelString, canonicalModel, effectiveThinkingLevel, effectiveReasoningMode } =
         this.resolveTaskAISettings({
           cfg,
           parentMeta,
@@ -2315,9 +2409,10 @@ export class TaskService {
       const taskRuntimeMode = getRuntimeType(taskRuntimeConfig);
       const parentIsMultiProject = (parentMeta.projects?.length ?? 0) > 1;
       const useSharedWorkspace =
-        args.isolation === "none" &&
-        runtimeModeSupportsSharedTaskWorkspace(taskRuntimeMode) &&
-        !parentIsMultiProject;
+        parentIsScratch ||
+        (args.isolation === "none" &&
+          runtimeModeSupportsSharedTaskWorkspace(taskRuntimeMode) &&
+          !parentIsMultiProject);
       const sharedWorkspacePath = useSharedWorkspace ? parentWorkspacePath : undefined;
       // Branch actually checked out in the parent's checkout (see create() for rationale).
       const parentIsSharedTask = parentEntry?.workspace.taskIsolation === "none";
@@ -2410,9 +2505,12 @@ export class TaskService {
         createdAt,
         taskRuntimeConfig,
         parentRuntimeConfig,
+        configProjectPath,
+        workspaceKind: parentIsScratch ? "scratch" : undefined,
         taskModelString,
         canonicalModel,
         effectiveThinkingLevel,
+        effectiveReasoningMode,
         skipInitHook,
         workflowTask: args.workflowTask,
         bestOf: normalizedBestOf,
@@ -2455,12 +2553,13 @@ export class TaskService {
         if (!trunkBranch) {
           throw new Error("Task.createMany: parent workspace name missing");
         }
-        let projectConfig = config.projects.get(plan.parentMeta.projectPath);
+        let projectConfig = config.projects.get(plan.configProjectPath);
         if (!projectConfig) {
           projectConfig = { workspaces: [] };
-          config.projects.set(plan.parentMeta.projectPath, projectConfig);
+          config.projects.set(plan.configProjectPath, projectConfig);
         }
         projectConfig.workspaces.push({
+          kind: plan.workspaceKind,
           path: workspacePath,
           id: plan.taskId,
           name: plan.workspaceName,
@@ -2469,7 +2568,13 @@ export class TaskService {
           runtimeConfig: plan.taskRuntimeConfig,
           aiSettings:
             plan.effectiveThinkingLevel !== undefined
-              ? { model: plan.canonicalModel, thinkingLevel: plan.effectiveThinkingLevel }
+              ? {
+                  model: plan.canonicalModel,
+                  thinkingLevel: plan.effectiveThinkingLevel,
+                  ...(plan.effectiveReasoningMode != null
+                    ? { reasoningMode: plan.effectiveReasoningMode }
+                    : {}),
+                }
               : undefined,
           parentWorkspaceId: plan.parentWorkspaceId,
           agentId: plan.agentId,
@@ -2654,9 +2759,7 @@ export class TaskService {
           ? { preferredTrunkBranch: plan.preferredTrunkBranch }
           : {}),
         trusted:
-          this.config
-            .loadConfigOrDefault()
-            .projects.get(stripTrailingSlashes(plan.parentMeta.projectPath))?.trusted ?? false,
+          this.config.loadConfigOrDefault().projects.get(plan.configProjectPath)?.trusted ?? false,
         multiProjectExperimentEnabled: this.workspaceService.isExperimentEnabled(
           EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES
         ),
@@ -2867,9 +2970,8 @@ export class TaskService {
           env: secrets,
           skipInitHook: plan.skipInitHook,
           trusted:
-            this.config
-              .loadConfigOrDefault()
-              .projects.get(stripTrailingSlashes(plan.parentMeta.projectPath))?.trusted ?? false,
+            this.config.loadConfigOrDefault().projects.get(plan.configProjectPath)?.trusted ??
+            false,
         },
         plan.taskId
       );
@@ -2879,6 +2981,9 @@ export class TaskService {
       model: plan.taskModelString,
       agentId: plan.agentId,
       thinkingLevel: plan.effectiveThinkingLevel,
+      // Inherited pro mode: the send path re-gates per model/route, so this is
+      // inert for non-GPT-5.6 task models.
+      reasoningMode: plan.effectiveReasoningMode,
       experiments: plan.experiments,
     };
     const sendResult =
@@ -2940,6 +3045,10 @@ export class TaskService {
     const parentMeta = parentMetaResult.data;
     const cfg = this.config.loadConfigOrDefault();
     const taskSettings = cfg.taskSettings ?? DEFAULT_TASK_SETTINGS;
+    const parentEntry = findWorkspaceEntry(cfg, ownerWorkspaceId);
+    if (parentEntry?.workspace.kind === "scratch") {
+      return Err("Task.createWorkspaceTurn: scratch workspace turns are not supported yet");
+    }
     const taskProjectConfig = cfg.projects.get(stripTrailingSlashes(parentMeta.projectPath));
     if ((parentMeta.projects?.length ?? 0) > 1) {
       // WorkspaceService.create only materializes one project checkout; fail loudly instead of
@@ -3033,10 +3142,31 @@ export class TaskService {
       defaultModel;
     const thinkingLevel =
       args.thinkingLevel != null
-        ? resolveThinkingInput(args.thinkingLevel, normalizeToCanonical(model))
+        ? // Providers config keeps mapped aliases on their target's ladder
+          // (see resolveTaskAISettings).
+          resolveThinkingInput(
+            args.thinkingLevel,
+            normalizeToCanonical(model),
+            this.aiService.getProvidersConfig()
+          )
         : (args.parentRuntimeAiSettings?.thinkingLevel ??
           parentMeta.aiSettingsByAgent?.exec?.thinkingLevel ??
           parentMeta.aiSettings?.thinkingLevel);
+    // Per-workspace pro mode inherits alongside model/thinking; the send path
+    // re-gates per model/route so this is inert for non-GPT-5.6 models.
+    // The user toggles pro on the parent's ACTIVE agent, so after the exec
+    // bucket fall back to the active-agent bucket (then legacy settings) —
+    // mirroring resolveTaskAISettings — or a workspace turn launched from a
+    // non-exec parent agent would silently drop back to standard mode.
+    const activeParentAiSettings = this.resolveWorkspaceAISettings(
+      parentMeta,
+      normalizeAgentId(parentMeta.agentId)
+    );
+    const reasoningMode = coerceOpenAIReasoningMode(
+      parentMeta.aiSettingsByAgent?.exec?.reasoningMode ??
+        activeParentAiSettings?.reasoningMode ??
+        parentMeta.aiSettings?.reasoningMode
+    );
 
     const record: WorkspaceTurnTaskHandleRecord = {
       kind: "workspace_turn",
@@ -3096,6 +3226,7 @@ export class TaskService {
         model,
         agentId: "exec",
         ...(thinkingLevel != null ? { thinkingLevel } : {}),
+        ...(reasoningMode != null ? { reasoningMode } : {}),
         muxMetadata: this.buildWorkspaceTurnMuxMetadata(record),
         experiments: args.experiments,
         ...(mode === "existing" ? { queueDispatchMode } : {}),
@@ -3253,18 +3384,22 @@ export class TaskService {
     // Enforce nesting depth.
     const cfg = this.config.loadConfigOrDefault();
     const taskSettings = cfg.taskSettings ?? DEFAULT_TASK_SETTINGS;
+    const parentEntry = findWorkspaceEntry(cfg, parentWorkspaceId);
+    const parentIsScratch = parentEntry?.workspace.kind === "scratch";
+    const configProjectPath = parentIsScratch
+      ? SCRATCH_PROJECT_CONFIG_KEY
+      : stripTrailingSlashes(parentMeta.projectPath);
 
     // Trust gate: block task creation for untrusted projects.
     // The frontend shows a confirmation dialog for primary workspace creation,
     // but task spawning bypasses the UI — enforce trust here as defense-in-depth.
-    const taskProjectConfig = cfg.projects.get(stripTrailingSlashes(parentMeta.projectPath));
+    const taskProjectConfig = cfg.projects.get(configProjectPath);
     if (!taskProjectConfig?.trusted) {
       return Err(
         "This project must be trusted before creating workspaces. Trust the project in Settings → Security, or create a workspace from the project page."
       );
     }
 
-    const parentEntry = findWorkspaceEntry(cfg, parentWorkspaceId);
     if (parentEntry?.workspace.taskStatus === "reported") {
       return Err("Task.create: cannot spawn new tasks after agent_report");
     }
@@ -3290,14 +3425,15 @@ export class TaskService {
       );
     }
 
-    const { taskModelString, canonicalModel, effectiveThinkingLevel } = this.resolveTaskAISettings({
-      cfg,
-      parentMeta,
-      agentId,
-      modelString: args.modelString,
-      thinkingLevel: args.thinkingLevel,
-      parentRuntimeAiSettings: args.parentRuntimeAiSettings,
-    });
+    const { taskModelString, canonicalModel, effectiveThinkingLevel, effectiveReasoningMode } =
+      this.resolveTaskAISettings({
+        cfg,
+        parentMeta,
+        agentId,
+        modelString: args.modelString,
+        thinkingLevel: args.thinkingLevel,
+        parentRuntimeAiSettings: args.parentRuntimeAiSettings,
+      });
 
     const parentRuntimeConfig = parentMeta.runtimeConfig;
     const taskRuntimeConfig: RuntimeConfig = parentRuntimeConfig;
@@ -3329,9 +3465,10 @@ export class TaskService {
     const taskRuntimeMode = getRuntimeType(taskRuntimeConfig);
     const parentIsMultiProject = (parentMeta.projects?.length ?? 0) > 1;
     const useSharedWorkspace =
-      args.isolation === "none" &&
-      runtimeModeSupportsSharedTaskWorkspace(taskRuntimeMode) &&
-      !parentIsMultiProject;
+      parentIsScratch ||
+      (args.isolation === "none" &&
+        runtimeModeSupportsSharedTaskWorkspace(taskRuntimeMode) &&
+        !parentIsMultiProject);
     // The branch actually checked out in the parent's checkout. When the parent is itself an
     // isolation: "none" task, parentMeta.name is a synthetic agent workspace name with no real
     // branch — the shared checkout sits on the parent's own persisted taskTrunkBranch. Persisting
@@ -3464,20 +3601,25 @@ export class TaskService {
       });
 
       await this.config.editConfig((config) => {
-        let projectConfig = config.projects.get(parentMeta.projectPath);
+        let projectConfig = config.projects.get(configProjectPath);
         if (!projectConfig) {
           projectConfig = { workspaces: [] };
-          config.projects.set(parentMeta.projectPath, projectConfig);
+          config.projects.set(configProjectPath, projectConfig);
         }
 
         projectConfig.workspaces.push({
+          kind: parentIsScratch ? "scratch" : undefined,
           path: workspacePath,
           id: taskId,
           name: workspaceName,
           title: args.title,
           createdAt,
           runtimeConfig: taskRuntimeConfig,
-          aiSettings: { model: canonicalModel, thinkingLevel: effectiveThinkingLevel },
+          aiSettings: {
+            model: canonicalModel,
+            thinkingLevel: effectiveThinkingLevel,
+            ...(effectiveReasoningMode != null ? { reasoningMode: effectiveReasoningMode } : {}),
+          },
           parentWorkspaceId,
           agentId,
           agentType,
@@ -3570,9 +3712,7 @@ export class TaskService {
           ? { preferredTrunkBranch: parentBranchName }
           : {}),
         trusted:
-          this.config
-            .loadConfigOrDefault()
-            .projects.get(stripTrailingSlashes(parentMeta.projectPath))?.trusted ?? false,
+          this.config.loadConfigOrDefault().projects.get(configProjectPath)?.trusted ?? false,
         multiProjectExperimentEnabled: this.workspaceService.isExperimentEnabled(
           EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES
         ),
@@ -3624,20 +3764,25 @@ export class TaskService {
 
     // Persist workspace entry before starting work so it's durable across crashes.
     await this.config.editConfig((config) => {
-      let projectConfig = config.projects.get(parentMeta.projectPath);
+      let projectConfig = config.projects.get(configProjectPath);
       if (!projectConfig) {
         projectConfig = { workspaces: [] };
-        config.projects.set(parentMeta.projectPath, projectConfig);
+        config.projects.set(configProjectPath, projectConfig);
       }
 
       projectConfig.workspaces.push({
+        kind: parentIsScratch ? "scratch" : undefined,
         path: workspacePath,
         id: taskId,
         name: workspaceName,
         title: args.title,
         createdAt,
         runtimeConfig: forkedRuntimeConfig,
-        aiSettings: { model: canonicalModel, thinkingLevel: effectiveThinkingLevel },
+        aiSettings: {
+          model: canonicalModel,
+          thinkingLevel: effectiveThinkingLevel,
+          ...(effectiveReasoningMode != null ? { reasoningMode: effectiveReasoningMode } : {}),
+        },
         agentId,
         parentWorkspaceId,
         agentType,
@@ -3680,9 +3825,7 @@ export class TaskService {
           env: secrets,
           skipInitHook,
           trusted:
-            this.config
-              .loadConfigOrDefault()
-              .projects.get(stripTrailingSlashes(parentMeta.projectPath))?.trusted ?? false,
+            this.config.loadConfigOrDefault().projects.get(configProjectPath)?.trusted ?? false,
         },
         taskId
       );
@@ -3696,6 +3839,7 @@ export class TaskService {
         model: taskModelString,
         agentId,
         thinkingLevel: effectiveThinkingLevel,
+        reasoningMode: effectiveReasoningMode,
         experiments: args.experiments,
       },
       { agentInitiated: true }
@@ -3729,6 +3873,7 @@ export class TaskService {
     assert(taskId.length > 0, "terminateDescendantAgentTask: taskId must be non-empty");
 
     const terminatedTaskIds: string[] = [];
+    const terminationErrors: string[] = [];
 
     {
       await using _lock = await this.mutex.acquire();
@@ -3760,23 +3905,103 @@ export class TaskService {
 
       const terminationError = new Error("Task terminated");
 
+      // When a descendant workspace could not be removed, keep every ancestor of it
+      // so the surviving child never points at removed parent metadata.
+      const ancestorsBlockedByFailedChild = new Set<string>();
+      const blockAncestorsOf = (id: string) => {
+        for (
+          let cur = parentById.get(id);
+          cur != null && !ancestorsBlockedByFailedChild.has(cur);
+          cur = parentById.get(cur)
+        ) {
+          ancestorsBlockedByFailedChild.add(cur);
+        }
+      };
+
       for (const id of toTerminate) {
         // Best-effort: stop any active stream immediately to avoid further token usage.
         try {
-          const stopResult = await this.aiService.stopStream(id, { abandonPartial: true });
-          if (!stopResult.success) {
+          const stopPromise = this.aiService.stopStream(id, { abandonPartial: true });
+          const stopOutcome = await raceWithAbortAndTimeout(stopPromise, {
+            timeoutMs: TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS,
+          });
+          if (stopOutcome.kind !== "ok") {
+            void stopPromise.catch((error: unknown) => {
+              log.debug("terminateDescendantAgentTask: timed-out stopStream later threw", {
+                taskId: id,
+                error,
+              });
+            });
+            terminationErrors.push(`Timed out stopping task stream (${id})`);
+            blockAncestorsOf(id);
+            continue;
+          }
+          if (!stopOutcome.value.success) {
             log.debug("terminateDescendantAgentTask: stopStream failed", { taskId: id });
           }
         } catch (error: unknown) {
           log.debug("terminateDescendantAgentTask: stopStream threw", { taskId: id, error });
         }
 
+        if (ancestorsBlockedByFailedChild.has(id)) {
+          terminationErrors.push(
+            `Skipped removing task workspace (${id}): a descendant task workspace was not removed`
+          );
+          continue;
+        }
+
         this.completedReportsByTaskId.delete(id);
         this.rejectWaiters(id, terminationError);
 
-        const removeResult = await this.workspaceService.remove(id, true);
-        if (!removeResult.success) {
-          return Err(`Failed to remove task workspace (${id}): ${removeResult.error}`);
+        try {
+          let removePromise = this.pendingTaskWorkspaceRemovals.get(id);
+          if (!removePromise) {
+            removePromise = this.workspaceService.remove(id, true);
+            this.pendingTaskWorkspaceRemovals.set(id, removePromise);
+            const trackedPromise = removePromise;
+            void trackedPromise
+              .then(
+                (result) => result.success,
+                (error: unknown) => {
+                  log.debug("terminateDescendantAgentTask: workspace removal threw", {
+                    taskId: id,
+                    error,
+                  });
+                  return false;
+                }
+              )
+              .then(async (removed) => {
+                if (this.pendingTaskWorkspaceRemovals.get(id) === trackedPromise) {
+                  this.pendingTaskWorkspaceRemovals.delete(id);
+                }
+                // A removal that outlived its termination timeout frees the task slot
+                // only when it settles, so kick the scheduler for queued tasks then.
+                if (removed) {
+                  await this.maybeStartQueuedTasks();
+                }
+              });
+          }
+          const removeOutcome = await raceWithAbortAndTimeout(removePromise, {
+            timeoutMs: TASK_TERMINATION_WORKSPACE_REMOVE_TIMEOUT_MS,
+          });
+          if (removeOutcome.kind !== "ok") {
+            terminationErrors.push(`Timed out removing task workspace (${id})`);
+            blockAncestorsOf(id);
+            continue;
+          }
+          if (!removeOutcome.value.success) {
+            terminationErrors.push(
+              `Failed to remove task workspace (${id}): ${removeOutcome.value.error}`
+            );
+            blockAncestorsOf(id);
+            continue;
+          }
+        } catch (error: unknown) {
+          terminationErrors.push(
+            `Failed to remove task workspace (${id}): ${getErrorMessage(error)}`
+          );
+          blockAncestorsOf(id);
+          continue;
         }
 
         terminatedTaskIds.push(id);
@@ -3786,29 +4011,207 @@ export class TaskService {
     // Free slots and start any queued tasks (best-effort).
     await this.maybeStartQueuedTasks();
 
+    if (terminationErrors.length > 0) {
+      return Err(terminationErrors.join("; "));
+    }
     return Ok({ terminatedTaskIds });
   }
 
-  /** Best-effort final recheck for any completed workflow children still deferred by cleanup gates. */
+  /**
+   * Best-effort sweep of leftover task workspaces once a workflow run reached a terminal
+   * state (completed, failed, interrupted): recheck completed children still deferred by
+   * cleanup gates and archive interrupted-without-report garbage.
+   */
   async markWorkflowRunEnded(workflowRunId: string): Promise<void> {
     assert(workflowRunId.length > 0, "markWorkflowRunEnded: workflowRunId must be non-empty");
+    await this.sweepEndedWorkflowRunTasks(workflowRunId);
+  }
 
-    const cfg = this.config.loadConfigOrDefault();
-    const completedTaskIds: string[] = [];
-    for (const project of cfg.projects.values()) {
-      for (const workspace of project.workspaces) {
-        if (
-          workspace.id &&
-          workspace.workflowTask?.runId === workflowRunId &&
-          hasCompletedAgentReport(workspace)
-        ) {
-          completedTaskIds.push(workspace.id);
+  /**
+   * Hide leftover task workspaces of a workflow run that reached a terminal state.
+   *
+   * Why: interrupting a run leaves its children in taskStatus "interrupted" WITHOUT a
+   * completed report, and canCleanupReportedTask requires a completed report — so those
+   * children would linger in the active sidebar forever (until manual deletion).
+   * Workflow-owned children are transient by design (results persist in the workflow
+   * run/report artifacts), so archive them — never remove — once the owning run has
+   * ended. Archived entries disappear from the active sidebar but keep their data for
+   * inspection. User-spawned interrupted tasks are untouched: they intentionally stay
+   * visible for manual inspection/resume.
+   *
+   * workflow_resume stays safe: resume replays the journal and restarts incomplete steps
+   * with FRESH task ids (see WorkflowRunner's unrecoverable-started-task restart), so
+   * archived old children are never reused.
+   *
+   * Idempotent (interrupted + not-already-archived filter), so it runs from both the
+   * run-end hook and the run-scoped interrupt path: WorkflowService.interruptRun aborts
+   * the runner BEFORE terminating descendants, so the runner's onRunEnded can fire while
+   * children are still "running" — only the later interrupt-path sweep sees them.
+   */
+  private async sweepEndedWorkflowRunTasks(workflowRunId: string): Promise<void> {
+    assert(workflowRunId.length > 0, "sweepEndedWorkflowRunTasks: workflowRunId must be non-empty");
+
+    // Phase 1: archive interrupted-without-report descendants of the run. Descendants of
+    // run children (spawned by workflow-owned agents) are included via ancestry.
+    {
+      const cfg = this.config.loadConfigOrDefault();
+      const index = this.buildAgentTaskIndex(cfg);
+      const interruptedTaskIds = [...index.byId.entries()]
+        .filter(
+          ([taskId, workspace]) =>
+            this.isWorkflowRunDescendant(index, taskId, workflowRunId) &&
+            workspace.taskStatus === "interrupted" &&
+            !hasCompletedAgentReport(workspace) &&
+            !isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)
+        )
+        .map(([taskId]) => taskId);
+      await this.archiveWorkflowTaskWorkspacesDeepestFirst(interruptedTaskIds, index);
+    }
+
+    // Phase 2: recheck reported descendants of the run (deepest-first). Eligible ones are
+    // removed by the normal cleanup walk. The rest can be blocked by the structural-leaf
+    // topology gate: hasChildAgentTasks counts archived children too, so a reported
+    // ancestor whose only remaining children are the entries archived in phase 1 can
+    // never become removable — removing it anyway would orphan those archived config
+    // entries. Archive such ancestors instead: hidden from the active sidebar, fully
+    // preserved for inspection, tree intact.
+    {
+      const cfg = this.config.loadConfigOrDefault();
+      const index = this.buildAgentTaskIndex(cfg);
+      const reportedTaskIds = [...index.byId.entries()]
+        .filter(
+          ([taskId, workspace]) =>
+            this.isWorkflowRunDescendant(index, taskId, workflowRunId) &&
+            hasCompletedAgentReport(workspace)
+        )
+        .map(([taskId]) => taskId);
+      const depthById = new Map<string, number>();
+      for (const taskId of reportedTaskIds) {
+        depthById.set(taskId, this.getTaskDepthFromParentById(index.parentById, taskId));
+      }
+      reportedTaskIds.sort((a, b) => (depthById.get(b) ?? 0) - (depthById.get(a) ?? 0));
+
+      for (const taskId of reportedTaskIds) {
+        await this.cleanupReportedLeafTask(taskId);
+
+        const freshConfig = this.config.loadConfigOrDefault();
+        const entry = findWorkspaceEntry(freshConfig, taskId);
+        if (!entry) continue; // removed by the cleanup walk
+        if (isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt)) {
+          continue;
         }
+        // Defensive: never hide a workspace with an active stream.
+        if (this.aiService.isStreaming(taskId)) continue;
+        const freshIndex = this.buildAgentTaskIndex(freshConfig);
+        const childTaskIds = freshIndex.childrenByParent.get(taskId) ?? [];
+        // Leaf tasks deferred by non-topology gates (pending patch artifact, best-of
+        // grouping) keep their own event-driven rechecks; do not archive them here.
+        if (childTaskIds.length === 0) continue;
+        const blockedOnlyByArchivedChildren = childTaskIds.every((childTaskId) => {
+          const child = freshIndex.byId.get(childTaskId);
+          return child != null && isWorkspaceArchived(child.archivedAt, child.unarchivedAt);
+        });
+        if (!blockedOnlyByArchivedChildren) continue;
+        await this.archiveWorkflowTaskWorkspacesDeepestFirst([taskId], freshIndex);
       }
     }
-    for (const taskId of completedTaskIds) {
-      await this.cleanupReportedLeafTask(taskId);
+  }
+
+  /**
+   * Archive task workspaces deepest-first (so WorkspaceService.archive preconditions on
+   * descendants hold), logging and continuing on per-task failures — one failed archive
+   * must not abort the sweep; failures self-heal on the next startup sweep.
+   */
+  private async archiveWorkflowTaskWorkspacesDeepestFirst(
+    taskIds: readonly string[],
+    index: AgentTaskIndex
+  ): Promise<void> {
+    if (taskIds.length === 0) return;
+    const depthById = new Map<string, number>();
+    for (const taskId of taskIds) {
+      depthById.set(taskId, this.getTaskDepthFromParentById(index.parentById, taskId));
     }
+    const orderedTaskIds = [...taskIds].sort(
+      (a, b) => (depthById.get(b) ?? 0) - (depthById.get(a) ?? 0)
+    );
+    // Ancestors of a task whose archive failed or was skipped must stay visible too:
+    // hiding the parent while its child remains active would orphan the child in the
+    // sidebar. Deepest-first ordering guarantees descendants settle before ancestors.
+    const blockedAncestorIds = new Set<string>();
+    const markAncestorsBlocked = (taskId: string): void => {
+      let currentId = index.parentById.get(taskId);
+      for (let depth = 0; currentId != null && depth < 32; depth++) {
+        blockedAncestorIds.add(currentId);
+        currentId = index.parentById.get(currentId);
+      }
+    };
+    for (const taskId of orderedTaskIds) {
+      if (blockedAncestorIds.has(taskId)) {
+        // Own ancestors are already in the set: the failing descendant's walk went to root.
+        log.warn(
+          "Skipping auto-archive of workflow task workspace; a descendant stayed unarchived",
+          { taskId }
+        );
+        continue;
+      }
+      try {
+        const result = await this.workspaceService.archive(taskId);
+        if (!result.success) {
+          log.warn("Failed to archive leftover workflow task workspace", {
+            taskId,
+            error: result.error,
+          });
+          markAncestorsBlocked(taskId);
+        } else if (result.data.kind === "confirm-lossy-untracked-files") {
+          // Snapshot-archive mode asks for user confirmation before discarding untracked
+          // files. Auto-acknowledging would silently lose data, so leave this workspace
+          // visible for manual handling instead.
+          log.warn(
+            "Skipping auto-archive of workflow task workspace pending untracked-file confirmation",
+            { taskId }
+          );
+          markAncestorsBlocked(taskId);
+        }
+      } catch (error: unknown) {
+        log.warn("Archive of leftover workflow task workspace threw", { taskId, error });
+        markAncestorsBlocked(taskId);
+      }
+    }
+  }
+
+  /**
+   * Startup self-heal: archive interrupted-without-report workflow-owned tasks whose
+   * owning workflow run is no longer active. Covers both children the startup prepass
+   * just transitioned to "interrupted" (inactive workflow owner) and historical garbage
+   * left by interrupts before this sweep existed. Delegates to
+   * sweepEndedWorkflowRunTasks per inactive run so blocked reported ancestors are also
+   * resolved. Returns the number of inactive runs swept.
+   */
+  private async archiveLeftoverTasksOfInactiveWorkflowRuns(): Promise<number> {
+    const cfg = this.config.loadConfigOrDefault();
+    const index = this.buildAgentTaskIndex(cfg);
+    const inactiveRunIds = new Set<string>();
+    for (const [taskId, workspace] of index.byId) {
+      if (isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)) continue;
+      // Seed from two unarchived shapes so a crash mid-sweep still self-heals:
+      // - interrupted-without-report children (normal leftover garbage), and
+      // - reported tasks, covering a crash after phase 1 archived the interrupted
+      //   children but before phase 2 archived the reported ancestor they block —
+      //   at that point no unarchived interrupted task remains to re-seed the run.
+      // Reported tasks of ACTIVE runs are filtered out by the inactivity check below.
+      if (workspace.taskStatus !== "interrupted" && !hasCompletedAgentReport(workspace)) {
+        continue;
+      }
+      // Non-workflow-owned tasks have no owner in ancestry → null → skipped (user-spawned
+      // interrupted tasks intentionally stay visible).
+      const inactiveOwner = await this.getInactiveWorkflowTaskOwnerForRecovery(taskId, cfg, index);
+      if (inactiveOwner == null) continue;
+      inactiveRunIds.add(inactiveOwner.runId);
+    }
+    for (const runId of inactiveRunIds) {
+      await this.sweepEndedWorkflowRunTasks(runId);
+    }
+    return inactiveRunIds.size;
   }
 
   /**
@@ -3919,6 +4322,16 @@ export class TaskService {
 
     for (const taskId of interruptedTaskIds) {
       await this.emitWorkspaceMetadata(taskId);
+    }
+
+    if (options?.workflowRunId != null) {
+      // Run-scoped interrupts arrive after the owning run's terminal status write
+      // (WorkflowService.interruptRun aborts the runner, persists "interrupted", THEN
+      // terminates descendants), so the children just interrupted above can be archived
+      // right away. markWorkflowRunEnded also sweeps, but the runner-abort path can fire
+      // onRunEnded before this termination completes — sweeping here closes that
+      // ordering race (the sweep is idempotent).
+      await this.sweepEndedWorkflowRunTasks(options.workflowRunId);
     }
 
     // Free slots and start any queued tasks (best-effort).
@@ -4381,6 +4794,35 @@ export class TaskService {
     );
   }
 
+  async markWorkspaceTurnTerminalAttentionConsumed(params: {
+    ownerWorkspaceId: string;
+    handleId: string;
+    status: WorkspaceTurnTaskStatus;
+  }): Promise<void> {
+    assert(
+      params.ownerWorkspaceId.length > 0,
+      "markWorkspaceTurnTerminalAttentionConsumed requires ownerWorkspaceId"
+    );
+    assert(
+      params.handleId.length > 0,
+      "markWorkspaceTurnTerminalAttentionConsumed requires handleId"
+    );
+    if (!this.isTerminalWorkspaceTurnStatus(params.status)) {
+      return;
+    }
+    await this.terminalAttentionStore.enqueueIfAbsent({
+      ownerWorkspaceId: params.ownerWorkspaceId,
+      sourceKind: "workspace_turn",
+      sourceId: params.handleId,
+      outputDelivery: "requires_task_await",
+      terminalOutcome: workspaceTurnTerminalOutcome(params.status),
+    });
+    await this.terminalAttentionStore.markDelivered(
+      params.ownerWorkspaceId,
+      TerminalAttentionStore.notificationId("workspace_turn", params.handleId)
+    );
+  }
+
   private async enqueueTerminalAttention(params: {
     ownerWorkspaceId: string;
     sourceKind: TerminalAttentionNotification["sourceKind"];
@@ -4576,6 +5018,7 @@ export class TaskService {
       model: resumeOptions.model,
       agentId: resumeOptions.agentId,
       thinkingLevel: resumeOptions.thinkingLevel,
+      reasoningMode: resumeOptions.reasoningMode,
     };
     let sendResult = await this.workspaceService.sendMessage(
       ownerWorkspaceId,
@@ -5083,6 +5526,7 @@ export class TaskService {
         model,
         agentId,
         thinkingLevel: freshEntry.workspace.taskThinkingLevel,
+        reasoningMode: coerceOpenAIReasoningMode(freshEntry.workspace.aiSettings?.reasoningMode),
         experiments: freshEntry.workspace.taskExperiments,
         toolPolicy: [{ regex_match: `^${completionToolName}$`, action: "require" }],
       },
@@ -5783,11 +6227,13 @@ export class TaskService {
     }
 
     if (shouldClearQueuedPrompt && workspaceId != null) {
-      const clearQueueResult = this.workspaceService.clearQueue(workspaceId, {
+      // Targeted removal: the queue can hold unrelated user messages before/behind
+      // this turn's entry, so clearing the whole queue would drop real input.
+      const removeResult = this.workspaceService.removeQueuedWorkspaceTurn(workspaceId, handleId, {
         cancelReason: "Workspace turn interrupted",
       });
-      if (!clearQueueResult.success) {
-        return Err(`Failed to clear queued workspace turn: ${clearQueueResult.error}`);
+      if (!removeResult.success) {
+        return Err(`Failed to clear queued workspace turn: ${removeResult.error}`);
       }
     }
     if (shouldStopStream && workspaceId != null) {
@@ -6264,9 +6710,14 @@ export class TaskService {
     );
 
     const result: string[] = [];
+    const visited = new Set([workspaceId]);
     const stack: string[] = [...(index.childrenByParent.get(workspaceId) ?? [])];
     while (stack.length > 0) {
       const next = stack.pop()!;
+      if (visited.has(next)) {
+        continue;
+      }
+      visited.add(next);
       result.push(next);
       const children = index.childrenByParent.get(next);
       if (children) {
@@ -7116,21 +7567,28 @@ export class TaskService {
           continue;
         }
 
+        const parentRuntimeProjectPath =
+          parentEntry.workspace.kind === "scratch"
+            ? parentEntry.workspace.path
+            : parentEntry.projectPath;
         const parentMetaResult = await this.aiService.getWorkspaceMetadata(parentWorkspaceId);
         const parentMeta = parentMetaResult.success
           ? parentMetaResult.data
           : ({
               id: parentWorkspaceId,
               name: parentWorkspaceName,
-              projectPath: parentEntry.projectPath,
+              kind: parentEntry.workspace.kind,
+              projectPath: parentRuntimeProjectPath,
               projectName:
-                parentEntry.workspace.projects?.find(
-                  (project) =>
-                    stripTrailingSlashes(project.projectPath) ===
-                    stripTrailingSlashes(parentEntry.projectPath)
-                )?.projectName ??
-                parentEntry.projectPath.split("/").filter(Boolean).at(-1) ??
-                parentEntry.projectPath,
+                parentEntry.workspace.kind === "scratch"
+                  ? SCRATCH_PROJECT_NAME
+                  : (parentEntry.workspace.projects?.find(
+                      (project) =>
+                        stripTrailingSlashes(project.projectPath) ===
+                        stripTrailingSlashes(parentEntry.projectPath)
+                    )?.projectName ??
+                    parentEntry.projectPath.split("/").filter(Boolean).at(-1) ??
+                    parentEntry.projectPath),
               runtimeConfig: parentRuntimeConfig,
               projects: parentEntry.workspace.projects,
             } satisfies WorkspaceMetadata);
@@ -7141,12 +7599,12 @@ export class TaskService {
         try {
           const parentRuntime = createRuntimeForWorkspace({
             runtimeConfig: parentRuntimeConfig,
-            projectPath: parentEntry.projectPath,
+            projectPath: parentRuntimeProjectPath,
             name: parentWorkspaceName,
           });
           const parentWorkspacePath =
             coerceNonEmptyString(parentEntry.workspace.path) ??
-            parentRuntime.getWorkspacePath(parentEntry.projectPath, parentWorkspaceName);
+            parentRuntime.getWorkspacePath(parentRuntimeProjectPath, parentWorkspaceName);
           const frontmatter = await resolveAgentFrontmatter(
             parentRuntime,
             parentWorkspacePath,
@@ -7188,9 +7646,14 @@ export class TaskService {
           createdAt,
           taskRuntimeConfig,
           parentRuntimeConfig,
+          configProjectPath: normalizedTaskProjectPath,
+          workspaceKind: task.kind,
           taskModelString: task.taskModelString ?? defaultModel,
           canonicalModel,
           effectiveThinkingLevel: task.taskThinkingLevel,
+          // Durable pro-mode source: the task record's aiSettings (written at
+          // creation, kept current by subsequent sends' persistence merge).
+          effectiveReasoningMode: coerceOpenAIReasoningMode(task.aiSettings?.reasoningMode),
           skipInitHook,
           preferredTrunkBranch: task.taskTrunkBranch,
           workflowTask: task.workflowTask,
@@ -7460,6 +7923,7 @@ export class TaskService {
         model,
         agentId,
         thinkingLevel: entry.workspace.taskThinkingLevel,
+        reasoningMode: coerceOpenAIReasoningMode(entry.workspace.aiSettings?.reasoningMode),
         experiments: entry.workspace.taskExperiments,
         toolPolicy: [{ regex_match: `^${completionToolName}$`, action: "require" }],
       },
@@ -7521,6 +7985,7 @@ export class TaskService {
         model,
         agentId,
         thinkingLevel: entry.workspace.taskThinkingLevel,
+        reasoningMode: coerceOpenAIReasoningMode(entry.workspace.aiSettings?.reasoningMode),
         experiments: entry.workspace.taskExperiments,
       },
       { synthetic: true, agentInitiated: true }
@@ -8066,6 +8531,7 @@ export class TaskService {
         model: resumeOptions.model,
         agentId: resumeOptions.agentId,
         thinkingLevel: resumeOptions.thinkingLevel,
+        reasoningMode: resumeOptions.reasoningMode,
         ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
       };
       let sendResult = await this.workspaceService.sendMessage(
@@ -8886,10 +9352,26 @@ export class TaskService {
           },
         });
 
+      // Plan -> Exec continues in the same workspace, so its own persisted pro
+      // choice carries over (resolveTaskAISettings sees an empty parentMeta here).
+      // A PRO toggle during the plan phase persists under the plan agent's
+      // bucket (aiSettingsByAgent), so read the still-current plan agent's
+      // settings first and only then fall back to legacy aiSettings.
+      const planAgentSettings = this.resolveWorkspaceAISettings(
+        args.entry.workspace,
+        normalizeAgentId(args.entry.workspace.agentId, "plan")
+      );
+      const planPhaseReasoningMode = coerceOpenAIReasoningMode(
+        planAgentSettings?.reasoningMode ?? args.entry.workspace.aiSettings?.reasoningMode
+      );
       await this.editWorkspaceEntry(args.workspaceId, (workspace) => {
         workspace.agentId = targetAgentId;
         workspace.agentType = targetAgentId;
-        workspace.aiSettings = { model: canonicalModel, thinkingLevel: effectiveThinkingLevel };
+        workspace.aiSettings = {
+          model: canonicalModel,
+          thinkingLevel: effectiveThinkingLevel,
+          ...(planPhaseReasoningMode != null ? { reasoningMode: planPhaseReasoningMode } : {}),
+        };
         workspace.taskModelString = taskModelString;
         workspace.taskThinkingLevel = effectiveThinkingLevel;
         // A successful propose_plan is a successful completion-tool outcome: the
@@ -8908,6 +9390,7 @@ export class TaskService {
             model: taskModelString,
             agentId: targetAgentId,
             thinkingLevel: effectiveThinkingLevel,
+            ...(planPhaseReasoningMode != null ? { reasoningMode: planPhaseReasoningMode } : {}),
             experiments: args.entry.workspace.taskExperiments,
           },
           { synthetic: true, agentInitiated: true }

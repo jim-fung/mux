@@ -205,6 +205,87 @@ describe("McpOauthService store", () => {
 
     expect(await readStoreFile()).toEqual({ version: 2, entries: {} });
   });
+
+  // Regression test: @ai-sdk/mcp auth() only uses a stored refresh_token when
+  // the persisted tokens/clientInformation retain the authorization_server +
+  // token_endpoint binding it saved. Stripping them during store parsing made
+  // auth() invalidate the tokens and demand interactive re-login after every
+  // app restart.
+  test("authorization server binding survives store round-trip", async () => {
+    const populatedStore = {
+      version: 2,
+      entries: {
+        "https://example.com/": {
+          serverUrl,
+          updatedAtMs: Date.now(),
+          clientInformation: {
+            client_id: "client-id",
+            authorization_server: "https://auth.example.com/",
+            token_endpoint: "https://auth.example.com/token",
+          },
+          tokens: {
+            access_token: "access-token",
+            token_type: "Bearer",
+            refresh_token: "refresh-token",
+            authorization_server: "https://auth.example.com/",
+            token_endpoint: "https://auth.example.com/token",
+          },
+        },
+      },
+    };
+    await fs.writeFile(getStoreFilePath(muxHome), JSON.stringify(populatedStore), "utf-8");
+
+    const provider = await service.getAuthProviderForServer({ serverUrl });
+    expect(provider).toBeDefined();
+
+    const tokens = await provider!.tokens();
+    expect(tokens?.refresh_token).toBe("refresh-token");
+    expect(tokens?.authorization_server).toBe("https://auth.example.com/");
+    expect(tokens?.token_endpoint).toBe("https://auth.example.com/token");
+
+    const clientInformation = await provider!.clientInformation();
+    expect(clientInformation?.authorization_server).toBe("https://auth.example.com/");
+    expect(clientInformation?.token_endpoint).toBe("https://auth.example.com/token");
+  });
+
+  test.each([
+    // Corrupted: not a parseable URL.
+    "not a url",
+    // Parseable but rejected by @ai-sdk/mcp's SafeUrlSchema; must be dropped
+    // for self-healing rather than surfacing as a metadata mismatch in auth().
+    "javascript:alert(1)",
+    "data:text/plain,x",
+    "vbscript:x",
+    // Parseable non-http(s) scheme: OAuth endpoints are always http(s).
+    "ftp://auth.example.com/",
+  ])("invalid authorization server binding %j is dropped as a pair", async (badUrl) => {
+    const populatedStore = {
+      version: 2,
+      entries: {
+        "https://example.com/": {
+          serverUrl,
+          updatedAtMs: Date.now(),
+          clientInformation: { client_id: "client-id" },
+          tokens: {
+            access_token: "access-token",
+            token_type: "Bearer",
+            refresh_token: "refresh-token",
+            authorization_server: badUrl,
+            token_endpoint: "https://auth.example.com/token",
+          },
+        },
+      },
+    };
+    await fs.writeFile(getStoreFilePath(muxHome), JSON.stringify(populatedStore), "utf-8");
+
+    const provider = await service.getAuthProviderForServer({ serverUrl });
+    expect(provider).toBeDefined();
+
+    const tokens = await provider!.tokens();
+    expect(tokens?.refresh_token).toBe("refresh-token");
+    expect(tokens?.authorization_server).toBeUndefined();
+    expect(tokens?.token_endpoint).toBeUndefined();
+  });
 });
 
 describe("parseBearerWwwAuthenticate", () => {
@@ -383,7 +464,9 @@ describe("McpOauthService.startDesktopFlow", () => {
           res.writeHead(200, { "content-type": "application/json" });
           res.end(
             JSON.stringify({
-              issuer: baseUrl,
+              // RFC 8414 canonical issuer: no trailing slash at the root.
+              // @ai-sdk/mcp v2 strictly validates metadata issuer identity.
+              issuer: new URL(baseUrl).origin,
               authorization_endpoint: `${baseUrl}authorize`,
               token_endpoint: `${baseUrl}token`,
               registration_endpoint: `${baseUrl}register`,
@@ -475,7 +558,9 @@ describe("McpOauthService.startDesktopFlow", () => {
           res.writeHead(200, { "content-type": "application/json" });
           res.end(
             JSON.stringify({
-              issuer: authorizationServerBaseUrl,
+              // RFC 8414 canonical issuer: no trailing slash at the root.
+              // @ai-sdk/mcp v2 strictly validates metadata issuer identity.
+              issuer: new URL(authorizationServerBaseUrl).origin,
               authorization_endpoint: `${authorizationServerBaseUrl}authorize`,
               token_endpoint: `${authorizationServerBaseUrl}token`,
               registration_endpoint: `${authorizationServerBaseUrl}register`,

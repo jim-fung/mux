@@ -21,6 +21,7 @@ export const CommandIds = {
   workspaceSwitch: (workspaceId: string) =>
     `${COMMAND_ID_PREFIXES.WS_SWITCH}${workspaceId}` as const,
   workspaceNew: () => "ws:new" as const,
+  workspaceNewScratch: () => "ws:new-scratch" as const,
   workspaceNewInProject: () => "ws:new-in-project" as const,
   workspaceNewMultiProject: () => "ws:new-multi-project" as const,
   workspaceRemove: () => "ws:remove" as const,
@@ -28,6 +29,9 @@ export const CommandIds = {
   workspaceEditTitle: () => "ws:edit-title" as const,
   workspaceEditTitleAny: () => "ws:edit-title-any" as const,
   workspaceGenerateTitle: () => "ws:generate-title" as const,
+  workspaceTogglePinned: () => "ws:toggle-pinned" as const,
+  workspaceMovePinnedUp: () => "ws:move-pinned-up" as const,
+  workspaceMovePinnedDown: () => "ws:move-pinned-down" as const,
   workspaceOpenTerminal: () => "ws:open-terminal" as const,
   workspaceOpenTerminalCurrent: () => "ws:open-terminal-current" as const,
   workspaceArchiveMergedInProject: () => "ws:archive-merged-in-project" as const,
@@ -66,6 +70,7 @@ export const CommandIds = {
   modeToggle: () => "mode:toggle" as const,
   modelChange: () => "model:change" as const,
   thinkingSetLevel: () => "thinking:set-level" as const,
+  toggleProReasoning: () => "thinking:toggle-pro-reasoning" as const,
 
   // Project commands
   projectAdd: () => "project:add" as const,

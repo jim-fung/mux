@@ -212,7 +212,8 @@ async function copyPersistentConfig(realConfig: Config, config: Config): Promise
     }
   }
   if (trustOnlyProjects.size > 0) {
-    await config.saveConfig({ ...config.loadConfigOrDefault(), projects: trustOnlyProjects });
+    // Config.saveConfig is private (lost-update safety); route through the queue.
+    await config.editConfig((cfg) => ({ ...cfg, projects: trustOnlyProjects }));
   }
 }
 
@@ -237,6 +238,9 @@ async function disposeWorkflowResources(input: {
   session?: AgentSession;
   codexOauthService?: CodexOauthService;
 }): Promise<void> {
+  // Suppress monitor:stopped before session.dispose() triggers cleanup() so persisted
+  // armed-monitor registry records survive shutdown (post-restart "monitor lost" wakes).
+  input.services?.backgroundProcessManager.beginShutdown();
   try {
     input.session?.dispose();
   } catch (error) {

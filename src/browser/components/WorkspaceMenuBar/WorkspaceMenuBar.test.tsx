@@ -35,15 +35,36 @@ import * as WorkspaceActionsMenuContentModule from "../WorkspaceActionsMenuConte
 import * as WorkspaceTerminalIconModule from "../icons/WorkspaceTerminalIcon/WorkspaceTerminalIcon";
 import * as SkillIndicatorModule from "../SkillIndicator/SkillIndicator";
 
+import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX } from "@/constants/layout";
 
 let WorkspaceMenuBar!: typeof WorkspaceMenuBarComponent;
 
+let workspaceMetadata = new Map<string, FrontendWorkspaceMetadata>();
 let cleanupDom: (() => void) | null = null;
 const workspaceId = "workspace-1";
 
 function TestWrapper(props: PropsWithChildren) {
   return <>{props.children}</>;
+}
+
+// The WorkspaceActionsMenuContent test double records every render's props, so
+// gating assertions read the latest call instead of clicking through the menu.
+function getLastMenuContentProps() {
+  const spy = WorkspaceActionsMenuContentModule.WorkspaceActionsMenuContent as unknown as {
+    mock: {
+      calls: Array<
+        [
+          {
+            onForkChat?: ((anchorEl: HTMLElement) => void) | null;
+            onEnterImmersiveReview?: (() => void) | null;
+            onOpenTouchFullscreenReview?: (() => void) | null;
+          },
+        ]
+      >;
+    };
+  };
+  return spy.mock.calls.at(-1)?.[0];
 }
 
 function resolveArchivePreflight(
@@ -120,7 +141,7 @@ function installWorkspaceMenuBarTestDoubles() {
   );
   spyOn(WorkspaceContextModule, "useWorkspaceContext").mockImplementation(
     () =>
-      ({ workspaceMetadata: new Map() }) as unknown as ReturnType<
+      ({ workspaceMetadata }) as unknown as ReturnType<
         typeof WorkspaceContextModule.useWorkspaceContext
       >
   );
@@ -130,6 +151,9 @@ function installWorkspaceMenuBarTestDoubles() {
         getProjectConfig: () => undefined,
         userProjects: new Map(),
       }) as unknown as ReturnType<typeof ProjectContextModule.useProjectContext>
+  );
+  spyOn(WorkspaceStoreModule, "useWorkspaceMetadataEntry").mockImplementation((id) =>
+    id ? (workspaceMetadata.get(id) ?? null) : null
   );
   spyOn(WorkspaceStoreModule, "useWorkspaceSidebarState").mockImplementation(
     () =>
@@ -275,6 +299,7 @@ const defaultProps: ComponentProps<typeof WorkspaceMenuBarComponent> = {
 
 describe("WorkspaceMenuBar archive confirmations", () => {
   beforeEach(() => {
+    workspaceMetadata = new Map();
     cleanupDom = installDom();
     installWorkspaceMenuBarTestDoubles();
     /* eslint-disable @typescript-eslint/no-require-imports */
@@ -309,6 +334,63 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     mock.restore();
     cleanupDom?.();
     cleanupDom = null;
+  });
+
+  it("hides repository controls for scratch workspaces", () => {
+    const scratchPath = "/home/user/.mux/scratch/workspace-1";
+    workspaceMetadata.set(workspaceId, {
+      kind: "scratch",
+      id: workspaceId,
+      name: "scratch-workspace-1",
+      projectName: "Scratch",
+      projectPath: scratchPath,
+      namedWorkspacePath: scratchPath,
+      runtimeConfig: { type: "local" },
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    const view = render(
+      <WorkspaceMenuBar
+        {...defaultProps}
+        projectName="Scratch"
+        projectPath={scratchPath}
+        workspaceName="scratch-workspace-1"
+        namedWorkspacePath={scratchPath}
+        runtimeConfig={{ type: "local" }}
+      />
+    );
+
+    expect(view.getByText("Scratch")).toBeTruthy();
+    expect(BranchSelectorModule.BranchSelector).not.toHaveBeenCalled();
+    expect(GitStatusIndicatorModule.GitStatusIndicator).not.toHaveBeenCalled();
+    expect(
+      MultiProjectGitStatusIndicatorModule.MultiProjectGitStatusIndicator
+    ).not.toHaveBeenCalled();
+
+    // Repo-dependent More-menu actions must be hidden too: review events are
+    // ignored by RightSidebar for scratch and forking scratch is unsupported.
+    const scratchMenuProps = getLastMenuContentProps();
+    expect(scratchMenuProps?.onForkChat).toBeNull();
+    expect(scratchMenuProps?.onEnterImmersiveReview).toBeNull();
+    expect(scratchMenuProps?.onOpenTouchFullscreenReview).toBeNull();
+  });
+
+  it("offers fork and immersive review in the More menu for repo-backed workspaces", () => {
+    workspaceMetadata.set(workspaceId, {
+      id: workspaceId,
+      name: "feature-branch",
+      projectName: "demo",
+      projectPath: "/projects/demo",
+      namedWorkspacePath: "/projects/demo/workspaces/feature-branch",
+      runtimeConfig: { type: "worktree", srcBaseDir: "/tmp/src" },
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    render(<WorkspaceMenuBar {...defaultProps} />);
+
+    const menuProps = getLastMenuContentProps();
+    expect(typeof menuProps?.onForkChat).toBe("function");
+    expect(typeof menuProps?.onEnterImmersiveReview).toBe("function");
   });
 
   it("applies the collapsed-left-sidebar inset immediately from props", () => {

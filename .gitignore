@@ -110,6 +110,8 @@ runs/
 
 # Python
 __pycache__
+# ruff format (fmt.mk) drops its cache at the repo root
+.ruff_cache/
 
 tmpfork
 .mux-agent-cli
@@ -131,8 +133,11 @@ docs/theme/pagetoc.css
 !src/node/services/workflows/builtInWorkflowActionContent.generated.ts
 !src/node/services/workflows/workflowRuntimeSources.generated.ts
 docs/theme/pagetoc.js
-mobile/.expo/
 .mux/mcp.jsonc
+# Removed mobile/ Expo prototype: upgraded checkouts keep untracked leftovers
+# (node_modules, .expo, ios, android) that its deleted nested .gitignore used
+# to hide. Ignore the whole dead path so git status stays clean.
+mobile/
 # Terminal-Bench leaderboard cache
 benchmarks/terminal_bench/.leaderboard_cache/
 # Terminal-Bench job output

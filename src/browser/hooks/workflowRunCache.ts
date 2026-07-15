@@ -182,10 +182,7 @@ export function subscribeWorkflowRun(
   };
 }
 
-export function getWorkflowRunSnapshot(
-  workspaceId: string,
-  runId: string
-): WorkflowRunSnapshot {
+export function getWorkflowRunSnapshot(workspaceId: string, runId: string): WorkflowRunSnapshot {
   const key = cacheKey(workspaceId, runId);
   return cache.get(key)?.snapshot ?? { run: null, loading: false, error: null };
 }

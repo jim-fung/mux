@@ -27,6 +27,8 @@
  */
 
 import { streamText, type ModelMessage } from "ai";
+import type { LanguageModelV2Usage } from "@ai-sdk/provider";
+import { modelCostsIncluded } from "./providerModelFactory";
 import type { AIService } from "./aiService";
 import type { HistoryService } from "./historyService";
 import { log } from "./log";
@@ -46,6 +48,7 @@ import {
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import { createUserMessageId, createAssistantMessageId } from "@/node/services/utils/messageIds";
 import { NAME_GEN_PREFERRED_MODELS } from "@/common/constants/nameGeneration";
+import { normalizeUsage, withCacheWriteMetadata } from "@/common/utils/tokens/usageHelpers";
 
 /** Max non-/btw messages from the active context window we keep in a /btw transcript. */
 const SIDE_QUESTION_MAX_TRAILING_MESSAGES = 200;
@@ -67,7 +70,10 @@ const SIDE_QUESTION_MIN_FALLBACK_ATTEMPTS = 3;
  * peek at the live-stream registry. Stating the dependency precisely keeps
  * `askSideQuestion` testable without an `as unknown as AIService` cast.
  */
-export type SideQuestionAIService = Pick<AIService, "createModel" | "getStreamInfo">;
+export type SideQuestionAIService = Pick<
+  AIService,
+  "createModel" | "getStreamInfo" | "resolveMetadataModel"
+>;
 
 export interface AskSideQuestionOptions {
   workspaceId: string;
@@ -83,6 +89,16 @@ export interface AskSideQuestionOptions {
    * stays free of any direct dependency on AgentSession.
    */
   emitChatEvent: (workspaceId: string, message: WorkspaceChatMessage) => void;
+  /**
+   * Best-effort cost telemetry for the successful answer. /btw bypasses
+   * StreamManager, so without this callback its token spend never reaches
+   * session-usage.json. Provided by WorkspaceService (SessionUsageService).
+   */
+  recordUsage?: (
+    modelString: string,
+    usage: LanguageModelV2Usage,
+    providerMetadata?: Record<string, unknown>
+  ) => Promise<void>;
 }
 
 export interface AskSideQuestionSuccess {
@@ -352,6 +368,8 @@ export async function askSideQuestion(
       startTime: streamStartedAt,
     });
 
+    let usage: LanguageModelV2Usage | undefined;
+    let usageProviderMetadata: Record<string, unknown> | undefined;
     try {
       try {
         // streamText (not generateText): we want token-by-token UX.
@@ -378,6 +396,40 @@ export async function askSideQuestion(
             tokens: 0,
             timestamp: Date.now(),
           });
+        }
+
+        // Cost telemetry: the side question sends the full conversation
+        // context, so the provider bills real spend. Capture usage after a
+        // clean stream (short race — a slow-settling SDK promise must not
+        // stall the answer) so it can be persisted on the answer row and
+        // recorded in session-usage.json below.
+        const withTimeout = <T>(promise: PromiseLike<T>): Promise<T | undefined> =>
+          Promise.race([
+            promise,
+            new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 2000)),
+          ]).catch(() => undefined);
+        // AI SDK 7: top-level `usage` accumulates across all steps (old
+        // `totalUsage`). Normalize to mux's persisted flat shape and re-inject
+        // cache-write tokens (moved off providerMetadata in v7) for pricing.
+        const rawUsage = await withTimeout(stream.usage);
+        usage = normalizeUsage(rawUsage);
+        usageProviderMetadata = withCacheWriteMetadata(
+          (await withTimeout(stream.providerMetadata)) as Record<string, unknown> | undefined,
+          rawUsage
+        );
+        // Subscription-covered routing (Codex OAuth) must price at $0. The
+        // StreamManager path stamps this via markProviderMetadataCostsIncluded;
+        // /btw bypasses it, so stamp here — the persisted answer row (analytics
+        // ETL) and the recordUsage callback both read this metadata.
+        if (usage !== undefined && modelCostsIncluded(modelResult.data)) {
+          const existingMux = usageProviderMetadata?.mux;
+          usageProviderMetadata = {
+            ...(usageProviderMetadata ?? {}),
+            mux: {
+              ...(typeof existingMux === "object" && existingMux !== null ? existingMux : {}),
+              costsIncluded: true,
+            },
+          };
         }
       } catch (error) {
         lastError = mapNameGenerationError(error, modelString);
@@ -451,6 +503,16 @@ export async function askSideQuestion(
           timestamp: streamStartedAt,
           duration,
           model: modelString,
+          // Resolved mappedToModel alias target (mirrors StreamManager rows):
+          // without it the ETL prices custom provider models against the raw
+          // custom ID (unknown → $0).
+          metadataModel: aiService.resolveMetadataModel(modelString),
+          // Persist usage on the answer row so analytics prices the /btw turn
+          // (the ETL reads metadata.usage from chat.jsonl rows).
+          ...(usage !== undefined ? { usage } : {}),
+          ...(usageProviderMetadata !== undefined
+            ? { providerMetadata: usageProviderMetadata }
+            : {}),
           muxMetadata: {
             type: SIDE_QUESTION_ANSWER_METADATA_TYPE,
             questionMessageId: userMessage.id,
@@ -458,6 +520,12 @@ export async function askSideQuestion(
         },
         parts: finalParts,
       };
+
+      // Mirror the persisted usage into session-usage.json (live per-workspace
+      // cost display). Best-effort: the recorder never throws.
+      if (usage !== undefined && opts.recordUsage) {
+        await opts.recordUsage(modelString, usage, usageProviderMetadata);
+      }
 
       const updateResult = await historyService.updateHistory(workspaceId, assistantMessage);
       if (!updateResult.success) {
@@ -471,6 +539,12 @@ export async function askSideQuestion(
         });
       }
 
+      // INVARIANT: this stream-end must NOT carry metadata.usage. The live
+      // Costs cache already receives this turn's spend via the
+      // session-usage-delta emitted by the recordUsage callback above;
+      // WorkspaceStore also accumulates stream-end usage, so including it
+      // here would double-count until a reload. Usage lives only on the
+      // persisted answer row (for the analytics ETL).
       emitChatEvent(workspaceId, {
         type: "stream-end",
         workspaceId,

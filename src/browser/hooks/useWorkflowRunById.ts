@@ -2,10 +2,7 @@ import { useContext, useSyncExternalStore } from "react";
 
 import { APIContext } from "@/browser/contexts/API";
 import type { WorkflowRunRecord } from "@/common/types/workflow";
-import {
-  subscribeWorkflowRun,
-  getWorkflowRunSnapshot,
-} from "./workflowRunCache";
+import { subscribeWorkflowRun, getWorkflowRunSnapshot } from "./workflowRunCache";
 
 // Re-export helpers from the dedicated helpers module for backwards compatibility
 // with existing consumers that imported them from this module.
@@ -43,19 +40,24 @@ export function useWorkflowRunById(input: {
   const snapshot = useSyncExternalStore(
     (listener: () => void) => {
       if (!isReady || api == null) {
-        return () => {};
+        return () => undefined;
       }
-      return subscribeWorkflowRun(workspaceId!, runId!, {
-        api,
-        pollWhileActive: input.pollWhileActive,
-        pollAfterTerminal: input.pollAfterTerminal,
-      }, listener);
+      return subscribeWorkflowRun(
+        workspaceId,
+        runId,
+        {
+          api,
+          pollWhileActive: input.pollWhileActive,
+          pollAfterTerminal: input.pollAfterTerminal,
+        },
+        listener
+      );
     },
     () => {
       if (!isReady) {
         return IDLE_SNAPSHOT;
       }
-      return getWorkflowRunSnapshot(workspaceId!, runId!);
+      return getWorkflowRunSnapshot(workspaceId, runId);
     }
   );
 

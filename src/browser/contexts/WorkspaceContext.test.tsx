@@ -17,6 +17,7 @@ import {
   getTerminalTitlesKey,
   getThinkingLevelKey,
 } from "@/common/constants/storage";
+import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import type { RecursivePartial } from "@/browser/testUtils";
 import { readPersistedState } from "@/browser/hooks/usePersistedState";
@@ -241,6 +242,63 @@ describe("WorkspaceContext", () => {
     expect(ctx().selectedWorkspace).toBeNull();
     await waitFor(() => expect(ctx().workspaceMetadata.has(workspaceId)).toBe(false));
     expect(localStorage.getItem(SELECTED_WORKSPACE_KEY)).toBeNull();
+  });
+
+  test("navigates to scratch creation when selected scratch workspace is archived", async () => {
+    const workspaceId = "scratch-archive";
+    const scratchWorkdir = "/tmp/mux/scratch/scratch-archive";
+    const scratchMetadata = createProjectWorkspaceMetadata(workspaceId, scratchWorkdir, {
+      kind: "scratch",
+      projectName: "Scratch",
+      namedWorkspacePath: scratchWorkdir,
+    });
+
+    let emitArchive:
+      | ((event: { workspaceId: string; metadata: FrontendWorkspaceMetadata | null }) => void)
+      | null = null;
+
+    createMockAPI({
+      workspace: {
+        list: () => Promise.resolve([scratchMetadata]),
+        onMetadata: () =>
+          Promise.resolve(
+            (async function* () {
+              const event = await new Promise<{
+                workspaceId: string;
+                metadata: FrontendWorkspaceMetadata | null;
+              }>((resolve) => {
+                emitArchive = resolve;
+              });
+              yield event;
+            })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
+          ),
+      },
+      projects: {
+        list: () => Promise.resolve([]),
+      },
+      localStorage: {
+        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace"),
+      },
+      locationPath: `/workspace/${workspaceId}`,
+    });
+
+    const ctx = await setup();
+
+    await waitFor(() => expect(ctx().selectedWorkspace?.workspaceId).toBe(workspaceId));
+    await waitFor(() => expect(emitArchive).toBeTruthy());
+
+    act(() => {
+      emitArchive?.({
+        workspaceId,
+        metadata: {
+          ...scratchMetadata,
+          archivedAt: "2025-02-01T00:00:00.000Z",
+        },
+      });
+    });
+
+    await waitFor(() => expect(ctx().pendingNewWorkspaceProject).toBe(SCRATCH_PROJECT_CONFIG_KEY));
+    expect(ctx().selectedWorkspace).toBeNull();
   });
 
   test("archiving does not override a rapid manual workspace switch", async () => {
@@ -644,6 +702,36 @@ describe("WorkspaceContext", () => {
     await waitFor(() => expect(ctx().selectedWorkspace).toBeNull());
   });
 
+  test("removeWorkspace returns selected scratch workspace to scratch creation", async () => {
+    const workspaceId = "scratch-remove";
+    const scratchWorkdir = "/tmp/mux/scratch/scratch-remove";
+
+    createMockAPI({
+      workspace: {
+        list: () =>
+          Promise.resolve([
+            createProjectWorkspaceMetadata(workspaceId, scratchWorkdir, {
+              kind: "scratch",
+              projectName: "Scratch",
+              namedWorkspacePath: scratchWorkdir,
+            }),
+          ]),
+      },
+      localStorage: {
+        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace"),
+      },
+      locationPath: `/workspace/${workspaceId}`,
+    });
+
+    const ctx = await setup();
+
+    await waitFor(() => expect(ctx().selectedWorkspace?.workspaceId).toBe(workspaceId));
+    await ctx().removeWorkspace(workspaceId);
+
+    await waitFor(() => expect(ctx().pendingNewWorkspaceProject).toBe(SCRATCH_PROJECT_CONFIG_KEY));
+    expect(ctx().selectedWorkspace).toBeNull();
+  });
+
   test("removeWorkspace handles failure gracefully", async () => {
     const { workspace: workspaceApi } = createMockAPI();
 
@@ -1009,6 +1097,89 @@ describe("WorkspaceContext", () => {
     expect(ctx().pendingNewWorkspaceProject).toBeNull();
   });
 
+  test("browser direct open restores an existing scratch workspace", async () => {
+    const workspaceId = "scratch-direct";
+    const scratchWorkdir = "/tmp/mux/scratch/scratch-direct";
+
+    createMockAPI({
+      workspace: {
+        list: () =>
+          Promise.resolve([
+            createProjectWorkspaceMetadata(workspaceId, scratchWorkdir, {
+              kind: "scratch",
+              projectName: "Scratch",
+              namedWorkspacePath: scratchWorkdir,
+            }),
+          ]),
+      },
+      localStorage: {
+        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("dashboard"),
+      },
+      locationPath: `/workspace/${workspaceId}`,
+      navigationType: "navigate",
+    });
+
+    const ctx = await setup();
+
+    await waitFor(() => expect(ctx().loading).toBe(false));
+    await waitFor(() => expect(ctx().selectedWorkspace?.workspaceId).toBe(workspaceId));
+    expect(ctx().pendingNewWorkspaceProject).toBeNull();
+  });
+
+  test("browser direct open clears an unknown workspace after metadata loads", async () => {
+    createMockAPI({
+      workspace: {
+        list: () => Promise.resolve([createProjectWorkspaceMetadata("ws-existing", "/existing")]),
+      },
+      projects: {
+        list: () => Promise.resolve([["/existing", { workspaces: [] }]]),
+      },
+      localStorage: {
+        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("dashboard"),
+      },
+      locationPath: "/workspace/ws-missing",
+      navigationType: "navigate",
+    });
+
+    const ctx = await setup();
+
+    await waitFor(() => expect(ctx().loading).toBe(false));
+    await waitFor(() => expect(ctx().pendingNewWorkspaceProject).toBe("/existing"));
+    expect(ctx().selectedWorkspace).toBeNull();
+  });
+
+  test("browser direct open keeps the persisted selection when the workspace list is empty", async () => {
+    // workspace.list swallows backend read failures and resolves [], so an
+    // empty list is not proof the workspace is gone; the stale-route cleanup
+    // must not wipe the persisted selection. (The startup fallback may still
+    // navigate to a project page; that pre-existing behavior is not under test.)
+    const persistedSelection = {
+      workspaceId: "ws-maybe-alive",
+      projectPath: "/existing",
+      projectName: "existing",
+      namedWorkspacePath: "/existing-main",
+    };
+    createMockAPI({
+      workspace: {
+        list: () => Promise.resolve([]),
+      },
+      projects: {
+        list: () => Promise.resolve([["/existing", { workspaces: [] }]]),
+      },
+      localStorage: {
+        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("dashboard"),
+        [SELECTED_WORKSPACE_KEY]: JSON.stringify(persistedSelection),
+      },
+      locationPath: "/workspace/ws-maybe-alive",
+      navigationType: "navigate",
+    });
+
+    const ctx = await setup();
+
+    await waitFor(() => expect(ctx().loading).toBe(false));
+    expect(localStorage.getItem(SELECTED_WORKSPACE_KEY)).toContain("ws-maybe-alive");
+  });
+
   test("resolves system project route IDs for pending workspace creation", async () => {
     const systemProjectPath = "/system/internal-project";
     const systemProjectId = getProjectRouteId(systemProjectPath);
@@ -1025,6 +1196,25 @@ describe("WorkspaceContext", () => {
 
     await waitFor(() => expect(ctx().loading).toBe(false));
     expect(ctx().pendingNewWorkspaceProject).toBe(systemProjectPath);
+  });
+
+  test("reloaded scratch draft route resolves without a configured _scratch project", async () => {
+    // Before the first scratch chat is ever created, no _scratch bucket exists
+    // in config, and reloads drop the in-memory route state, so the route ID
+    // must resolve statically or the draft page cannot remount.
+    const scratchRouteId = getProjectRouteId(SCRATCH_PROJECT_CONFIG_KEY);
+
+    createMockAPI({
+      locationPath: `/project?project=${encodeURIComponent(scratchRouteId)}`,
+      projects: {
+        list: () => Promise.resolve([["/existing", { workspaces: [] }]]),
+      },
+    });
+
+    const ctx = await setup();
+
+    await waitFor(() => expect(ctx().loading).toBe(false));
+    expect(ctx().pendingNewWorkspaceProject).toBe(SCRATCH_PROJECT_CONFIG_KEY);
   });
 
   test("browser: launch-project opens project creation on true first launch", async () => {
@@ -1463,6 +1653,98 @@ describe("WorkspaceContext", () => {
       expect(state.pendingNewWorkspaceProject).toBeNull();
     });
   });
+
+  describe("reorderPinnedWorkspaces", () => {
+    // Three pinned chats in one project; pinnedAt ascending = a, b, c.
+    const T1 = "2026-01-01T00:00:00.000Z";
+    const T2 = "2026-01-01T00:00:01.000Z";
+    const T3 = "2026-01-01T00:00:02.000Z";
+    const pinnedWorkspaces = (): FrontendWorkspaceMetadata[] => [
+      createProjectWorkspaceMetadata("ws-a", "/alpha", { pinnedAt: T1 }),
+      createProjectWorkspaceMetadata("ws-b", "/alpha", { pinnedAt: T2 }),
+      createProjectWorkspaceMetadata("ws-c", "/alpha", { pinnedAt: T3 }),
+    ];
+    type ReorderResult = { success: true; data: undefined } | { success: false; error: string };
+    const createDeferred = () => {
+      let resolve!: (value: ReorderResult) => void;
+      const promise = new Promise<ReorderResult>((res) => {
+        resolve = res;
+      });
+      return { promise, resolve };
+    };
+    const pinnedAtById = (ctx: () => WorkspaceContext): Record<string, string | undefined> => ({
+      "ws-a": ctx().workspaceMetadata.get("ws-a")?.pinnedAt,
+      "ws-b": ctx().workspaceMetadata.get("ws-b")?.pinnedAt,
+      "ws-c": ctx().workspaceMetadata.get("ws-c")?.pinnedAt,
+    });
+
+    test("failed reorder reverts the optimistic pinnedAt values", async () => {
+      const deferred = createDeferred();
+      createMockAPI({
+        workspace: {
+          list: () => Promise.resolve(pinnedWorkspaces()),
+          reorderPinned: () => deferred.promise,
+        },
+      });
+
+      const ctx = await setup();
+      await waitFor(() => expect(ctx().workspaceMetadata.size).toBe(3));
+
+      let request!: Promise<{ success: boolean; error?: string }>;
+      act(() => {
+        request = ctx().reorderPinnedWorkspaces(["ws-b", "ws-a", "ws-c"]);
+      });
+      // Optimistic re-deal of the existing pool: b<a<c.
+      expect(pinnedAtById(ctx)).toEqual({ "ws-a": T2, "ws-b": T1, "ws-c": T3 });
+
+      deferred.resolve({ success: false, error: "boom" });
+      await act(async () => {
+        expect(await request).toEqual({ success: false, error: "boom" });
+      });
+
+      expect(pinnedAtById(ctx)).toEqual({ "ws-a": T1, "ws-b": T2, "ws-c": T3 });
+    });
+
+    test("stale reorder failure does not clobber a newer reorder's state", async () => {
+      const first = createDeferred();
+      const second = createDeferred();
+      let calls = 0;
+      createMockAPI({
+        workspace: {
+          list: () => Promise.resolve(pinnedWorkspaces()),
+          reorderPinned: () => (calls++ === 0 ? first.promise : second.promise),
+        },
+      });
+
+      const ctx = await setup();
+      await waitFor(() => expect(ctx().workspaceMetadata.size).toBe(3));
+
+      let request1!: Promise<{ success: boolean; error?: string }>;
+      let request2!: Promise<{ success: boolean; error?: string }>;
+      act(() => {
+        request1 = ctx().reorderPinnedWorkspaces(["ws-b", "ws-a", "ws-c"]);
+      });
+      act(() => {
+        request2 = ctx().reorderPinnedWorkspaces(["ws-c", "ws-b", "ws-a"]);
+      });
+      // Second reorder's optimistic re-deal on top of the first: c<b<a.
+      const afterSecond = pinnedAtById(ctx);
+      expect(afterSecond).toEqual({ "ws-a": T3, "ws-b": T2, "ws-c": T1 });
+
+      // Out-of-order completion: #2 succeeds, then the stale #1 fails. Its
+      // revert must not roll entries back underneath the newer reorder.
+      second.resolve({ success: true, data: undefined });
+      await act(async () => {
+        await request2;
+      });
+      first.resolve({ success: false, error: "boom" });
+      await act(async () => {
+        await request1;
+      });
+
+      expect(pinnedAtById(ctx)).toEqual(afterSecond);
+    });
+  });
 });
 
 async function setup() {
@@ -1582,6 +1864,14 @@ function createMockAPI(options: MockAPIOptions = {}) {
     ),
     updateTitle: mock(
       options.workspace?.updateTitle ??
+        (() => Promise.resolve({ success: true as const, data: undefined }))
+    ),
+    setPinned: mock(
+      options.workspace?.setPinned ??
+        (() => Promise.resolve({ success: true as const, data: undefined }))
+    ),
+    reorderPinned: mock(
+      options.workspace?.reorderPinned ??
         (() => Promise.resolve({ success: true as const, data: undefined }))
     ),
     getInfo: mock(options.workspace?.getInfo ?? (() => Promise.resolve(null))),

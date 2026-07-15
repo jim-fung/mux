@@ -1,6 +1,11 @@
 import type { ReactNode } from "react";
 import React, { createContext, useContext, useEffect, useMemo, useCallback } from "react";
-import { THINKING_LEVEL_OFF, type ThinkingLevel } from "@/common/types/thinking";
+import {
+  THINKING_LEVEL_OFF,
+  coerceOpenAIReasoningMode,
+  type OpenAIReasoningMode,
+  type ThinkingLevel,
+} from "@/common/types/thinking";
 import {
   readPersistedState,
   updatePersistedState,
@@ -10,6 +15,7 @@ import {
   getAgentIdKey,
   getModelKey,
   getProjectScopeId,
+  getReasoningModeKey,
   getThinkingLevelByModelKey,
   getThinkingLevelKey,
   getWorkspaceAISettingsByAgentKey,
@@ -19,7 +25,9 @@ import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { enforceThinkingPolicy, getAvailableThinkingLevels } from "@/common/utils/thinking/policy";
 import { useMinThinkingLevels } from "@/browser/hooks/useMinThinkingLevels";
+import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { useAPI } from "@/browser/contexts/API";
+import { requestActiveTurnThinkingLevel } from "@/browser/utils/activeTurnThinking";
 import {
   clearPendingWorkspaceAiSettings,
   getWorkspaceAiSettingsFromMetadata,
@@ -32,6 +40,9 @@ import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 interface ThinkingContextType {
   thinkingLevel: ThinkingLevel;
   setThinkingLevel: (level: ThinkingLevel) => void;
+  /** OpenAI pro reasoning-mode toggle; sibling of thinkingLevel (orthogonal on the wire). */
+  reasoningMode: OpenAIReasoningMode;
+  setReasoningMode: (mode: OpenAIReasoningMode) => void;
 }
 
 const ThinkingContext = createContext<ThinkingContextType | undefined>(undefined);
@@ -65,6 +76,8 @@ export const ThinkingProvider: React.FC<ThinkingProviderProps> = (props) => {
   const { api } = useAPI();
   const workspaceContext = useOptionalWorkspaceContext();
   const { getMinimum } = useMinThinkingLevels();
+  // Resolve mapped aliases so keybind stepping walks the target model's ladder.
+  const { config: providersConfig } = useProvidersConfig();
   const defaultModel = getDefaultModel();
   const scopeId = getScopeId(props.workspaceId, props.projectPath);
   const thinkingKey = getThinkingLevelKey(scopeId);
@@ -83,6 +96,19 @@ export const ThinkingProvider: React.FC<ThinkingProviderProps> = (props) => {
   const thinkingLevel =
     persistedThinkingLevel ?? metadataSettings.thinkingLevel ?? THINKING_LEVEL_OFF;
 
+  // Workspace-scoped OpenAI pro reasoning mode. Null = no explicit user choice yet;
+  // absent everywhere means "standard" (the API default).
+  const reasoningKey = getReasoningModeKey(scopeId);
+  const [persistedReasoningMode, setReasoningModeInternal] =
+    usePersistedState<OpenAIReasoningMode | null>(reasoningKey, null, { listener: true });
+  // Coerce untrusted persisted values (corrupt entries or a future downgrade) so
+  // bad state self-heals to "standard" instead of failing SendMessageOptionsSchema
+  // validation and bricking sends until storage is cleared.
+  const reasoningMode =
+    coerceOpenAIReasoningMode(persistedReasoningMode) ??
+    coerceOpenAIReasoningMode(metadataSettings.reasoningMode) ??
+    "standard";
+
   // One-time migration: if the new workspace-scoped key is missing, seed from the legacy per-model key.
   useEffect(() => {
     const existing = readPersistedState<ThinkingLevel | null | undefined>(thinkingKey, undefined);
@@ -100,12 +126,16 @@ export const ThinkingProvider: React.FC<ThinkingProviderProps> = (props) => {
     updatePersistedState(thinkingKey, legacy);
   }, [defaultModel, scopeId, thinkingKey]);
 
-  const setThinkingLevel = useCallback(
-    (level: ThinkingLevel) => {
-      const model = getModelForThinkingUpdate(scopeId, metadataSettings.model, defaultModel);
-
-      setThinkingLevelInternal(level);
-
+  // Shared persistence for both setters: caches the full per-agent settings and
+  // pushes them to the backend. updateAgentAISettings replaces the agent's
+  // settings wholesale, so every payload must carry BOTH thinkingLevel and
+  // reasoningMode or the omitted one gets wiped on the next sync.
+  const persistAgentAiSettings = useCallback(
+    (settings: {
+      model: string;
+      thinkingLevel: ThinkingLevel;
+      reasoningMode: OpenAIReasoningMode;
+    }) => {
       // Workspace variant: persist to backend so settings follow the workspace across devices.
       if (!props.workspaceId) {
         return;
@@ -114,7 +144,10 @@ export const ThinkingProvider: React.FC<ThinkingProviderProps> = (props) => {
       const workspaceId = props.workspaceId;
 
       type WorkspaceAISettingsByAgentCache = Partial<
-        Record<string, { model: string; thinkingLevel: ThinkingLevel }>
+        Record<
+          string,
+          { model: string; thinkingLevel: ThinkingLevel; reasoningMode?: OpenAIReasoningMode }
+        >
       >;
 
       const normalizedAgentId =
@@ -129,7 +162,7 @@ export const ThinkingProvider: React.FC<ThinkingProviderProps> = (props) => {
             prev && typeof prev === "object" ? prev : {};
           return {
             ...record,
-            [normalizedAgentId]: { model, thinkingLevel: level },
+            [normalizedAgentId]: settings,
           };
         },
         {}
@@ -141,16 +174,13 @@ export const ThinkingProvider: React.FC<ThinkingProviderProps> = (props) => {
 
       // Avoid stale backend metadata clobbering newer local preferences when users
       // click through levels quickly (tests reproduce this by cycling to xhigh).
-      markPendingWorkspaceAiSettings(workspaceId, normalizedAgentId, {
-        model,
-        thinkingLevel: level,
-      });
+      markPendingWorkspaceAiSettings(workspaceId, normalizedAgentId, settings);
 
       api.workspace
         .updateAgentAISettings({
           workspaceId,
           agentId: normalizedAgentId,
-          aiSettings: { model, thinkingLevel: level },
+          aiSettings: settings,
         })
         .then((result) => {
           if (!result.success) {
@@ -162,13 +192,78 @@ export const ThinkingProvider: React.FC<ThinkingProviderProps> = (props) => {
           // Best-effort only. If offline or backend is old, the next sendMessage will persist.
         });
     },
+    [api, props.workspaceId, scopeId]
+  );
+
+  // Read the sibling setting at call time (not from the render closure) so
+  // rapid interleaved updates cannot persist a stale counterpart value.
+  // Coerced like the render path: a corrupt persisted value must not ride a
+  // thinking-level change into updateAgentAISettings and fail backend sync.
+  const getCurrentReasoningMode = useCallback(
+    (): OpenAIReasoningMode =>
+      coerceOpenAIReasoningMode(
+        readPersistedState<OpenAIReasoningMode | null>(reasoningKey, null)
+      ) ??
+      coerceOpenAIReasoningMode(metadataSettings.reasoningMode) ??
+      "standard",
+    [metadataSettings.reasoningMode, reasoningKey]
+  );
+
+  const getCurrentThinkingLevel = useCallback(
+    (): ThinkingLevel =>
+      readPersistedState<ThinkingLevel | null>(thinkingKey, null) ??
+      metadataSettings.thinkingLevel ??
+      THINKING_LEVEL_OFF,
+    [metadataSettings.thinkingLevel, thinkingKey]
+  );
+
+  const setThinkingLevel = useCallback(
+    (level: ThinkingLevel) => {
+      const model = getModelForThinkingUpdate(scopeId, metadataSettings.model, defaultModel);
+
+      setThinkingLevelInternal(level);
+      persistAgentAiSettings({
+        model,
+        thinkingLevel: level,
+        reasoningMode: getCurrentReasoningMode(),
+      });
+      // Mid-turn change: also request the new level for the active turn's next
+      // model step. Non-workspace (project/global) mounts have no workspaceId
+      // and skip this inside the helper.
+      if (props.workspaceId) {
+        requestActiveTurnThinkingLevel(api, props.workspaceId, level);
+      }
+    },
     [
       api,
       defaultModel,
+      getCurrentReasoningMode,
       metadataSettings.model,
+      persistAgentAiSettings,
       props.workspaceId,
       scopeId,
       setThinkingLevelInternal,
+    ]
+  );
+
+  const setReasoningMode = useCallback(
+    (mode: OpenAIReasoningMode) => {
+      const model = getModelForThinkingUpdate(scopeId, metadataSettings.model, defaultModel);
+
+      setReasoningModeInternal(mode);
+      persistAgentAiSettings({
+        model,
+        thinkingLevel: getCurrentThinkingLevel(),
+        reasoningMode: mode,
+      });
+    },
+    [
+      defaultModel,
+      getCurrentThinkingLevel,
+      metadataSettings.model,
+      persistAgentAiSettings,
+      scopeId,
+      setReasoningModeInternal,
     ]
   );
 
@@ -191,12 +286,17 @@ export const ThinkingProvider: React.FC<ThinkingProviderProps> = (props) => {
       const model = getModelForThinkingUpdate(scopeId, metadataSettings.model, defaultModel);
       // Step only within levels at or above the model's minimum floor.
       const minimum = getMinimum(model);
-      const allowed = getAvailableThinkingLevels(model, minimum);
+      const allowed = getAvailableThinkingLevels(model, minimum, providersConfig);
       if (allowed.length <= 1) {
         return;
       }
 
-      const effectiveThinkingLevel = enforceThinkingPolicy(model, thinkingLevel, minimum);
+      const effectiveThinkingLevel = enforceThinkingPolicy(
+        model,
+        thinkingLevel,
+        minimum,
+        providersConfig
+      );
       const currentIndex = allowed.indexOf(effectiveThinkingLevel);
 
       // Increase/decrease are directional: clamp at the ends instead of wrapping,
@@ -213,12 +313,20 @@ export const ThinkingProvider: React.FC<ThinkingProviderProps> = (props) => {
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [defaultModel, getMinimum, metadataSettings.model, scopeId, thinkingLevel, setThinkingLevel]);
+  }, [
+    defaultModel,
+    getMinimum,
+    metadataSettings.model,
+    providersConfig,
+    scopeId,
+    thinkingLevel,
+    setThinkingLevel,
+  ]);
 
   // Memoize context value to prevent unnecessary re-renders of consumers.
   const contextValue = useMemo(
-    () => ({ thinkingLevel, setThinkingLevel }),
-    [thinkingLevel, setThinkingLevel]
+    () => ({ thinkingLevel, setThinkingLevel, reasoningMode, setReasoningMode }),
+    [thinkingLevel, setThinkingLevel, reasoningMode, setReasoningMode]
   );
 
   return <ThinkingContext.Provider value={contextValue}>{props.children}</ThinkingContext.Provider>;

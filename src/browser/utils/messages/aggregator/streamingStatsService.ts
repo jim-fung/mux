@@ -83,11 +83,10 @@ export class StreamingStatsService {
         : fallbackDurationMs;
 
     const ttftMs =
-      serverFirstTokenTime !== null
-        ? Math.max(0, serverFirstTokenTime - serverStartTime)
-        : null;
+      serverFirstTokenTime !== null ? Math.max(0, serverFirstTokenTime - serverStartTime) : null;
 
-    const outputTokens = input.cumulativeUsage?.outputTokens ?? input.metadataUsage?.outputTokens ?? 0;
+    const outputTokens =
+      input.cumulativeUsage?.outputTokens ?? input.metadataUsage?.outputTokens ?? 0;
     const reasoningTokens =
       input.cumulativeUsage?.reasoningTokens ?? input.metadataUsage?.reasoningTokens ?? 0;
 

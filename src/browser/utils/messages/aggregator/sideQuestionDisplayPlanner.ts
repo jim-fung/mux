@@ -1,4 +1,9 @@
-import type { MuxMessage, DisplayedMessage, SideQuestionDisplayBranch, InlineSkillSnapshotMap } from "@/common/types/message";
+import type {
+  MuxMessage,
+  DisplayedMessage,
+  SideQuestionDisplayBranch,
+  InlineSkillSnapshotMap,
+} from "@/common/types/message";
 import {
   isSideQuestionAnswerMessage,
   isSideQuestionUserMessage,
@@ -141,14 +146,11 @@ export function buildSideQuestionDisplayPlan(
         ? adjacentAnswer
         : undefined;
     const answer = linkedAnswer ?? legacyAdjacentAnswer;
-    const answerIsRenderable =
-      answer !== undefined && deps.isRenderableSideQuestionAnswer(answer);
+    const answerIsRenderable = answer !== undefined && deps.isRenderableSideQuestionAnswer(answer);
     const entry: SideQuestionInterrupt = {
       atTextLength: Math.max(0, muxMeta.interruptedTextLength),
       atPartIndex:
-        typeof muxMeta.interruptedPartIndex === "number"
-          ? muxMeta.interruptedPartIndex
-          : undefined,
+        typeof muxMeta.interruptedPartIndex === "number" ? muxMeta.interruptedPartIndex : undefined,
       sideQuestionUserMsg: msg,
       sideQuestionAnswerMsg: answerIsRenderable ? answer : undefined,
     };
@@ -329,9 +331,7 @@ export function buildInterruptedMessageDisplay(
   agentSkillSnapshot?: { frontmatterYaml?: string; body?: string },
   inlineSkillSnapshots?: InlineSkillSnapshotMap
 ): DisplayedMessage[] {
-  const sorted = [...interrupts].sort((left, right) =>
-    compareSideQuestionInterrupts(left, right)
-  );
+  const sorted = [...interrupts].sort((left, right) => compareSideQuestionInterrupts(left, right));
   const segments = splitMessagePartsAtTextLengths(
     message.parts,
     sorted.map((interrupt) => ({

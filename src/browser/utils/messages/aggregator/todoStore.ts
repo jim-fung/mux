@@ -19,8 +19,7 @@ export class TodoStore {
   /** True if every item is completed. */
   isAllCompleted(): boolean {
     return (
-      this.currentTodos.length > 0 &&
-      this.currentTodos.every((todo) => todo.status === "completed")
+      this.currentTodos.length > 0 && this.currentTodos.every((todo) => todo.status === "completed")
     );
   }
 

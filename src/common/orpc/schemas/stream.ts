@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { AgentIdSchema } from "./agentDefinition";
-import { ThinkingLevelSchema } from "../../types/thinking";
+import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "../../types/thinking";
 import { AgentModeSchema } from "../../types/mode";
 import { ChatUsageDisplaySchema } from "./chatStats";
 import { StreamErrorTypeSchema } from "./errors";
@@ -335,7 +335,26 @@ export const ToolCallStartEventSchema = z.object({
   args: z.unknown(),
   tokens: z.number().meta({ description: "Token count for tool input" }),
   timestamp: z.number().meta({ description: "When tool call started (Date.now())" }),
+  executionStartedAt: z.number().optional().meta({
+    description:
+      "When the tool's execute() began running, if it already had by the time this event was built (replay); live streams deliver it via tool-call-execution-start instead",
+  }),
   parentToolCallId: z.string().optional().meta({ description: "Set for nested PTC calls" }),
+});
+
+/**
+ * Emitted when a tool call's execute() actually begins running.
+ *
+ * Parallel tool calls are serialized by withSequentialExecution, so this can fire
+ * long after tool-call-start (which marks when the model emitted the call).
+ * The UI uses this to start the elapsed timer only once real execution begins.
+ */
+export const ToolCallExecutionStartEventSchema = z.object({
+  type: z.literal("tool-call-execution-start"),
+  workspaceId: z.string(),
+  messageId: z.string(),
+  toolCallId: z.string(),
+  timestamp: z.number().meta({ description: "When execute() began running (Date.now())" }),
 });
 
 export const ToolCallDeltaEventSchema = z.object({
@@ -450,6 +469,10 @@ export const ToolCallEndEventSchema = z.object({
   toolCallId: z.string(),
   toolName: z.string(),
   result: z.unknown(),
+  providerExecuted: z
+    .boolean()
+    .optional()
+    .meta({ description: "True when the provider executed the tool server-side" }),
   timestamp: z.number().meta({ description: "When tool call completed (Date.now())" }),
   parentToolCallId: z.string().optional().meta({ description: "Set for nested PTC calls" }),
 });
@@ -494,13 +517,16 @@ export const ErrorEventSchema = z.object({
 });
 
 /**
- * Emitted when a child workspace is deleted and its accumulated session usage has been
- * rolled up into the parent workspace.
+ * Emitted when accumulated session usage changes outside the live stream path:
+ * a deleted child workspace's usage rolled up into the parent, or headless
+ * usage (e.g. a /btw side question) recorded against the workspace itself.
  */
 export const SessionUsageDeltaEventSchema = z.object({
   type: z.literal("session-usage-delta"),
-  workspaceId: z.string().meta({ description: "Parent workspace ID" }),
-  sourceWorkspaceId: z.string().meta({ description: "Deleted child workspace ID" }),
+  workspaceId: z.string().meta({ description: "Workspace receiving the usage delta" }),
+  sourceWorkspaceId: z
+    .string()
+    .meta({ description: "Workspace that produced the usage (deleted child, or self)" }),
   byModelDelta: z.record(z.string(), ChatUsageDisplaySchema),
   timestamp: z.number(),
 });
@@ -599,6 +625,8 @@ export const GoalBudgetLimitedEventSchema = z.object({
 export const QueuedMessageChangedEventSchema = z.object({
   type: z.literal("queued-message-changed"),
   workspaceId: z.string(),
+  /** True when any entry is queued, including hidden synthetic/background entries. */
+  hasQueuedMessages: z.boolean().optional(),
   queuedMessages: z.array(z.string()),
   displayText: z.string(),
   fileParts: z.array(FilePartSchema).optional(),
@@ -632,6 +660,7 @@ export const WorkspaceChatMessageSchema = z.discriminatedUnion("type", [
   StreamAbortEventSchema,
   // Tool events
   ToolCallStartEventSchema,
+  ToolCallExecutionStartEventSchema,
   ToolCallDeltaEventSchema,
   ToolCallEndEventSchema,
   BashOutputEventSchema,
@@ -710,6 +739,7 @@ export const ExperimentsSchema = z.object({
   memory: z.boolean().optional(),
   workspaceHeartbeats: z.boolean().optional(),
   astGrepOutline: z.boolean().optional(),
+  toolSearch: z.boolean().optional(),
 });
 
 /**
@@ -723,6 +753,8 @@ export const GoalInterventionPolicySchema = z.enum(["steer", "pause"]);
 export const SendMessageOptionsSchema = z.object({
   editMessageId: z.string().optional(),
   thinkingLevel: ThinkingLevelSchema.optional(),
+  /** OpenAI reasoning mode (pro toggle); inert for models without pro-mode support. */
+  reasoningMode: OpenAIReasoningModeSchema.optional(),
   model: z.string("No model specified"),
   toolPolicy: ToolPolicySchema.optional(),
   additionalSystemInstructions: z.string().optional(),

@@ -8,6 +8,11 @@
  * UI can reference the same endpoints and model gating rules.
  */
 
+import {
+  resolveModelForMetadata,
+  type ProviderModelsConfig,
+} from "@/common/utils/providers/modelEntries";
+
 // NOTE: These endpoints + params follow the OpenCode Codex OAuth guide.
 // If OpenAI changes them, keep all updates centralized here.
 
@@ -94,6 +99,13 @@ export const CODEX_OAUTH_ALLOWED_MODELS = new Set<string>([
   "gpt-5.2",
   "gpt-5.4-mini",
   "gpt-5.5",
+  // GPT-5.6 family (July 9, 2026): available via both the public API and Codex.
+  // The bare alias is a servable model id (OpenAI routes it to Sol), so it must
+  // be allowed too or OAuth-only users selecting it fall to the API-key path.
+  "gpt-5.6",
+  "gpt-5.6-sol",
+  "gpt-5.6-terra",
+  "gpt-5.6-luna",
   "gpt-5.2-codex",
   "gpt-5.3-codex",
   "gpt-5.3-codex-spark",
@@ -119,9 +131,14 @@ export const CODEX_OAUTH_REQUIRED_MODELS = new Set<string>([
  * still use the public OpenAI limits.
  */
 const CODEX_OAUTH_CONTEXT_WINDOW_OVERRIDES: Record<string, number> = {
-  // User-reported routing limit: GPT-5.5's public API window is 1.05M, but the
-  // ChatGPT/Codex OAuth backend rejects prompts near that size and must compact at ~270K.
+  // The public API exposes a 1.05M window for these models, but the ChatGPT/Codex
+  // OAuth routing layer has smaller tier-specific limits. Keep the auth-route caps
+  // separate from model metadata so API-key requests retain the full public window.
   "gpt-5.5": 272_000,
+  "gpt-5.6": 272_000,
+  "gpt-5.6-sol": 272_000,
+  "gpt-5.6-terra": 128_000,
+  "gpt-5.6-luna": 128_000,
 };
 
 function normalizeCodexOauthModelId(modelId: string): string {
@@ -140,6 +157,64 @@ export function isCodexOauthAllowedModelId(modelId: string): boolean {
 
 export function isCodexOauthRequiredModelId(modelId: string): boolean {
   return CODEX_OAUTH_REQUIRED_MODELS.has(normalizeCodexOauthModelId(modelId));
+}
+
+function normalizeOpenAIModelString(modelId: string): string | null {
+  const trimmedModelId = modelId.trim();
+  if (!trimmedModelId) {
+    return null;
+  }
+
+  if (trimmedModelId.startsWith("openai:")) {
+    return trimmedModelId.length > "openai:".length ? trimmedModelId : null;
+  }
+
+  if (trimmedModelId.startsWith("openai/")) {
+    return trimmedModelId.length > "openai/".length
+      ? `openai:${trimmedModelId.slice("openai/".length)}`
+      : null;
+  }
+
+  return trimmedModelId.includes(":") || trimmedModelId.includes("/")
+    ? null
+    : `openai:${trimmedModelId}`;
+}
+
+/**
+ * Resolve the OpenAI model whose capabilities a runtime model inherits.
+ *
+ * Custom OpenAI IDs may opt into Codex OAuth compatibility by mapping to a known
+ * OpenAI model. The runtime ID is still sent to OpenAI; only capability checks
+ * inherit from mappedToModel. Treat-as mappings also accept the bare and
+ * LiteLLM-style OpenAI IDs supported by metadata lookups.
+ */
+export function getCodexOauthCompatibilityModelId(
+  modelId: string,
+  providersConfig: ProviderModelsConfig | null
+): string | null {
+  const runtimeModelId = normalizeOpenAIModelString(modelId);
+  if (runtimeModelId === null || !modelId.trim().startsWith("openai:")) {
+    return null;
+  }
+
+  const mappedModelId = resolveModelForMetadata(runtimeModelId, providersConfig);
+  return normalizeOpenAIModelString(mappedModelId) ?? runtimeModelId;
+}
+
+export function isCodexOauthAllowedModel(
+  modelId: string,
+  providersConfig: ProviderModelsConfig | null
+): boolean {
+  const compatibilityModelId = getCodexOauthCompatibilityModelId(modelId, providersConfig);
+  return compatibilityModelId !== null && isCodexOauthAllowedModelId(compatibilityModelId);
+}
+
+export function isCodexOauthRequiredModel(
+  modelId: string,
+  providersConfig: ProviderModelsConfig | null
+): boolean {
+  const compatibilityModelId = getCodexOauthCompatibilityModelId(modelId, providersConfig);
+  return compatibilityModelId !== null && isCodexOauthRequiredModelId(compatibilityModelId);
 }
 
 export function getCodexOauthContextWindowOverride(modelId: string): number | null {

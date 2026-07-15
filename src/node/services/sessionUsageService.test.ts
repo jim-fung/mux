@@ -11,6 +11,7 @@ import {
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { createTestHistoryService } from "./testHistoryService";
+import { existsSync } from "fs";
 import * as fs from "fs/promises";
 import * as path from "path";
 
@@ -428,6 +429,170 @@ describe("SessionUsageService", () => {
       result = await service.getSessionUsage(workspaceId);
       expect(result?.lastRequest?.model).toBe("claude-opus-4-20250514");
       expect(result?.lastRequest?.usage.input.tokens).toBe(200);
+    });
+  });
+
+  describe("recordHeadlessUsage", () => {
+    it("accumulates into byModel without replacing lastRequest", async () => {
+      const workspaceId = "test-workspace";
+      const agentModel = "anthropic:claude-sonnet-4-20250514";
+      const statusModel = "anthropic:claude-haiku-4-5";
+
+      // Normal agent turn establishes lastRequest.
+      await service.recordUsage(workspaceId, agentModel, createUsage(100, 50));
+
+      // Background status/memory/btw call must add spend but keep the user's
+      // actual last agent request visible in the Costs tab.
+      await service.recordHeadlessUsage(workspaceId, statusModel, {
+        inputTokens: 40,
+        outputTokens: 10,
+        totalTokens: 50,
+      });
+
+      const result = await service.getSessionUsage(workspaceId);
+      expect(result?.byModel[statusModel]?.input.tokens).toBe(40);
+      expect(result?.byModel[statusModel]?.output.tokens).toBe(10);
+      expect(result?.lastRequest?.model).toBe(agentModel);
+      expect(result?.lastRequest?.usage.input.tokens).toBe(100);
+    });
+
+    it("prices costsIncluded (subscription-covered) usage at $0", async () => {
+      const workspaceId = "test-workspace";
+      const model = "openai:gpt-5.2";
+
+      const recorded = await service.recordHeadlessUsage(
+        workspaceId,
+        model,
+        { inputTokens: 1000, outputTokens: 500, totalTokens: 1500 },
+        undefined,
+        { costsIncluded: true }
+      );
+
+      expect(recorded?.usage.costsIncluded).toBe(true);
+      expect(recorded?.usage.input.tokens).toBe(1000);
+      expect(getTotalCost(recorded!.usage)).toBe(0);
+    });
+
+    it("appends to the headless-usage sidecar only when an analyticsSource is given", async () => {
+      const workspaceId = "test-workspace";
+      const model = "anthropic:claude-sonnet-4-20250514";
+      const sidecarPath = path.join(config.getSessionDir(workspaceId), "headless-usage.jsonl");
+
+      // No source (/btw-style caller whose spend rides a chat row): no sidecar.
+      await service.recordHeadlessUsage(workspaceId, model, {
+        inputTokens: 10,
+        outputTokens: 5,
+        totalTokens: 15,
+      });
+      expect(existsSync(sidecarPath)).toBe(false);
+
+      await service.recordHeadlessUsage(
+        workspaceId,
+        model,
+        { inputTokens: 40, outputTokens: 10, totalTokens: 50 },
+        undefined,
+        { analyticsSource: "workspace_status" }
+      );
+      const lines = (await fs.readFile(sidecarPath, "utf-8")).trim().split("\n");
+      expect(lines).toHaveLength(1);
+      const record = JSON.parse(lines[0]) as Record<string, unknown>;
+      expect(record.source).toBe("workspace_status");
+      expect(record.model).toBe(model);
+      expect((record.usage as Record<string, unknown>).inputTokens).toBe(40);
+    });
+
+    it("still appends the analytics sidecar when the usage ledger is corrupt", async () => {
+      const workspaceId = "test-workspace";
+      const model = "anthropic:claude-sonnet-4-20250514";
+      const sessionDir = config.getSessionDir(workspaceId);
+      await fs.mkdir(sessionDir, { recursive: true });
+      // Corrupt ledger: readFile throws on bad JSON (non-ENOENT), which must
+      // not block the sidecar — headless spend has no chat-row fallback.
+      await fs.writeFile(path.join(sessionDir, "session-usage.json"), "{not json");
+
+      const recorded = await service.recordHeadlessUsage(
+        workspaceId,
+        model,
+        { inputTokens: 40, outputTokens: 10, totalTokens: 50 },
+        undefined,
+        { analyticsSource: "workspace_status" }
+      );
+
+      // Sidecar callers key their analytics-ingest trigger off the return.
+      expect(recorded?.model).toBe(model);
+      const sidecarPath = path.join(sessionDir, "headless-usage.jsonl");
+      const record = JSON.parse((await fs.readFile(sidecarPath, "utf-8")).trim()) as Record<
+        string,
+        unknown
+      >;
+      expect(record.source).toBe("workspace_status");
+
+      // Without a sidecar (/btw-style), a failed ledger write must NOT report
+      // success: the caller would emit a session-usage-delta that diverges
+      // from the on-disk ledger.
+      const btwRecorded = await service.recordHeadlessUsage(workspaceId, model, {
+        inputTokens: 40,
+        outputTokens: 10,
+        totalTokens: 50,
+      });
+      expect(btwRecorded).toBeUndefined();
+    });
+
+    it("writes the sidecar before the ledger so a sidecar failure leaves no ledger-only spend", async () => {
+      // Ordering contract: the sidecar is the ETL's only replay source, so a
+      // crash between the two writes must strand the LEDGER (self-heals via
+      // rebuild), never the sidecar. Behavioral proxy: an unwritable sidecar
+      // (directory at the path) must abort BEFORE the ledger update.
+      const workspaceId = "test-workspace";
+      const model = "anthropic:claude-sonnet-4-20250514";
+      const sessionDir = config.getSessionDir(workspaceId);
+      await fs.mkdir(path.join(sessionDir, "headless-usage.jsonl"), { recursive: true });
+
+      const recorded = await service.recordHeadlessUsage(
+        workspaceId,
+        model,
+        { inputTokens: 40, outputTokens: 10, totalTokens: 50 },
+        undefined,
+        { analyticsSource: "workspace_status" }
+      );
+
+      expect(recorded).toBeUndefined();
+      // Ledger untouched: no session-usage.json was created.
+      expect(existsSync(path.join(sessionDir, "session-usage.json"))).toBe(false);
+    });
+
+    it("resolves mappedToModel aliases for pricing and stamps metadataModel in the sidecar", async () => {
+      const workspaceId = "test-workspace";
+      const mappedService = new SessionUsageService(config, historyService, () => ({
+        mycustom: {
+          apiKeySet: true,
+          isEnabled: true,
+          isConfigured: true,
+          models: [{ id: "my-alias", mappedToModel: "anthropic:claude-sonnet-4-20250514" }],
+        },
+      }));
+
+      const recorded = await mappedService.recordHeadlessUsage(
+        workspaceId,
+        "mycustom:my-alias",
+        { inputTokens: 1000, outputTokens: 500, totalTokens: 1500 },
+        undefined,
+        { analyticsSource: "workspace_status" }
+      );
+
+      // Priced via the mapped model — the raw custom ID has no pricing entry
+      // and would leave cost_usd undefined.
+      expect(recorded?.usage.input.cost_usd).toBeGreaterThan(0);
+
+      const sidecarPath = path.join(config.getSessionDir(workspaceId), "headless-usage.jsonl");
+      const record = JSON.parse((await fs.readFile(sidecarPath, "utf-8")).trim()) as Record<
+        string,
+        unknown
+      >;
+      // model keeps the raw ID for attribution; metadataModel carries the
+      // resolved alias target for ETL pricing.
+      expect(record.model).toBe("mycustom:my-alias");
+      expect(record.metadataModel).toBe("anthropic:claude-sonnet-4-20250514");
     });
   });
 

@@ -6,10 +6,10 @@
  */
 
 import {
+  getCodexOauthCompatibilityModelId,
   getCodexOauthContextWindowOverride,
-  isCodexOauthAllowedModelId,
-  isCodexOauthRequiredModelId,
 } from "@/common/constants/codexOAuth";
+import { wouldRouteOpenAIThroughCodexOauth } from "@/common/utils/providers/codexOauthRouting";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { supports1MContext } from "@/common/utils/ai/models";
 import {
@@ -18,96 +18,21 @@ import {
 } from "@/common/utils/providers/modelEntries";
 import { getModelStats } from "@/common/utils/tokens/modelStats";
 
-function asRecord(value: unknown): Record<string, unknown> | null {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    return null;
-  }
-  return value as Record<string, unknown>;
-}
-
-function hasNonEmptyString(value: unknown): value is string {
-  return typeof value === "string" && value.trim().length > 0;
-}
-
-function getOpenAIProviderModelId(model: string): string | null {
-  const separatorIndex = model.indexOf(":");
-  if (separatorIndex <= 0 || separatorIndex === model.length - 1) {
-    return null;
-  }
-
-  const provider = model.slice(0, separatorIndex);
-  if (provider !== "openai") {
-    return null;
-  }
-
-  return model.slice(separatorIndex + 1);
-}
-
-function hasCodexOauthTokens(config: unknown): boolean {
-  const record = asRecord(config);
-  if (!record) {
-    return false;
-  }
-
-  if (record.codexOauthSet === true) {
-    return true;
-  }
-
-  // Backend compaction can receive raw providers.jsonc config in older tests/fallback paths.
-  // Detect the stored token shape without importing node-only OAuth parsing into common code.
-  const oauth = asRecord(record.codexOauth);
-  return (
-    oauth?.type === "oauth" &&
-    hasNonEmptyString(oauth.access) &&
-    hasNonEmptyString(oauth.refresh) &&
-    typeof oauth.expires === "number" &&
-    Number.isFinite(oauth.expires)
-  );
-}
-
-function hasOpenAIApiKey(config: unknown): boolean {
-  const record = asRecord(config);
-  if (!record) {
-    return false;
-  }
-
-  const apiKeySource = record.apiKeySource;
-  if (apiKeySource === "config" || apiKeySource === "file" || apiKeySource === "env") {
-    return true;
-  }
-
-  return record.apiKeySet === true || hasNonEmptyString(record.apiKey);
-}
-
 function getCodexOauthContextLimit(
   model: string,
   providersConfig: ProvidersConfigMap | null
 ): number | null {
-  const modelId = getOpenAIProviderModelId(model);
-  if (!modelId || !isCodexOauthAllowedModelId(modelId)) {
+  const compatibilityModelId = getCodexOauthCompatibilityModelId(model, providersConfig);
+  if (compatibilityModelId === null) {
     return null;
   }
 
-  const oauthLimit = getCodexOauthContextWindowOverride(modelId);
+  const oauthLimit = getCodexOauthContextWindowOverride(compatibilityModelId);
   if (oauthLimit == null) {
     return null;
   }
 
-  const openAIConfig = providersConfig?.openai;
-  if (!hasCodexOauthTokens(openAIConfig)) {
-    return null;
-  }
-
-  if (isCodexOauthRequiredModelId(modelId)) {
-    return oauthLimit;
-  }
-
-  if (!hasOpenAIApiKey(openAIConfig)) {
-    return oauthLimit;
-  }
-
-  const record = asRecord(openAIConfig);
-  return record?.codexOauthDefaultAuth === "apiKey" ? null : oauthLimit;
+  return wouldRouteOpenAIThroughCodexOauth(model, providersConfig) ? oauthLimit : null;
 }
 
 /**

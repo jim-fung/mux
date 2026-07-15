@@ -522,15 +522,17 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 </details>
 
 <details>
-<summary>heartbeat (5)</summary>
+<summary>heartbeat (7)</summary>
 
-| Env var                       | JSON path     | Type    | Description                                                                                                                                                                           |
-| ----------------------------- | ------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `MUX_TOOL_INPUT_ACTION`       | `action`      | enum    | Operation to perform: "get" reads the current heartbeat, "set" enables or configures it, and "unset" removes this workspace's heartbeat settings.                                     |
-| `MUX_TOOL_INPUT_CONTEXT_MODE` | `contextMode` | enum    | set: context preparation for heartbeat turns: "normal" uses current context, "compact" compacts first, and "reset" appends a reset boundary first. Omit to preserve the current mode. |
-| `MUX_TOOL_INPUT_ENABLED`      | `enabled`     | boolean | set: whether scheduled heartbeats are enabled. Omit to preserve the current value; when creating new settings, omitted means "enabled".                                               |
-| `MUX_TOOL_INPUT_INTERVAL_MS`  | `intervalMs`  | number  | set: heartbeat interval in milliseconds (300000–86400000). Omit to preserve the current interval or use the global default for new settings.                                          |
-| `MUX_TOOL_INPUT_MESSAGE`      | `message`     | string  | set: optional custom instruction body appended after the fixed idle-workspace lead-in. Pass an empty string to clear the custom message.                                              |
+| Env var                       | JSON path     | Type    | Description                                                                                                                                                                                                                                                                                                                                                                |
+| ----------------------------- | ------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MUX_TOOL_INPUT_ACTION`       | `action`      | enum    | Operation to perform: "get" reads the current heartbeat, "set" enables or configures it, and "unset" removes this workspace's heartbeat settings.                                                                                                                                                                                                                          |
+| `MUX_TOOL_INPUT_CONTEXT_MODE` | `contextMode` | enum    | set: context preparation for heartbeat turns: "normal" uses current context, "compact" compacts first, and "reset" appends a reset boundary first. Omit to preserve the current mode.                                                                                                                                                                                      |
+| `MUX_TOOL_INPUT_ENABLED`      | `enabled`     | boolean | set: whether scheduled heartbeats are enabled. Omit to preserve the current value; when creating new settings, omitted means "enabled".                                                                                                                                                                                                                                    |
+| `MUX_TOOL_INPUT_INTERVAL_MS`  | `intervalMs`  | number  | set: heartbeat interval in milliseconds (300000–86400000). Omit to preserve the current interval or use the global default for new settings.                                                                                                                                                                                                                               |
+| `MUX_TOOL_INPUT_MESSAGE`      | `message`     | string  | set: optional custom instruction body appended after the fixed idle-workspace lead-in. Pass an empty string to clear the custom message.                                                                                                                                                                                                                                   |
+| `MUX_TOOL_INPUT_TRIGGER`      | `trigger`     | enum    | set: countdown anchoring: "idle" resets on workspace activity (fires only after a full quiet interval), "interval" fires on a fixed wall-clock cadence regardless of activity. Omit to preserve the current value; unset resolves to "idle" at read time.                                                                                                                  |
+| `MUX_TOOL_INPUT_WHEN_BUSY`    | `whenBusy`    | enum    | set: behavior when a heartbeat fires while the workspace is busy: "skip" misses the slot, "tool-end" queues the heartbeat into the current turn at the next tool boundary, "turn-end" queues it as its own turn after the current one. Omit to preserve the current value; unset resolves at read time to "skip" for trigger "idle" and "turn-end" for trigger "interval". |
 
 </details>
 
@@ -748,6 +750,16 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 </details>
 
 <details>
+<summary>tool_catalog_search (2)</summary>
+
+| Env var                | JSON path | Type   | Description                                                                                               |
+| ---------------------- | --------- | ------ | --------------------------------------------------------------------------------------------------------- |
+| `MUX_TOOL_INPUT_LIMIT` | `limit`   | number | Maximum number of matches to return (default 10, max 25)                                                  |
+| `MUX_TOOL_INPUT_QUERY` | `query`   | string | Task or capability keywords to search for (matched against tool names, descriptions, and parameter names) |
+
+</details>
+
+<details>
 <summary>web_fetch (1)</summary>
 
 | Env var              | JSON path | Type   | Description                      |
@@ -775,7 +787,7 @@ If a value is too large for the environment, it may be omitted (not set). Mux al
 | `MUX_TOOL_INPUT_ARGS`              | `args`              | unknown | —                                                                                                                                                                                                                                                                                                                                                                        |
 | `MUX_TOOL_INPUT_RUN_IN_BACKGROUND` | `run_in_background` | boolean | Defaults to false. Prefer foreground mode for a single workflow; when the returned status is completed, the result is available directly. Set true only when you will start another workflow/task or do independent work while it runs. If workflow_run returns status=running or status=backgrounded, await the returned runId with task_await before using the result. |
 | `MUX_TOOL_INPUT_SCRIPT_PATH`       | `script_path`       | string  | Explicit workflow script path, such as "skill://deep-research/workflow.js" or "./workflows/research.js". Use paths for reusable, reviewable, or skill-packaged workflows.                                                                                                                                                                                                |
-| `MUX_TOOL_INPUT_SCRIPT_SOURCE`     | `script_source`     | string  | Inline JavaScript workflow source for compact one-off conductors. The exact source is snapshotted into the durable run for replay/resume.                                                                                                                                                                                                                                |
+| `MUX_TOOL_INPUT_SCRIPT_SOURCE`     | `script_source`     | string  | Inline JavaScript workflow source for one-off conductors, including prose-described processes codified in place. The exact source is snapshotted into the durable run for replay/resume.                                                                                                                                                                                 |
 
 </details>
 

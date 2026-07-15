@@ -1,10 +1,4 @@
-import React, {
-  useState,
-  useRef,
-  useCallback,
-  useEffect,
-  useMemo,
-} from "react";
+import React, { useState, useRef, useCallback, useEffect, useMemo } from "react";
 import {
   CommandSuggestions,
   COMMAND_SUGGESTION_KEYS,
@@ -18,10 +12,7 @@ import { createErrorToast } from "@/browser/features/ChatInput/ChatInputToasts";
 import { ConfirmationModal } from "@/browser/components/ConfirmationModal/ConfirmationModal";
 import type { ParsedCommand } from "@/browser/utils/slashCommands/types";
 import { parseCommand } from "@/browser/utils/slashCommands/parser";
-import {
-  usePersistedState,
-  updatePersistedState,
-} from "@/browser/hooks/usePersistedState";
+import { usePersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
@@ -52,10 +43,7 @@ import {
   getPendingWorkspaceSendErrorKey,
   getWorkspaceLastReadKey,
 } from "@/common/constants/storage";
-import {
-  processSlashCommand,
-  type SlashCommandContext,
-} from "@/browser/utils/chatCommands";
+import { processSlashCommand, type SlashCommandContext } from "@/browser/utils/chatCommands";
 import {
   addWorkflowRunCardMessageForRun,
   getWorkflowRunCardProjection,
@@ -95,12 +83,8 @@ import { useModelsFromSettings } from "@/browser/hooks/useModelsFromSettings";
 import { AttachFileButton } from "./AttachFileButton";
 import { VimTextArea } from "@/browser/components/VimTextArea/VimTextArea";
 import { ChatAttachments, type ChatAttachment } from "@/browser/features/ChatInput/ChatAttachments";
-import {
-  chatAttachmentsToFileParts,
-} from "@/browser/utils/attachmentsHandling";
-import {
-  type PendingUserMessage,
-} from "@/browser/utils/chatEditing";
+import { chatAttachmentsToFileParts } from "@/browser/utils/attachmentsHandling";
+import { type PendingUserMessage } from "@/browser/utils/chatEditing";
 
 import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
 import { DEFAULT_RUNTIME_ENABLEMENT, normalizeRuntimeEnablement } from "@/common/types/runtime";
@@ -491,6 +475,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     defaultModel,
     setDefaultModel,
     codexOauthSet,
+    requiresCodexOauth,
   } = useModelsFromSettings();
 
   const telemetry = useTelemetry();
@@ -1819,10 +1804,14 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
     // Note: ESC handled by VimTextArea (for mode transitions) and CommandSuggestions (for dismissal)
 
-    const hasCommandSuggestionMenu = suggestionMenus.command.show && suggestionMenus.command.suggestions.length > 0;
-    const hasAtMentionSuggestionMenu = suggestionMenus.atMention.show && suggestionMenus.atMention.suggestions.length > 0;
-    const hasSkillSuggestionMenu = suggestionMenus.skill.show && suggestionMenus.skill.suggestions.length > 0;
-    const hasSymbolSuggestionMenu = suggestionMenus.symbol.show && suggestionMenus.symbol.suggestions.length > 0;
+    const hasCommandSuggestionMenu =
+      suggestionMenus.command.show && suggestionMenus.command.suggestions.length > 0;
+    const hasAtMentionSuggestionMenu =
+      suggestionMenus.atMention.show && suggestionMenus.atMention.suggestions.length > 0;
+    const hasSkillSuggestionMenu =
+      suggestionMenus.skill.show && suggestionMenus.skill.suggestions.length > 0;
+    const hasSymbolSuggestionMenu =
+      suggestionMenus.symbol.show && suggestionMenus.symbol.suggestions.length > 0;
 
     // Don't handle keys if suggestions are visible.
     // Enter/Tab/arrows/Escape are handled by CommandSuggestions for slash, @file, $skill, and \symbol menus.
@@ -1987,7 +1976,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           {creationControlsProps && <CreationControls {...creationControlsProps} />}
 
           <CodexOauthWarningBanner
-            activeModel={baseModel}
+            requiresCodexOauth={requiresCodexOauth(baseModel)}
             codexOauthSet={codexOauthSet}
             onOpenProviders={() => open("providers", { expandProvider: "openai" })}
           />
@@ -2085,19 +2074,24 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                   aria-label={editingMessageForUi ? "Edit your last message" : "Message Claude"}
                   aria-autocomplete="list"
                   aria-controls={
-                    suggestionMenus.atMention.show && suggestionMenus.atMention.suggestions.length > 0
+                    suggestionMenus.atMention.show &&
+                    suggestionMenus.atMention.suggestions.length > 0
                       ? suggestionMenus.atMention.listId
                       : suggestionMenus.skill.show && suggestionMenus.skill.suggestions.length > 0
                         ? suggestionMenus.skill.listId
-                        : suggestionMenus.symbol.show && suggestionMenus.symbol.suggestions.length > 0
+                        : suggestionMenus.symbol.show &&
+                            suggestionMenus.symbol.suggestions.length > 0
                           ? suggestionMenus.symbol.listId
-                          : suggestionMenus.command.show && suggestionMenus.command.suggestions.length > 0
+                          : suggestionMenus.command.show &&
+                              suggestionMenus.command.suggestions.length > 0
                             ? suggestionMenus.command.listId
                             : undefined
                   }
                   aria-expanded={
-                    (suggestionMenus.command.show && suggestionMenus.command.suggestions.length > 0) ||
-                    (suggestionMenus.atMention.show && suggestionMenus.atMention.suggestions.length > 0) ||
+                    (suggestionMenus.command.show &&
+                      suggestionMenus.command.suggestions.length > 0) ||
+                    (suggestionMenus.atMention.show &&
+                      suggestionMenus.atMention.suggestions.length > 0) ||
                     (suggestionMenus.skill.show && suggestionMenus.skill.suggestions.length > 0) ||
                     (suggestionMenus.symbol.show && suggestionMenus.symbol.suggestions.length > 0)
                   }

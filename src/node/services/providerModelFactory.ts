@@ -3,7 +3,7 @@ import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import type { XaiProviderOptions } from "@ai-sdk/xai";
 import { fromNodeProviderChain } from "@aws-sdk/credential-providers";
 import { wrapLanguageModel, type LanguageModel } from "ai";
-import { anthropicSupportsNativeXhigh, type ThinkingLevel } from "@/common/types/thinking";
+import type { ThinkingLevel } from "@/common/types/thinking";
 import { Ok, Err } from "@/common/types/result";
 import type { Result } from "@/common/types/result";
 import type { SendMessageError } from "@/common/types/errors";
@@ -15,8 +15,8 @@ import {
 } from "@/common/constants/providers";
 import {
   CODEX_ENDPOINT,
-  isCodexOauthAllowedModelId,
-  isCodexOauthRequiredModelId,
+  isCodexOauthAllowedModel,
+  isCodexOauthRequiredModel,
 } from "@/common/constants/codexOAuth";
 import { parseCodexOauthAuth } from "@/node/utils/codexOauthAuth";
 import type { Config, ProviderConfig, ProvidersConfig } from "@/node/config";
@@ -50,10 +50,7 @@ import {
 } from "@/node/services/languageModelCleanup";
 import { createOpenAIWebSocketTransportFetch } from "@/node/services/openAIWebSocketTransportFetch";
 import { log } from "@/node/services/log";
-import {
-  MUX_ANTHROPIC_EFFORT_OVERRIDE_HEADER,
-  resolveProviderOptionsNamespaceKey,
-} from "@/common/utils/ai/providerOptions";
+import { resolveProviderOptionsNamespaceKey } from "@/common/utils/ai/providerOptions";
 import { resolveRoute, type RouteContext } from "@/common/routing";
 import {
   getExplicitGatewayPrefix as getExplicitGatewayProvider,
@@ -338,66 +335,8 @@ export function wrapFetchWithAnthropicCacheControl(
       return baseFetch(input, init);
     }
 
-    // Detect and strip Mux-internal headers before forwarding.
-    const incomingHeaders = new Headers(init.headers);
-    const effortOverride = incomingHeaders.get(MUX_ANTHROPIC_EFFORT_OVERRIDE_HEADER);
-    let headersModified = false;
-    if (effortOverride != null) {
-      incomingHeaders.delete(MUX_ANTHROPIC_EFFORT_OVERRIDE_HEADER);
-      headersModified = true;
-    }
-
     try {
       const json = JSON.parse(init.body) as Record<string, unknown>;
-
-      // Native-xhigh adaptive-thinking models (Opus 4.7+ and Sonnet 5+) require
-      // `thinking.display: "summarized"` to return thinking content in the response.
-      // Inject it on the wire for any adaptive thinking request targeting those models.
-      // See https://platform.claude.com/docs/en/build-with-claude/adaptive-thinking#summarized-thinking
-      //
-      // Two body shapes to handle:
-      // - Direct Anthropic API:   `{ model, thinking: { type: "adaptive" }, output_config }`
-      // - AI SDK gateway (mux-gateway): `{ prompt, providerOptions: { anthropic: { thinking } } }`
-      //   with the model exposed via the ai-model-id header.
-      const directModel = typeof json.model === "string" ? json.model : "";
-      const headerModelId = incomingHeaders.get("ai-model-id") ?? "";
-      // Reuse the shared native-xhigh detector so the wire-level regex stays in
-      // one place (src/common/types/thinking.ts) — it also normalizes provider
-      // prefixes (e.g., `anthropic/claude-opus-4-7`, `anthropic/claude-sonnet-5`).
-      const targetsNativeXhighModel = [directModel, headerModelId].some(
-        anthropicSupportsNativeXhigh
-      );
-
-      const directThinking = isRecord(json.thinking) ? json.thinking : undefined;
-      const providerOpts = isRecord(json.providerOptions) ? json.providerOptions : undefined;
-      const anthropicOpts =
-        providerOpts && isRecord(providerOpts.anthropic) ? providerOpts.anthropic : undefined;
-      const gatewayThinking =
-        anthropicOpts && isRecord(anthropicOpts.thinking) ? anthropicOpts.thinking : undefined;
-
-      if (targetsNativeXhighModel) {
-        if (directThinking?.type === "adaptive") {
-          directThinking.display ??= "summarized";
-          log.debug("Anthropic wrapper: injected thinking.display=summarized (direct body)");
-        }
-        if (gatewayThinking?.type === "adaptive") {
-          gatewayThinking.display ??= "summarized";
-          log.debug("Anthropic wrapper: injected thinking.display=summarized (gateway body)");
-        }
-      }
-
-      // Native-xhigh Anthropic models use an "xhigh" effort level. The @ai-sdk/anthropic
-      // Zod schema still rejects "xhigh", so providerOptions sends "max" through
-      // the SDK and we rewrite effort here based on the Mux-internal override
-      // header — for both direct and gateway body shapes.
-      if (effortOverride) {
-        if (isRecord(json.output_config)) {
-          json.output_config.effort = effortOverride;
-        }
-        if (anthropicOpts) {
-          anthropicOpts.effort = effortOverride;
-        }
-      }
 
       // Inject cache_control on the last tool if tools array exists.
       // If the SDK already populated cache_control, preserve it but override ttl
@@ -445,15 +384,11 @@ export function wrapFetchWithAnthropicCacheControl(
 
       // Update body with modified JSON
       const newBody = JSON.stringify(json);
-      const outHeaders = incomingHeaders;
+      const outHeaders = new Headers(init.headers);
       outHeaders.delete("content-length"); // Body size changed
       return baseFetch(input, { ...init, headers: outHeaders, body: newBody });
     } catch {
-      // If JSON parsing fails we can't touch the body, but we still need to
-      // strip Mux-internal headers if any were present so Anthropic doesn't see them.
-      if (headersModified) {
-        return baseFetch(input, { ...init, headers: incomingHeaders });
-      }
+      // If JSON parsing fails we can't touch the body; forward unchanged.
       return baseFetch(input, init);
     }
   };
@@ -855,6 +790,16 @@ export function normalizeCodexResponsesBody(body: string): string {
   // and currently rejects the `truncation` field entirely.
   delete json.truncation;
 
+  // Strip the native pro-mode field before forwarding to the stricter ChatGPT
+  // backend. Unknown nested reasoning fields risk a hard 4xx, and falling back
+  // to standard mode is safer. Preserve effort/summary.
+  if (isRecord(json.reasoning)) {
+    delete json.reasoning.mode;
+    if (Object.keys(json.reasoning).length === 0) {
+      delete json.reasoning;
+    }
+  }
+
   // Codex-compatible Responses requests must disable storage and strip unsupported params.
   json.store = false;
 
@@ -1070,7 +1015,7 @@ export class ProviderModelFactory {
     }
 
     // DevTools middleware wrappers currently support LanguageModelV3 instances only.
-    if (typeof result.data === "string" || result.data.specificationVersion !== "v3") {
+    if (typeof result.data === "string" || result.data.specificationVersion !== "v4") {
       return result;
     }
 
@@ -1290,8 +1235,7 @@ export class ProviderModelFactory {
         // Use getProviderFetch to preserve any user-configured custom fetch (e.g., proxies)
         const baseFetch = getProviderFetch(providerConfig);
         const disableBeta = muxProviderOptions?.anthropic?.disableBetaFeatures === true;
-        // Always wrap to apply Opus 4.7+ wire-level transforms (display + effort
-        // override); skip cache_control injection when beta features are off.
+        // Wrap for cache_control normalization; skip injection when beta features are off.
         const fetchWithCacheControl = wrapFetchWithAnthropicCacheControl(
           baseFetch,
           effectiveAnthropicCacheTtl,
@@ -1309,8 +1253,8 @@ export class ProviderModelFactory {
       if (providerName === "openai") {
         const fullModelId = `${providerName}:${modelId}`;
 
-        const codexOauthAllowed = isCodexOauthAllowedModelId(fullModelId);
-        const codexOauthRequired = isCodexOauthRequiredModelId(fullModelId);
+        const codexOauthAllowed = isCodexOauthAllowedModel(fullModelId, providersConfig);
+        const codexOauthRequired = isCodexOauthRequiredModel(fullModelId, providersConfig);
 
         const storedCodexOauth = parseCodexOauthAuth(
           (providerConfig as { codexOauth?: unknown }).codexOauth
@@ -1525,12 +1469,11 @@ export class ProviderModelFactory {
 
         // Lazy-load OpenAI provider to reduce startup time
         const { createOpenAI } = await PROVIDER_REGISTRY.openai();
-        const providerFetch = webSocketTransport.fetch;
         const provider = createOpenAI({
           ...configWithCreds,
           // Cast is safe: our fetch implementation is compatible with the SDK's fetch type.
           // The preconnect method is optional in our implementation but required by the SDK type.
-          fetch: providerFetch,
+          fetch: webSocketTransport.fetch,
         });
         // OpenAI reasoning state is preserved via explicit history, so no extra
         // middleware is needed beyond the provider's standard Responses handling.
@@ -1623,7 +1566,10 @@ export class ProviderModelFactory {
           ...restOptions,
           fetch: providerFetch,
         });
-        return Ok(provider(modelId));
+        // AI SDK 7 switched xai(modelId) to the Responses API by default.
+        // Pin the Chat Completions API to preserve pre-upgrade behavior
+        // (e.g. providerOptions.xai.searchParameters routing).
+        return Ok(provider.chat(modelId));
       }
 
       // Handle Ollama provider
@@ -1802,8 +1748,8 @@ export class ProviderModelFactory {
         const baseFetch = getProviderFetch(providerConfig);
         const isAnthropicModel = modelId.startsWith("anthropic/");
         const disableBeta = muxProviderOptions?.anthropic?.disableBetaFeatures === true;
-        // For Anthropic models via gateway, always wrap to apply Opus 4.7+ wire
-        // transforms; skip cache_control injection when beta features are off.
+        // For Anthropic models via gateway, wrap for cache_control normalization;
+        // skip injection when beta features are off.
         const fetchWithCacheControl = isAnthropicModel
           ? wrapFetchWithAnthropicCacheControl(baseFetch, effectiveAnthropicCacheTtl, {
               injectCacheControl: !disableBeta,

@@ -9,7 +9,11 @@ import type {
 } from "@/common/types/runtime";
 import type { RuntimeChoice } from "@/browser/utils/runtimeUi";
 import { buildRuntimeConfig, RUNTIME_MODE } from "@/common/types/runtime";
-import type { ThinkingLevel } from "@/common/types/thinking";
+import {
+  coerceOpenAIReasoningMode,
+  type OpenAIReasoningMode,
+  type ThinkingLevel,
+} from "@/common/types/thinking";
 import { useDraftWorkspaceSettings } from "@/browser/hooks/useDraftWorkspaceSettings";
 import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
@@ -21,6 +25,7 @@ import {
   getModelKey,
   getNotifyOnResponseAutoEnableKey,
   getNotifyOnResponseKey,
+  getReasoningModeKey,
   getThinkingLevelKey,
   getWorkspaceAISettingsByAgentKey,
   getPendingScopeId,
@@ -64,6 +69,7 @@ export type CreationSendResult = { success: true } | { success: false; error?: S
 export type CreationInitialSlashCommand = Extract<ParsedCommand, { type: "goal-set" }>;
 
 interface UseCreationWorkspaceOptions {
+  kind?: "scratch";
   projectPath: string;
   onWorkspaceCreated: (
     metadata: FrontendWorkspaceMetadata,
@@ -110,16 +116,36 @@ function syncCreationPreferences(projectPath: string, workspaceId: string): void
     updatePersistedState(getThinkingLevelKey(workspaceId), projectThinkingLevel);
   }
 
+  // Mirror thinkingLevel: carry the creation-time pro reasoning-mode choice into
+  // the new workspace's scope so it survives the project→workspace transition.
+  // Coerced so a corrupt persisted value is dropped instead of copied forward.
+  const projectReasoningMode = coerceOpenAIReasoningMode(
+    readPersistedState<OpenAIReasoningMode | null>(getReasoningModeKey(projectScopeId), null)
+  );
+  if (projectReasoningMode != null) {
+    updatePersistedState(getReasoningModeKey(workspaceId), projectReasoningMode);
+  }
+
   if (projectModel) {
     const effectiveThinking: ThinkingLevel = projectThinkingLevel ?? "off";
 
-    updatePersistedState<Partial<Record<string, { model: string; thinkingLevel: ThinkingLevel }>>>(
+    type AgentSettingsCache = Partial<
+      Record<
+        string,
+        { model: string; thinkingLevel: ThinkingLevel; reasoningMode?: OpenAIReasoningMode }
+      >
+    >;
+    updatePersistedState<AgentSettingsCache>(
       getWorkspaceAISettingsByAgentKey(workspaceId),
       (prev) => {
-        const record = prev && typeof prev === "object" ? prev : {};
+        const record: AgentSettingsCache = prev && typeof prev === "object" ? prev : {};
         return {
-          ...(record as Partial<Record<string, { model: string; thinkingLevel: ThinkingLevel }>>),
-          [effectiveAgentId]: { model: projectModel, thinkingLevel: effectiveThinking },
+          ...record,
+          [effectiveAgentId]: {
+            model: projectModel,
+            thinkingLevel: effectiveThinking,
+            ...(projectReasoningMode != null ? { reasoningMode: projectReasoningMode } : {}),
+          },
         };
       },
       {}
@@ -211,6 +237,7 @@ export type RuntimeAvailabilityState =
  * - Message sending with workspace creation
  */
 export function useCreationWorkspace({
+  kind,
   projectPath,
   onWorkspaceCreated,
   message,
@@ -291,7 +318,7 @@ export function useCreationWorkspace({
   // Load branches - used on mount and after git init
   // Returns a cleanup function to track mounted state
   const loadBranches = useCallback(async () => {
-    if (!projectPath.length || !api) return;
+    if (kind === "scratch" || !projectPath.length || !api) return;
     setBranchesLoaded(false);
     try {
       const result = await api.projects.listBranches({ projectPath });
@@ -302,10 +329,14 @@ export function useCreationWorkspace({
     } finally {
       setBranchesLoaded(true);
     }
-  }, [projectPath, api]);
+  }, [kind, projectPath, api]);
 
   // Load branches and runtime availability on mount with mounted guard
   useEffect(() => {
+    if (kind === "scratch") {
+      setBranchesLoaded(true);
+      return;
+    }
     if (!projectPath.length || !api) return;
     let mounted = true;
     setBranchesLoaded(false);
@@ -339,7 +370,7 @@ export function useCreationWorkspace({
     return () => {
       mounted = false;
     };
-  }, [projectPath, api]);
+  }, [kind, projectPath, api]);
 
   // Cleanup: resolve trust prompt on unmount so handleSend doesn't wedge
   useEffect(() => {
@@ -364,7 +395,11 @@ export function useCreationWorkspace({
       // Build runtime config early (used later for workspace creation)
       let runtimeSelection = settings.selectedRuntime;
 
-      if (runtimeSelection.mode === RUNTIME_MODE.DEVCONTAINER) {
+      // Scratch chats always run on the local runtime and never load runtime
+      // availability, so the devcontainer preflight below would block creation
+      // forever (availability stays "loading") for users whose default runtime
+      // is Dev Container. createScratch() ignores runtimeConfig entirely.
+      if (kind !== "scratch" && runtimeSelection.mode === RUNTIME_MODE.DEVCONTAINER) {
         const devcontainerSelection = resolveDevcontainerSelection({
           selectedRuntime: runtimeSelection,
           availabilityState: runtimeAvailabilityState,
@@ -484,7 +519,7 @@ export function useCreationWorkspace({
 
         // Gate: untrusted projects must be confirmed before workspace creation.
         // Skip while projects are still loading — the backend gate catches untrusted projects.
-        if (!projectsLoading && !getProjectConfig(projectPath)?.trusted) {
+        if (kind !== "scratch" && !projectsLoading && !getProjectConfig(projectPath)?.trusted) {
           const userConfirmed = await new Promise<boolean>((resolve) => {
             setTrustPrompt({ resolve, projectPath });
           });
@@ -497,15 +532,17 @@ export function useCreationWorkspace({
           // Trust was confirmed and set, continue with creation
         }
 
-        // Create the workspace with the generated name and title
-        const createResult = await api.workspace.create({
-          projectPath,
-          branchName: identity.name,
-          trunkBranch: settings.trunkBranch,
-          title: createTitle,
-          runtimeConfig,
-          subProjectPath: subProjectPath ?? undefined,
-        });
+        const createResult =
+          kind === "scratch"
+            ? await api.workspace.createScratch({ title: createTitle })
+            : await api.workspace.create({
+                projectPath,
+                branchName: identity.name,
+                trunkBranch: settings.trunkBranch,
+                title: createTitle,
+                runtimeConfig,
+                subProjectPath: subProjectPath ?? undefined,
+              });
 
         if (!createResult.success) {
           setToast({
@@ -531,6 +568,7 @@ export function useCreationWorkspace({
             aiSettings: {
               model: settings.model,
               thinkingLevel: settings.thinkingLevel,
+              reasoningMode: settings.reasoningMode,
             },
             persistSelectedAgentId: true,
           })
@@ -594,7 +632,7 @@ export function useCreationWorkspace({
             api,
             workspaceId: metadata.id,
             variant: "workspace",
-            projectPath,
+            projectPath: metadata.projectPath,
             rawInput: messageText,
             dynamicWorkflowsEnabled,
             sendMessageOptions,
@@ -679,6 +717,7 @@ export function useCreationWorkspace({
       }
     },
     [
+      kind,
       api,
       isSending,
       projectPath,
@@ -692,6 +731,7 @@ export function useCreationWorkspace({
       settings.agentId,
       settings.model,
       settings.thinkingLevel,
+      settings.reasoningMode,
       settings.trunkBranch,
       waitForGeneration,
       workspaceNameState.autoGenerate,

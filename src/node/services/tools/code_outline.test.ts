@@ -4,7 +4,10 @@ import type { ExecResult } from "@/node/utils/runtime/helpers";
 import * as runtimeHelpers from "@/node/utils/runtime/helpers";
 import { createCodeOutlineTool } from "./code_outline";
 import type { CodeOutlineToolResult } from "@/common/types/tools";
-import { createTestToolConfig, mockToolCallOptions as sharedMockToolCallOptions } from "./testHelpers";
+import {
+  createTestToolConfig,
+  mockToolCallOptions as sharedMockToolCallOptions,
+} from "./testHelpers";
 
 /**
  * code_outline behavior tests.
@@ -19,7 +22,7 @@ import { createTestToolConfig, mockToolCallOptions as sharedMockToolCallOptions 
  * without touching the real filesystem for the binary path.
  */
 
-const toolCallOptions: ToolExecutionOptions = sharedMockToolCallOptions;
+const toolCallOptions: ToolExecutionOptions<unknown> = sharedMockToolCallOptions;
 
 function createExecResult(overrides: Partial<ExecResult> = {}): ExecResult {
   return { stdout: "", stderr: "", exitCode: 0, duration: 1, ...overrides };
@@ -54,10 +57,7 @@ function createStubbedTool(
  * intentionally 0-based (ast-grep's native convention) so we can assert the
  * tool maps them to 1-based.
  */
-function filePayload(
-  items: unknown[],
-  opts: { path?: string; language?: string } = {}
-): string {
+function filePayload(items: unknown[], opts: { path?: string; language?: string } = {}): string {
   return JSON.stringify([
     { path: opts.path ?? "src/mod.ts", language: opts.language ?? "TypeScript", items },
   ]);
@@ -219,9 +219,7 @@ describe("code_outline tool — binary-missing failure", () => {
   it("returns failure mentioning ast-grep when exec throws (ENOENT on the binary)", async () => {
     const env = createStubbedTool(
       { isDirectory: false },
-      spyOn(runtimeHelpers, "execBuffered").mockRejectedValue(
-        new Error("spawn ast-grep ENOENT")
-      )
+      spyOn(runtimeHelpers, "execBuffered").mockRejectedValue(new Error("spawn ast-grep ENOENT"))
     );
 
     const result = (await env.tool.execute!(
@@ -317,7 +315,12 @@ describe("code_outline tool — stream (directory) parsing", () => {
       JSON.stringify({
         path: "a.ts",
         language: "TypeScript",
-        items: [rawItem({ name: "a", range: { start: { line: 0, column: 0 }, end: { line: 0, column: 3 } } })],
+        items: [
+          rawItem({
+            name: "a",
+            range: { start: { line: 0, column: 0 }, end: { line: 0, column: 3 } },
+          }),
+        ],
       }),
       "",
       JSON.stringify({ path: "b.ts", language: "TypeScript", items: [] }),

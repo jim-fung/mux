@@ -54,8 +54,13 @@ import {
 } from "@/node/services/utils/fileChangeTracker";
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
-import { coerceThinkingLevel, type ThinkingLevel } from "@/common/types/thinking";
+import {
+  coerceOpenAIReasoningMode,
+  coerceThinkingLevel,
+  type ThinkingLevel,
+} from "@/common/types/thinking";
 import { enforceThinkingPolicy, resolveMinimumThinkingLevel } from "@/common/utils/thinking/policy";
+import type { ActiveTurnThinkingOverride } from "@/node/services/thinkingOverride";
 import {
   createMuxMessage,
   dedupeAgentSkillRefs,
@@ -355,12 +360,21 @@ export class AgentSession {
   private disposed = false;
   private turnPhase: TurnPhase = TurnPhase.IDLE;
   private activePreparedTurnAbortController: AbortController | null = null;
+  /**
+   * Per-turn holder for mid-turn thinking-level overrides. Created when a turn
+   * is durably accepted (before any await that could let the renderer's slider
+   * route race in), threaded by reference into StreamManager, and cleared when
+   * the turn ends (setTurnPhase → IDLE). Null while idle: the slider route then
+   * reports accepted:false and persisted settings cover the next turn.
+   */
+  private activeTurnThinkingOverride: ActiveTurnThinkingOverride | null = null;
   // When true, stream-end skips auto-flushing queued messages so an edit can truncate first.
   private deferQueuedFlushUntilAfterEdit = false;
-  // A tool-end queued message should preempt the current turn after the next real tool result.
-  // We keep this set until the requested stream-abort arrives, so a re-queued replacement
-  // can still dispatch even if the original queued draft was edited while the abort was in flight.
-  private queuedToolEndAbortInFlight = false;
+  // Provider-executed tools (for example native web_search/web_fetch) complete inside one
+  // provider response, so the SDK's between-step stopWhen hook cannot preempt after them.
+  // Track known siblings and reserve soft interruption for that native-only boundary.
+  private queuedProviderToolEndAbortInFlight = false;
+  private readonly activeToolCallIds = new Set<string>();
 
   private idleWaiters: Array<() => void> = [];
   private pendingExternalManualFollowUps = 0;
@@ -1415,6 +1429,17 @@ export class AgentSession {
       ? (agentSettingsThinkingLevel ?? persistedThinkingLevel ?? assistantThinkingLevel)
       : (persistedThinkingLevel ?? assistantThinkingLevel ?? agentSettingsThinkingLevel);
 
+    // Pro reasoning mode threads alongside thinkingLevel from the same sources
+    // (assistant message metadata does not carry it), so startup retries do not
+    // silently downgrade a pro-mode turn to standard.
+    const persistedReasoningMode = coerceOpenAIReasoningMode(
+      persistedRetrySendOptions?.reasoningMode
+    );
+    const agentSettingsReasoningMode = coerceOpenAIReasoningMode(agentSettings?.reasoningMode);
+    const baseReasoningMode = isChildTaskWorkspace
+      ? (agentSettingsReasoningMode ?? persistedReasoningMode)
+      : (persistedReasoningMode ?? agentSettingsReasoningMode);
+
     const persistedToolPolicy =
       lastUserMessage?.metadata?.toolPolicy ?? persistedRetrySendOptions?.toolPolicy;
     const persistedDisableWorkspaceAgents =
@@ -1437,10 +1462,19 @@ export class AgentSession {
       const requestedThinkingLevel =
         baseThinkingLevel ?? coerceThinkingLevel(compactSettings?.thinkingLevel) ?? "off";
 
+      const requestedReasoningMode =
+        baseReasoningMode ?? coerceOpenAIReasoningMode(compactSettings?.reasoningMode);
+
       const compactionRequest: StartupRetrySendOptions = {
         model: compactionModel,
         agentId: "compact",
-        thinkingLevel: enforceThinkingPolicy(compactionModel, requestedThinkingLevel),
+        thinkingLevel: enforceThinkingPolicy(
+          compactionModel,
+          requestedThinkingLevel,
+          undefined,
+          this.getProvidersConfigSafe()
+        ),
+        ...(requestedReasoningMode != null ? { reasoningMode: requestedReasoningMode } : {}),
         maxOutputTokens:
           typeof lastUserMuxMetadata.parsed.maxOutputTokens === "number"
             ? lastUserMuxMetadata.parsed.maxOutputTokens
@@ -1475,6 +1509,9 @@ export class AgentSession {
     };
     if (baseThinkingLevel) {
       retryRequest.thinkingLevel = baseThinkingLevel;
+    }
+    if (baseReasoningMode) {
+      retryRequest.reasoningMode = baseReasoningMode;
     }
     if (persistedToolPolicy) {
       retryRequest.toolPolicy = persistedToolPolicy;
@@ -2176,12 +2213,13 @@ export class AgentSession {
         message: {
           type: "queued-message-changed",
           workspaceId: this.workspaceId,
-          queuedMessages: this.messageQueue.getMessages(),
-          displayText: this.messageQueue.getDisplayText(),
-          fileParts: this.messageQueue.getFileParts(),
-          reviews: this.messageQueue.getReviews(),
-          queueDispatchMode: this.messageQueue.getQueueDispatchMode(),
-          hasCompactionRequest: this.messageQueue.hasCompactionRequest(),
+          hasQueuedMessages: !this.messageQueue.isEmpty(),
+          queuedMessages: this.messageQueue.getVisibleMessages(),
+          displayText: this.messageQueue.getVisibleDisplayText(),
+          fileParts: this.messageQueue.getVisibleFileParts(),
+          reviews: this.messageQueue.getVisibleReviews(),
+          queueDispatchMode: this.messageQueue.getVisibleQueueDispatchMode(),
+          hasCompactionRequest: this.messageQueue.hasVisibleCompactionRequest(),
         },
       });
 
@@ -2645,7 +2683,7 @@ export class AgentSession {
       // stream events have populated lastUsageState.
       await this.seedUsageStateFromHistory();
 
-      const providersConfigForCompaction = this.getProvidersConfigForCompaction();
+      const providersConfigForCompaction = this.getProvidersConfigSafe();
       const compactionResult = this.compactionMonitor.checkBeforeSend({
         model: modelForStream,
         usage: this.getUsageState(),
@@ -2777,6 +2815,13 @@ export class AgentSession {
       return Ok(undefined);
     }
 
+    // Turn durably accepted + options finalized: open the mid-turn thinking
+    // override window BEFORE the user-message emit / onAccepted / any further
+    // await, so a slider change during PREPARING (runtime warmup, model
+    // creation) lands in the holder the stream's prepareStep will read.
+    const turnThinkingOverride: ActiveTurnThinkingOverride = {};
+    this.activeTurnThinkingOverride = turnThinkingOverride;
+
     // Emit snapshots only for immediately-sent turns. On on-send compaction paths,
     // snapshots are deferred with the follow-up message to avoid duplicate ephemeral
     // snapshot rows that were never persisted.
@@ -2819,6 +2864,11 @@ export class AgentSession {
     try {
       await internal?.onAccepted?.();
     } catch (error) {
+      // Pre-stream failure: identity-guarded so a replacement turn's holder
+      // (created while this one unwound) is never cleared by mistake.
+      if (this.activeTurnThinkingOverride === turnThinkingOverride) {
+        this.activeTurnThinkingOverride = null;
+      }
       return Err(createUnknownSendMessageError(getErrorMessage(error)));
     }
 
@@ -2858,7 +2908,8 @@ export class AgentSession {
           undefined,
           agentInitiated,
           preparedTurnAbortController.signal,
-          goalKind
+          goalKind,
+          turnThinkingOverride
         );
       } finally {
         // Success should advance via stream events; if startup never emitted any, don't leave the
@@ -2934,6 +2985,10 @@ export class AgentSession {
     // accept its options, even if startup fails before the stream fully begins.
     this.setAutoRetryResumeState(optionsForStream, internal?.agentInitiated, internal?.goalKind);
     this.setTurnPhase(TurnPhase.PREPARING);
+    // Open the mid-turn thinking override window for the resumed turn (after
+    // setTurnPhase(PREPARING), which clears the holder on the IDLE transition).
+    const turnThinkingOverride: ActiveTurnThinkingOverride = {};
+    this.activeTurnThinkingOverride = turnThinkingOverride;
     try {
       // Must await here so the finally block runs after streaming completes,
       // not immediately when the Promise is returned.
@@ -2944,7 +2999,8 @@ export class AgentSession {
         undefined,
         internal?.agentInitiated,
         undefined,
-        internal?.goalKind
+        internal?.goalKind,
+        turnThinkingOverride
       );
       if (!result.success) {
         return result;
@@ -2988,7 +3044,7 @@ export class AgentSession {
     return this.lastUsageState;
   }
 
-  private getProvidersConfigForCompaction(): ProvidersConfigMap | null {
+  private getProvidersConfigSafe(): ProvidersConfigMap | null {
     try {
       // Prefer ProviderService's safe config view: it includes env/file API-key source
       // metadata plus the Codex OAuth presence bit, which context-limit resolution needs
@@ -3221,31 +3277,36 @@ export class AgentSession {
     return followUp;
   }
 
-  private getPreferredCompactionModel(): string | null {
+  private getPreferredCompactionSettings(): {
+    model: string | null;
+    thinkingLevel: ThinkingLevel | null;
+  } {
     try {
       const maybeConfig = this.config as Config & {
         loadConfigOrDefault?: () => {
-          agentAiDefaults?: Record<string, { modelString?: string }>;
+          agentAiDefaults?: Record<string, { modelString?: string; thinkingLevel?: string }>;
         } | null;
       };
       if (typeof maybeConfig.loadConfigOrDefault !== "function") {
-        return null;
+        return { model: null, thinkingLevel: null };
       }
 
-      const compactModelString =
-        maybeConfig.loadConfigOrDefault()?.agentAiDefaults?.compact?.modelString;
+      const compactDefaults = maybeConfig.loadConfigOrDefault()?.agentAiDefaults?.compact;
+      const thinkingLevel = coerceThinkingLevel(compactDefaults?.thinkingLevel) ?? null;
+
+      const compactModelString = compactDefaults?.modelString;
       if (typeof compactModelString !== "string") {
-        return null;
+        return { model: null, thinkingLevel };
       }
 
       const normalized = normalizeToCanonical(compactModelString.trim());
       if (!isValidModelFormat(normalized)) {
-        return null;
+        return { model: null, thinkingLevel };
       }
 
-      return normalized;
+      return { model: normalized, thinkingLevel };
     } catch {
-      return null;
+      return { model: null, thinkingLevel: null };
     }
   }
 
@@ -3261,7 +3322,8 @@ export class AgentSession {
   } {
     // Callers pass the stream model in baseOptions.model; avoid ambient session state
     // here because the current stream is cleared before compaction and could go stale.
-    const compactionModel = this.getPreferredCompactionModel() ?? params.baseOptions.model;
+    const compactSettings = this.getPreferredCompactionSettings();
+    const compactionModel = compactSettings.model ?? params.baseOptions.model;
     assert(
       typeof compactionModel === "string" && compactionModel.trim().length > 0,
       "auto-compaction requires a non-empty model"
@@ -3272,9 +3334,14 @@ export class AgentSession {
       agentId: "compact",
       skipAiSettingsPersistence: true,
       model: compactionModel,
+      // Prefer the compact agent's configured thinking level over the active
+      // stream's, matching desktop /compact (applyCompactionOverrides) — the
+      // stream's level was chosen for its model, not the compaction model.
       thinkingLevel: enforceThinkingPolicy(
         compactionModel,
-        params.baseOptions.thinkingLevel ?? "off"
+        compactSettings.thinkingLevel ?? params.baseOptions.thinkingLevel ?? "off",
+        undefined,
+        this.getProvidersConfigSafe()
       ),
       maxOutputTokens: undefined,
       toolPolicy: [{ regex_match: ".*", action: "disable" }],
@@ -3435,7 +3502,8 @@ export class AgentSession {
     this.retryManager.cancel();
 
     if (options?.soft !== true) {
-      this.queuedToolEndAbortInFlight = false;
+      this.queuedProviderToolEndAbortInFlight = false;
+      this.activeToolCallIds.clear();
     }
 
     // For hard interrupts, delete partial BEFORE stopping to prevent abort handler
@@ -3466,7 +3534,11 @@ export class AgentSession {
     disablePostCompactionAttachments?: boolean,
     agentInitiated?: boolean,
     abortSignal?: AbortSignal,
-    goalKind?: GoalSyntheticMessageKind
+    goalKind?: GoalSyntheticMessageKind,
+    // Session-owned per-turn holder for mid-turn thinking changes. Passed
+    // explicitly (not read from the field) so a preempted turn can never pick
+    // up its replacement's holder. Absent for internal retry paths.
+    activeTurnThinkingOverride?: ActiveTurnThinkingOverride
   ): Promise<Result<void, SendMessageError>> {
     const isStartupAbortRequested = (): boolean => abortSignal?.aborted === true;
 
@@ -3482,14 +3554,14 @@ export class AgentSession {
     this.activeStreamErrorEventReceived = false;
     this.activeStreamFailureHandled = false;
     this.activeStreamHadPostCompactionInjection = false;
-    const providersConfigForCompaction = this.getProvidersConfigForCompaction();
+    const providersConfig = this.getProvidersConfigSafe();
     this.activeStreamContext = {
       modelString,
       options,
       agentInitiated,
       openaiTruncationModeOverride,
       ...(goalKind != null ? { goalKind } : {}),
-      providersConfig: providersConfigForCompaction,
+      providersConfig,
     };
     this.activeStreamUserMessageId = undefined;
 
@@ -3587,9 +3659,17 @@ export class AgentSession {
             normalizeToCanonical(modelString)
           ]
         : undefined;
-    const minThinkingLevel = resolveMinimumThinkingLevel(modelString, minThinkingOverride);
+    // Pass providersConfig so mapped aliases (mappedToModel -> e.g. GPT-5.6)
+    // clamp against the target model's policy — otherwise a capability level
+    // like native max would be stripped here before buildProviderOptions can
+    // resolve the alias.
+    const minThinkingLevel = resolveMinimumThinkingLevel(
+      modelString,
+      minThinkingOverride,
+      providersConfig
+    );
     const effectiveThinkingLevel = options?.thinkingLevel
-      ? enforceThinkingPolicy(modelString, options.thinkingLevel, minThinkingLevel)
+      ? enforceThinkingPolicy(modelString, options.thinkingLevel, minThinkingLevel, providersConfig)
       : undefined;
 
     // Bind recordFileState to this session for the propose_plan tool
@@ -3615,6 +3695,8 @@ export class AgentSession {
       modelString,
       abortSignal,
       thinkingLevel: effectiveThinkingLevel,
+      // Orthogonal to thinking level; buildRequestHeaders gates it per model.
+      reasoningMode: options?.reasoningMode,
       toolPolicy: options?.toolPolicy,
       additionalSystemContext: options?.additionalSystemContext,
       additionalSystemInstructions: options?.additionalSystemInstructions,
@@ -3641,6 +3723,10 @@ export class AgentSession {
       disableWorkspaceAgents: options?.disableWorkspaceAgents,
       hasQueuedMessages: this.hasQueuedMessages.bind(this),
       openaiTruncationModeOverride,
+      // Mid-turn thinking overrides clamp against the same floor as the
+      // send-time level above (single source of truth for the floor).
+      minThinkingLevel,
+      activeTurnThinkingOverride,
     });
 
     if (!streamResult.success) {
@@ -4400,6 +4486,7 @@ export class AgentSession {
   }
 
   private resetActiveStreamState(): void {
+    this.activeToolCallIds.clear();
     this.activeStreamContext = undefined;
     this.activeStreamUserMessageId = undefined;
     this.activeStreamStartedAtMs = undefined;
@@ -4411,6 +4498,7 @@ export class AgentSession {
   private async handleStreamError(data: StreamErrorPayload): Promise<void> {
     this.setTurnPhase(TurnPhase.COMPLETING);
 
+    this.queuedProviderToolEndAbortInFlight = false;
     this.clearLiveUsageState();
     const hadCompactionRequest = this.activeCompactionRequest !== undefined;
     if (
@@ -4489,6 +4577,8 @@ export class AgentSession {
     forward("stream-start", (payload) => {
       if (payload.type === "stream-start") {
         this.activeStreamStartedAtMs = payload.startTime;
+        this.queuedProviderToolEndAbortInFlight = false;
+        this.activeToolCallIds.clear();
       }
       this.setTurnPhase(TurnPhase.STREAMING);
       this.emitChatEvent(payload);
@@ -4499,6 +4589,12 @@ export class AgentSession {
     });
     forward("tool-call-start", (payload) => {
       this.markActiveStreamHadAnyOutput();
+      this.emitChatEvent(payload);
+      if (payload.type === "tool-call-start" && payload.replay !== true) {
+        this.activeToolCallIds.add(payload.toolCallId);
+      }
+    });
+    forward("tool-call-execution-start", (payload) => {
       this.emitChatEvent(payload);
     });
     forward("bash-output", (payload) => {
@@ -4529,7 +4625,7 @@ export class AgentSession {
       this.markActiveStreamHadAnyOutput();
       this.emitChatEvent(payload);
     });
-    forward("tool-call-end", (payload) => {
+    forward("tool-call-end", async (payload) => {
       this.markActiveStreamHadAnyOutput();
       this.emitChatEvent(payload);
 
@@ -4543,7 +4639,10 @@ export class AgentSession {
       }
 
       if (payload.type === "tool-call-end" && payload.replay !== true) {
-        this.requestQueuedToolEndDispatchAfterCurrentTool();
+        this.activeToolCallIds.delete(payload.toolCallId);
+        if (payload.providerExecuted === true && this.activeToolCallIds.size === 0) {
+          await this.requestQueuedProviderToolEndDispatch();
+        }
       }
     });
     forward("reasoning-delta", (payload) => {
@@ -4638,8 +4737,9 @@ export class AgentSession {
           this.activeStreamUserMessageId
         );
 
+        this.queuedProviderToolEndAbortInFlight = false;
+        this.activeToolCallIds.clear();
         this.emitChatEvent(payload);
-        this.queuedToolEndAbortInFlight = false;
         return;
       }
 
@@ -4659,7 +4759,8 @@ export class AgentSession {
       const failedUserMessageId = this.activeStreamUserMessageId;
       const hadCompactionRequest = this.activeCompactionRequest !== undefined;
       const abortReason = "abortReason" in payload ? payload.abortReason : undefined;
-      const isQueuedToolEndAbort = this.queuedToolEndAbortInFlight && abortReason !== "user";
+      const isQueuedProviderToolEndAbort =
+        this.queuedProviderToolEndAbortInFlight && abortReason !== "user";
       if (abortReason === "user") {
         await this.workspaceGoalService?.recordUserStoppedStream(this.workspaceId);
       }
@@ -4688,9 +4789,7 @@ export class AgentSession {
       if (hadCompactionRequest && !this.disposed) {
         this.clearQueue();
       }
-      // A queued tool-end dispatch deliberately soft-stops the stream (abortReason "system")
-      // to preempt the turn, so that abort is intentional rather than a failure: skip auto-retry.
-      if (!isQueuedToolEndAbort) {
+      if (!isQueuedProviderToolEndAbort) {
         await this.handleStreamFailureForAutoRetry({
           type: "aborted",
           message: abortReason,
@@ -4698,7 +4797,8 @@ export class AgentSession {
       }
       await this.updateStartupAutoRetryAbandonFromAbort(abortReason, failedUserMessageId);
       this.emitChatEvent(payload);
-      const dispatchedQueuedMessage = this.dispatchQueuedToolEndMessageAfterAbort(abortReason);
+      const dispatchedQueuedMessage =
+        this.dispatchQueuedProviderToolEndMessageAfterAbort(abortReason);
       if (!dispatchedQueuedMessage) {
         this.setTurnPhase(TurnPhase.IDLE);
       }
@@ -4803,8 +4903,8 @@ export class AgentSession {
         // P2: if an edit is waiting, skip the queue flush so the edit truncates first.
         const hadQueuedMessages = this.hasPendingManualFollowUp();
         if (this.deferQueuedFlushUntilAfterEdit) {
-          // Clear the queued message flag so the next turn's tools don't early-return.
-          this.queuedToolEndAbortInFlight = false;
+          this.queuedProviderToolEndAbortInFlight = false;
+          // Clear the queued-message signal while the edit flow owns the next dispatch.
           this.backgroundProcessManager.setMessageQueued(this.workspaceId, false);
           // Do not dispatch stream-end follow-ups while the edit flow is waiting
           // for IDLE; truncation must run before any synthetic turn resumes.
@@ -4949,6 +5049,10 @@ export class AgentSession {
     this.emitStreamLifecycleIfChanged();
 
     if (next === TurnPhase.IDLE) {
+      // Turn ended: expire any mid-turn thinking override. Safe unconditionally
+      // because a replacement turn (e.g. an edit) only creates its holder after
+      // the preempted turn has already been transitioned to IDLE.
+      this.activeTurnThinkingOverride = null;
       const waiters = this.idleWaiters;
       this.idleWaiters = [];
       for (const resolve of waiters) {
@@ -4959,6 +5063,23 @@ export class AgentSession {
 
   isBusy(): boolean {
     return this.turnPhase !== TurnPhase.IDLE;
+  }
+
+  /**
+   * Mid-turn thinking change: request that the active turn's next model step
+   * uses `level`. Returns accepted:false when no turn is active — the caller
+   * already persisted the setting, which covers the next turn. Last write wins
+   * across consecutive calls; the pending value expires silently if the turn
+   * ends before another model step occurs.
+   */
+  setActiveTurnThinkingLevel(level: ThinkingLevel): { accepted: boolean } {
+    this.assertNotDisposed("setActiveTurnThinkingLevel");
+    const holder = this.activeTurnThinkingOverride;
+    if (!holder) {
+      return { accepted: false };
+    }
+    holder.pending = level;
+    return { accepted: true };
   }
 
   isPreparingTurn(): boolean {
@@ -5044,13 +5165,18 @@ export class AgentSession {
     internal?: {
       synthetic?: boolean;
       agentInitiated?: boolean;
+      /** Coalescing: drop the message when an entry with the same key is already queued. */
+      dedupeKey?: string;
       onAccepted?: () => Promise<void> | void;
       onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
       onCanceled?: (reason: string) => Promise<void> | void;
     }
   ): "tool-end" | "turn-end" | null {
     this.assertNotDisposed("queueMessage");
-    const didEnqueue = this.messageQueue.add(message, options, internal);
+    const didEnqueue =
+      internal?.dedupeKey != null
+        ? this.messageQueue.addOnce(message, options, internal.dedupeKey, internal)
+        : this.messageQueue.add(message, options, internal);
     if (!didEnqueue) {
       return null;
     }
@@ -5067,11 +5193,13 @@ export class AgentSession {
 
   clearQueue(cancelReason = "Queued message cleared before dispatch."): void {
     this.assertNotDisposed("clearQueue");
-    const callbacks = this.messageQueue.getClearCallbacks();
+    const callbackSets = this.messageQueue.getClearCallbacks();
     this.messageQueue.clear();
     this.emitQueuedMessageChanged();
     this.backgroundProcessManager.setMessageQueued(this.workspaceId, false);
-    this.notifyQueuedMessageCleared(callbacks, cancelReason);
+    for (const callbacks of callbackSets) {
+      this.notifyQueuedMessageCleared(callbacks, cancelReason);
+    }
   }
 
   private notifyQueuedMessageCleared(
@@ -5101,6 +5229,27 @@ export class AgentSession {
     return this.messageQueue.hasWorkspaceTurn(handleId);
   }
 
+  /**
+   * Remove only the queued workspace-turn entry for this handle, keeping any
+   * unrelated queued messages (interrupting a queued turn must not drop user
+   * input queued before/behind it). Returns true when an entry was removed.
+   */
+  removeQueuedWorkspaceTurn(handleId: string, cancelReason: string): boolean {
+    this.assertNotDisposed("removeQueuedWorkspaceTurn");
+    assert(handleId.length > 0, "removeQueuedWorkspaceTurn requires handleId");
+    const callbacks = this.messageQueue.removeWorkspaceTurn(handleId);
+    if (callbacks == null) {
+      return false;
+    }
+    this.emitQueuedMessageChanged();
+    this.backgroundProcessManager.setMessageQueued(
+      this.workspaceId,
+      !this.messageQueue.isEmpty() && this.messageQueue.getQueueDispatchMode() === "tool-end"
+    );
+    this.notifyQueuedMessageCleared(callbacks, cancelReason);
+    return true;
+  }
+
   hasQueuedMessages(dispatchMode?: "tool-end" | "turn-end"): boolean {
     return (
       !this.messageQueue.isEmpty() &&
@@ -5108,39 +5257,62 @@ export class AgentSession {
     );
   }
 
-  private requestQueuedToolEndDispatchAfterCurrentTool(): void {
+  /** Whether a message queued with this dedupe key is still pending (see MessageQueue.addOnce). */
+  hasQueuedDedupeKey(dedupeKey: string): boolean {
+    assert(dedupeKey.length > 0, "hasQueuedDedupeKey requires a dedupeKey");
+    return this.messageQueue.hasDedupeKey(dedupeKey);
+  }
+
+  /**
+   * Drop the queue when its only content is the entry queued under this dedupe key.
+   * Returns true when a drop happened. Supersede semantics for scheduled maintenance
+   * messages: new input must own its turn, not batch behind a pending heartbeat whose
+   * muxMetadata would mislabel it.
+   */
+  dropQueuedMessageWithOnlyDedupeKey(dedupeKey: string): boolean {
+    this.assertNotDisposed("dropQueuedMessageWithOnlyDedupeKey");
+    assert(dedupeKey.length > 0, "dropQueuedMessageWithOnlyDedupeKey requires a dedupeKey");
+    if (!this.messageQueue.holdsOnlyDedupeKey(dedupeKey)) {
+      return false;
+    }
+    this.clearQueue("Scheduled message superseded by new input.");
+    return true;
+  }
+
+  private async requestQueuedProviderToolEndDispatch(): Promise<void> {
     if (
       this.turnPhase !== TurnPhase.STREAMING ||
-      this.queuedToolEndAbortInFlight ||
+      this.queuedProviderToolEndAbortInFlight ||
+      this.activeToolCallIds.size > 0 ||
       !this.hasQueuedMessages("tool-end")
     ) {
       return;
     }
 
-    this.queuedToolEndAbortInFlight = true;
-    void this.aiService
-      .stopStream(this.workspaceId, { soft: true, abortReason: "system" })
-      .then((result) => {
-        if (!result.success) {
-          this.queuedToolEndAbortInFlight = false;
-          log.warn("Failed to stop stream for queued tool-end message dispatch", {
-            workspaceId: this.workspaceId,
-            error: result.error,
-          });
-        }
+    this.queuedProviderToolEndAbortInFlight = true;
+    const result = await this.aiService.stopStream(this.workspaceId, {
+      soft: true,
+      abortReason: "system",
+    });
+    if (!result.success) {
+      this.queuedProviderToolEndAbortInFlight = false;
+      log.warn("Failed to stop stream after provider-executed tool result", {
+        workspaceId: this.workspaceId,
+        error: result.error,
       });
+    }
   }
 
-  private dispatchQueuedToolEndMessageAfterAbort(
+  private dispatchQueuedProviderToolEndMessageAfterAbort(
     abortReason: StreamAbortReason | undefined
   ): boolean {
-    if (!this.queuedToolEndAbortInFlight) {
+    if (!this.queuedProviderToolEndAbortInFlight) {
       return false;
     }
 
     const shouldDispatch =
       abortReason !== "user" && !this.deferQueuedFlushUntilAfterEdit && this.hasQueuedMessages();
-    this.queuedToolEndAbortInFlight = false;
+    this.queuedProviderToolEndAbortInFlight = false;
 
     if (!shouldDispatch) {
       return false;
@@ -5163,23 +5335,34 @@ export class AgentSession {
   }
 
   /**
-   * Restore queued messages to input box.
-   * Called by IPC handler on user-initiated interrupt.
+   * Restore queued user input to the composer after a user-initiated interrupt.
+   * Fully synthetic background work is canceled with the queue but never surfaced
+   * as editable text, so monitor wakes cannot replace or pollute the user's draft.
    */
   restoreQueueToInput(): void {
     this.assertNotDisposed("restoreQueueToInput");
-    if (!this.messageQueue.isEmpty()) {
-      const displayText = this.messageQueue.getDisplayText();
-      const fileParts = this.messageQueue.getFileParts();
-      const reviews = this.messageQueue.getReviews();
-      this.clearQueue();
+    if (this.messageQueue.isEmpty()) {
+      return;
+    }
 
+    const queuedMessages = this.messageQueue.getVisibleMessages();
+    const displayText = this.messageQueue.getVisibleDisplayText();
+    const fileParts = this.messageQueue.getVisibleFileParts();
+    const reviews = this.messageQueue.getVisibleReviews();
+    const hasVisibleContent =
+      queuedMessages.length > 0 || fileParts.length > 0 || (reviews?.length ?? 0) > 0;
+
+    // Clear everything: synthetic wake callbacks need cancellation so their durable
+    // records do not retry after the user explicitly interrupted the workspace.
+    this.clearQueue();
+
+    if (hasVisibleContent) {
       this.emitChatEvent({
         type: "restore-to-input",
         workspaceId: this.workspaceId,
         text: displayText,
-        fileParts: fileParts,
-        reviews: reviews,
+        fileParts,
+        reviews,
       });
     }
   }
@@ -5188,18 +5371,32 @@ export class AgentSession {
     this.emitChatEvent({
       type: "queued-message-changed",
       workspaceId: this.workspaceId,
-      queuedMessages: this.messageQueue.getMessages(),
-      displayText: this.messageQueue.getDisplayText(),
-      fileParts: this.messageQueue.getFileParts(),
-      reviews: this.messageQueue.getReviews(),
-      queueDispatchMode: this.messageQueue.getQueueDispatchMode(),
-      hasCompactionRequest: this.messageQueue.hasCompactionRequest(),
+      hasQueuedMessages: !this.messageQueue.isEmpty(),
+      queuedMessages: this.messageQueue.getVisibleMessages(),
+      displayText: this.messageQueue.getVisibleDisplayText(),
+      fileParts: this.messageQueue.getVisibleFileParts(),
+      reviews: this.messageQueue.getVisibleReviews(),
+      queueDispatchMode: this.messageQueue.getVisibleQueueDispatchMode(),
+      hasCompactionRequest: this.messageQueue.hasVisibleCompactionRequest(),
     });
   }
 
   /**
+   * Dispatch the next user-authored queued entry immediately. Hidden synthetic
+   * entries remain queued behind it and resume through the normal drain lifecycle.
+   */
+  sendNextUserQueuedMessage(): boolean {
+    this.assertNotDisposed("sendNextUserQueuedMessage");
+    if (!this.messageQueue.prioritizeNextUserEntry()) {
+      return false;
+    }
+    this.sendQueuedMessages();
+    return true;
+  }
+
+  /**
    * Send queued messages if any exist.
-   * Called when tool execution completes, stream ends, or user clicks send immediately.
+   * Called when the current turn ends or the user chooses to send immediately.
    */
   sendQueuedMessages(): void {
     // sendQueuedMessages can race with teardown (e.g. workspace.remove) because we
@@ -5209,14 +5406,25 @@ export class AgentSession {
       return;
     }
 
+    this.queuedProviderToolEndAbortInFlight = false;
     // Clear the queued message flag (even if queue is empty, to handle race conditions)
-    this.queuedToolEndAbortInFlight = false;
     this.backgroundProcessManager.setMessageQueued(this.workspaceId, false);
 
     if (!this.messageQueue.isEmpty()) {
-      const { message, options, internal } = this.messageQueue.produceMessage();
-      this.messageQueue.clear();
+      // Entries dispatch one at a time (FIFO): special sends (compaction, agent
+      // skills, workspace-turn follow-ups) own their turn, and anything queued
+      // behind them dispatches on a later drain instead of batching into them.
+      const { message, options, internal } = this.messageQueue.dequeueNext();
       this.emitQueuedMessageChanged();
+
+      // Re-arm dispatch signals for the remaining entries so the stream we are
+      // about to start drains them at its next tool end (or stream end).
+      if (!this.messageQueue.isEmpty()) {
+        this.backgroundProcessManager.setMessageQueued(
+          this.workspaceId,
+          this.messageQueue.getQueueDispatchMode() === "tool-end"
+        );
+      }
 
       // Set PREPARING synchronously before the async sendMessage to prevent
       // incoming messages from bypassing the queue during the await gap.
@@ -5231,12 +5439,17 @@ export class AgentSession {
             if (this.turnPhase === TurnPhase.PREPARING) {
               this.setTurnPhase(TurnPhase.IDLE);
             }
+            // No stream started, so no stream-end drain will fire for the
+            // remaining entries — try the next one now (each attempt pops an
+            // entry, so this terminates).
+            this.sendQueuedMessages();
           }
         })
         .catch(() => {
           if (this.turnPhase === TurnPhase.PREPARING) {
             this.setTurnPhase(TurnPhase.IDLE);
           }
+          this.sendQueuedMessages();
         });
     }
   }
@@ -5433,6 +5646,7 @@ export class AgentSession {
       model: effectiveModel,
       agentId: effectiveAgentId,
       thinkingLevel: followUp.thinkingLevel,
+      reasoningMode: followUp.reasoningMode,
       additionalSystemInstructions: followUp.additionalSystemInstructions,
       providerOptions: followUp.providerOptions,
       experiments: followUp.experiments,

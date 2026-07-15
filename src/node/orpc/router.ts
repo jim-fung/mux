@@ -128,7 +128,7 @@ import {
 } from "@/node/services/workflows/WorkflowTaskServiceAdapter";
 import { WorkflowArgsValidationError } from "@/node/services/workflows/workflowArgs";
 import { resolveWorkflowScript } from "@/node/services/workflows/workflowScriptResolver";
-import { isProjectTrusted } from "@/node/utils/projectTrust";
+import { isProjectTrusted, isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
 
 import {
   WORKFLOW_RESULT_METADATA_TYPE,
@@ -373,7 +373,13 @@ export async function resolveWorkflowContext(
   const workflowProjectPath = hasRequestedWorkflowProjectPath
     ? requestedWorkflowProjectPath
     : metadata.projectPath;
-  const projectTrusted = isTrustedProjectPath(context, workflowProjectPath);
+  // Workspace-default trust must be metadata-aware: scratch chats are trusted
+  // by design but their projectPath is an app-managed workdir, not a config key.
+  const resolveWorkflowProjectTrusted = () =>
+    hasRequestedWorkflowProjectPath
+      ? isTrustedProjectPath(context, workflowProjectPath)
+      : isWorkspaceProjectTrusted(context.config, metadata);
+  const projectTrusted = resolveWorkflowProjectTrusted();
   const runtime = createRuntimeForWorkspace(metadata);
   const workspaceRootPath = resolveWorkspaceRootPath(metadata, runtime);
   const workflowExecutionProjectPath = hasRequestedWorkflowProjectPath
@@ -411,7 +417,7 @@ export async function resolveWorkflowContext(
             workspaceSessionDir: context.config.getSessionDir(workspaceId),
             trusted: projectTrusted,
           },
-          getProjectTrusted: () => isTrustedProjectPath(context, workflowProjectPath),
+          getProjectTrusted: resolveWorkflowProjectTrusted,
           experiments: {
             dynamicWorkflows: true,
           },
@@ -421,13 +427,13 @@ export async function resolveWorkflowContext(
           scriptPath,
           runtime,
           workspacePath,
-          projectTrusted: isTrustedProjectPath(context, workflowProjectPath),
+          projectTrusted: resolveWorkflowProjectTrusted(),
         }),
       onRunStatusChanged: (event) => context.workspaceService.emitWorkflowRunActivity(event),
       ...(options.onBackgroundRunTerminal != null
         ? { onBackgroundRunTerminal: options.onBackgroundRunTerminal }
         : {}),
-      getCurrentProjectTrusted: () => isTrustedProjectPath(context, workflowProjectPath),
+      getCurrentProjectTrusted: resolveWorkflowProjectTrusted,
       runnerId: `workflow-runner:${workspaceId}`,
     }),
   };
@@ -3980,6 +3986,16 @@ export const router = (authToken?: string) => {
           }
           return { success: true, metadata: result.data.metadata };
         }),
+      createScratch: t
+        .input(schemas.workspace.createScratch.input)
+        .output(schemas.workspace.createScratch.output)
+        .handler(async ({ context, input }) => {
+          const result = await context.workspaceService.createScratch(input.title);
+          if (!result.success) {
+            return { success: false, error: result.error };
+          }
+          return { success: true, metadata: result.data.metadata };
+        }),
       createMultiProject: t
         .input(schemas.workspace.createMultiProject.input)
         .output(schemas.workspace.createMultiProject.output)
@@ -4038,6 +4054,10 @@ export const router = (authToken?: string) => {
               intervalMs: input.intervalMs,
               ...(input.message != null ? { message: input.message } : {}),
               ...(input.contextMode != null ? { contextMode: input.contextMode } : {}),
+              // trigger/whenBusy use key-presence semantics: a present key with null clears the
+              // persisted value back to unset (read-time default), an absent key preserves it.
+              ...("trigger" in input ? { trigger: input.trigger ?? null } : {}),
+              ...("whenBusy" in input ? { whenBusy: input.whenBusy ?? null } : {}),
             });
             if (!result.success) {
               return result;
@@ -4094,11 +4114,32 @@ export const router = (authToken?: string) => {
             input.aiSettings
           );
         }),
+      setActiveTurnThinkingLevel: t
+        .input(schemas.workspace.setActiveTurnThinkingLevel.input)
+        .output(schemas.workspace.setActiveTurnThinkingLevel.output)
+        .handler(({ context, input }) => {
+          return context.workspaceService.setActiveTurnThinkingLevel(
+            input.workspaceId,
+            input.thinkingLevel
+          );
+        }),
       updateTitle: t
         .input(schemas.workspace.updateTitle.input)
         .output(schemas.workspace.updateTitle.output)
         .handler(async ({ context, input }) => {
           return context.workspaceService.updateTitle(input.workspaceId, input.title);
+        }),
+      setPinned: t
+        .input(schemas.workspace.setPinned.input)
+        .output(schemas.workspace.setPinned.output)
+        .handler(async ({ context, input }) => {
+          return context.workspaceService.setPinned(input.workspaceId, input.pinned);
+        }),
+      reorderPinned: t
+        .input(schemas.workspace.reorderPinned.input)
+        .output(schemas.workspace.reorderPinned.output)
+        .handler(async ({ context, input }) => {
+          return context.workspaceService.reorderPinned(input.workspaceIds);
         }),
       updateTags: t
         .input(schemas.workspace.updateTags.input)

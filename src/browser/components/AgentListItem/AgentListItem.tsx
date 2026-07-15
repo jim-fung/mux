@@ -28,7 +28,8 @@ import { isDevcontainerRuntime } from "@/common/types/runtime";
 import { getWorkspaceLastReadKey } from "@/common/constants/storage";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import React, { useState, useEffect, useRef, useCallback } from "react";
-import { useDrag } from "react-dnd";
+import { useDrag, useDrop } from "react-dnd";
+import type { DropTargetMonitor } from "react-dnd";
 import { getEmptyImage } from "react-dnd-html5-backend";
 import { SubAgentListItem } from "./SubAgentListItem";
 import {
@@ -62,7 +63,9 @@ import {
   EyeOff,
   ChevronDown,
   HeartPulse,
+  Pin,
 } from "lucide-react";
+import { isWorkspacePinnable, isWorkspacePinned } from "@/common/utils/pin";
 import { WorkspaceStatusIndicator } from "../WorkspaceStatusIndicator/WorkspaceStatusIndicator";
 import { ArchiveIcon } from "../icons/ArchiveIcon/ArchiveIcon";
 import { WorkspaceTerminalIcon } from "../icons/WorkspaceTerminalIcon/WorkspaceTerminalIcon";
@@ -71,9 +74,12 @@ import {
   type WorkspaceDragItem,
 } from "../WorkspaceSectionDropZone/WorkspaceSectionDropZone";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
+import type { PinnedDropEdge } from "@/browser/utils/ui/pinnedReorder";
 import { WorkspaceHeartbeatModal } from "../WorkspaceHeartbeatModal";
 import { WorkspaceActionsMenuContent } from "../WorkspaceActionsMenuContent/WorkspaceActionsMenuContent";
+import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
 import { useAPI } from "@/browser/contexts/API";
+import { useWorkspaceActionsOptional } from "@/browser/contexts/WorkspaceContext";
 
 export interface WorkspaceSelection {
   projectPath: string;
@@ -118,6 +124,13 @@ export interface AgentListItemProps extends AgentListItemBaseProps {
   isRemoving?: boolean;
   /** Section ID this workspace belongs to (for drag-drop targeting) */
   sectionId?: string;
+  /**
+   * Identifies the visual pinned block this row renders in (project + section,
+   * or the multi-project section). Rows drag-reorder only within their block.
+   */
+  pinnedReorderGroup?: string;
+  /** Present when pinned rows in this list can be drag-reordered. */
+  onPinnedReorderDrop?: (draggedId: string, targetId: string, edge: PinnedDropEdge) => void;
   rowRenderMeta?: AgentRowRenderMeta;
   delegatedActivity?: WorkspaceDelegatedActivity;
   completedChildrenExpanded?: boolean;
@@ -160,6 +173,7 @@ function getVisualState(opts: {
   isWorking: boolean;
   isStarting: boolean;
   hasActiveDelegatedWork: boolean;
+  isWaitingOnBashMonitor: boolean;
   isUnread: boolean;
   isSelected: boolean;
   hasError: boolean;
@@ -175,6 +189,12 @@ function getVisualState(opts: {
   }
   if (opts.isWorking || opts.isStarting || opts.isInitializing || opts.hasActiveDelegatedWork) {
     return "active";
+  }
+  // Idle but an armed background bash monitor will wake the agent: keep the row
+  // live (not "finished") without the streaming pulse, so users can tell parked
+  // wake-waiting apart from active streaming. Real work above wins.
+  if (opts.isWaitingOnBashMonitor) {
+    return "waiting";
   }
   // Avoid unread flicker for the currently selected workspace while last-read
   // timestamps catch up on the next render.
@@ -219,6 +239,11 @@ function formatDelegatedActivityText(activity: WorkspaceDelegatedActivity): stri
 function formatWorkflowRunCount(count: number): string {
   assert(count > 0, "formatWorkflowRunCount requires a positive count");
   return count === 1 ? "Workflow running" : `${count} workflows running`;
+}
+
+function formatBashMonitorCount(count: number): string {
+  assert(count > 0, "formatBashMonitorCount requires a positive count");
+  return count === 1 ? "Watching background bash" : `Watching ${count} background bashes`;
 }
 
 function SidebarActivityIndicator(props: { text: string; testId: string }) {
@@ -476,6 +501,10 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
   const isGeneratingTitle = generatingTitleWorkspaceIds.has(workspaceId);
   const isPendingAutoTitle = metadata.pendingAutoTitle === true;
   const { api } = useAPI();
+  // Route pin toggles through the context wrapper: it applies an optimistic
+  // pinnedAt (instant reorder on click) and works with mock API clients.
+  // Optional because stories/tests render this row without WorkspaceProvider.
+  const setWorkspacePinned = useWorkspaceActionsOptional()?.setWorkspacePinned;
 
   // Local state for title editing
   const [editingTitle, setEditingTitle] = useState<string>("");
@@ -509,6 +538,8 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
       ? `${groupLabel} · ${workspaceTitle}`
       : workspaceTitle;
   const isEditing = editingWorkspaceId === workspaceId;
+  const isPinned = isWorkspacePinned(metadata);
+  const isPinnable = isWorkspacePinnable(metadata);
   const [heartbeatModalOpen, setHeartbeatModalOpen] = useState(false);
   const overflowMenuButtonRef = useRef<HTMLButtonElement | null>(null);
   const overflowMenuFrameRef = useRef<number | null>(null);
@@ -613,6 +644,7 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
     isStarting,
     agentStatus,
     activeWorkflowRunCount,
+    activeBashMonitorCount,
     terminalActiveCount,
     lastAbortReason,
   } = useWorkspaceSidebarState(workspaceId);
@@ -628,6 +660,10 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
   const isWorking = displayStreamingStatusPhase !== null && !awaitingUserQuestion;
   const hasError = lastAbortReason?.reason === "system";
   const hasActiveWorkflowRun = activeWorkflowRunCount > 0;
+  // An armed background bash monitor means the workspace is still waiting to be
+  // woken, so keep the row live (distinct "waiting" dot) instead of letting it
+  // look finished — but don't let it masquerade as active streaming.
+  const hasActiveBashMonitor = activeBashMonitorCount > 0;
   const hasActiveDelegatedWork = (delegatedActivity?.activeCount ?? 0) > 0;
   const delegatedStatusText = delegatedActivity
     ? formatDelegatedActivityText(delegatedActivity)
@@ -635,11 +671,19 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
   const hasDelegatedStatusText = delegatedStatusText != null;
   const shouldShowWorkflowStatus =
     hasActiveWorkflowRun && !agentStatus && displayStreamingStatusPhase === null;
+  const shouldShowBashMonitorStatus =
+    hasActiveBashMonitor &&
+    !agentStatus &&
+    displayStreamingStatusPhase === null &&
+    !shouldShowWorkflowStatus;
   const hasOwnLiveStatusText =
     awaitingUserQuestion ||
     displayStreamingStatusPhase !== null ||
     isRemoving ||
-    shouldShowWorkflowStatus;
+    shouldShowWorkflowStatus ||
+    // Own-workspace signals (like workflow status above) outrank delegated text so a
+    // coordinator waiting on an armed monitor still surfaces the watching state.
+    shouldShowBashMonitorStatus;
   const shouldShowDelegatedStatus = hasDelegatedStatusText && !hasOwnLiveStatusText && !hasError;
   const visualState = getVisualState({
     awaitingUserQuestion,
@@ -649,6 +693,7 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
     isWorking,
     isStarting: displayStreamingStatusPhase === "starting",
     hasActiveDelegatedWork: hasActiveDelegatedWork || hasActiveWorkflowRun,
+    isWaitingOnBashMonitor: hasActiveBashMonitor,
     isUnread,
     isSelected,
     hasError,
@@ -661,7 +706,8 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
     awaitingUserQuestion ||
     displayStreamingStatusPhase !== null ||
     isRemoving ||
-    shouldShowWorkflowStatus;
+    shouldShowWorkflowStatus ||
+    shouldShowBashMonitorStatus;
   // Keep archiving feedback inline with the title so the row doesn't jump to a
   // two-line layout right before it disappears from the sidebar.
   const shouldShowInlineArchivingStatus = isArchiving === true && !isRemoving;
@@ -718,7 +764,7 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
     workspaceId,
   };
 
-  // Drag handle for moving workspace between sections
+  // Drag handle for moving workspace between sections (and reordering pinned rows)
   const [{ isDragging }, drag, dragPreview] = useDrag(
     () => ({
       type: WORKSPACE_DRAG_TYPE,
@@ -727,6 +773,8 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
         workspaceId,
         projectPath,
         currentSectionId: sectionId,
+        pinned: isPinned,
+        pinnedReorderGroup: props.pinnedReorderGroup,
         // Extra fields for custom drag layer preview
         displayTitle,
         runtimeConfig: metadata.runtimeConfig,
@@ -736,7 +784,16 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
       }),
       canDrag: !isDisabled,
     }),
-    [workspaceId, projectPath, sectionId, isDisabled, displayTitle, metadata.runtimeConfig]
+    [
+      workspaceId,
+      projectPath,
+      sectionId,
+      isDisabled,
+      isPinned,
+      props.pinnedReorderGroup,
+      displayTitle,
+      metadata.runtimeConfig,
+    ]
   );
 
   // Hide native drag preview; we render a custom preview via WorkspaceDragLayer
@@ -744,10 +801,54 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
     dragPreview(getEmptyImage(), { captureDraggingState: true });
   }, [dragPreview]);
 
+  // Pinned rows double as drop targets so pinned chats can be reordered by
+  // dragging within their own block. The drop edge (insert before/after) comes
+  // from the pointer position relative to the row midpoint; it is computed
+  // fresh in drop() so the result never depends on stale hover state.
+  const rowNodeRef = useRef<HTMLDivElement | null>(null);
+  const [pinnedDropEdge, setPinnedDropEdge] = useState<PinnedDropEdge | null>(null);
+  const onPinnedReorderDrop = props.onPinnedReorderDrop;
+  const pinnedReorderGroup = props.pinnedReorderGroup;
+  const computePinnedDropEdge = (monitor: DropTargetMonitor): PinnedDropEdge => {
+    const node = rowNodeRef.current;
+    const offset = monitor.getClientOffset();
+    if (!node || !offset) return "after";
+    const rect = node.getBoundingClientRect();
+    return offset.y < rect.top + rect.height / 2 ? "before" : "after";
+  };
+  const [{ isPinnedReorderTarget }, pinnedReorderDrop] = useDrop(
+    () => ({
+      accept: WORKSPACE_DRAG_TYPE,
+      canDrop: (item: WorkspaceDragItem) =>
+        onPinnedReorderDrop !== undefined &&
+        isPinned &&
+        item.pinned === true &&
+        item.pinnedReorderGroup !== undefined &&
+        item.pinnedReorderGroup === pinnedReorderGroup &&
+        item.workspaceId !== workspaceId,
+      hover: (_item: WorkspaceDragItem, monitor) => {
+        if (!monitor.canDrop()) return;
+        setPinnedDropEdge(computePinnedDropEdge(monitor));
+      },
+      drop: (item: WorkspaceDragItem, monitor) => {
+        onPinnedReorderDrop?.(item.workspaceId, workspaceId, computePinnedDropEdge(monitor));
+      },
+      collect: (monitor) => ({
+        isPinnedReorderTarget: monitor.isOver() && monitor.canDrop(),
+      }),
+    }),
+    [onPinnedReorderDrop, isPinned, pinnedReorderGroup, workspaceId]
+  );
+  const attachRowDndRef = (node: HTMLDivElement | null) => {
+    rowNodeRef.current = node;
+    drag(node);
+    pinnedReorderDrop(node);
+  };
+
   return (
     <React.Fragment>
       <div
-        ref={drag}
+        ref={attachRowDndRef}
         className={cn(
           LIST_ITEM_BASE_CLASSES,
           "group/row",
@@ -849,6 +950,17 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
         data-workspace-id={workspaceId}
         data-section-id={sectionId ?? ""}
       >
+        {/* Pinned-reorder insertion indicator: marks the edge the dragged row will land on. */}
+        {isPinnedReorderTarget && (
+          <div
+            aria-hidden
+            data-testid="pinned-reorder-indicator"
+            className={cn(
+              "bg-accent pointer-events-none absolute inset-x-0 z-10 h-0.5",
+              (pinnedDropEdge ?? "after") === "before" ? "top-0" : "bottom-0"
+            )}
+          />
+        )}
         {shouldShowHeartbeatFallback ? (
           <div className={STATUS_DOT_SLOT_CONTAINER_CLASSES} style={LEADING_SLOT_CONTAINER_STYLE}>
             <HeartbeatFallbackIcon />
@@ -981,9 +1093,26 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
                             )
                         : null
                     }
-                    onForkChat={(anchorEl) => {
-                      void onForkWorkspace(workspaceId, anchorEl);
-                    }}
+                    // Scratch chats have no repo and the backend rejects
+                    // forking them, so hide the action instead of offering a
+                    // menu item that can only fail.
+                    onForkChat={
+                      hasWorkspaceRepository(metadata)
+                        ? (anchorEl) => {
+                            void onForkWorkspace(workspaceId, anchorEl);
+                          }
+                        : null
+                    }
+                    onTogglePinned={
+                      isPinnable && setWorkspacePinned
+                        ? () => {
+                            // Fire-and-forget: optimistic reorder happens synchronously
+                            // inside setWorkspacePinned; errors are logged there.
+                            void setWorkspacePinned(workspaceId, !isPinned);
+                          }
+                        : null
+                    }
+                    isPinned={isPinned}
                     onArchiveChat={(anchorEl) => {
                       void onArchiveWorkspace(workspaceId, anchorEl);
                     }}
@@ -1091,6 +1220,9 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
 
             {!isInitializing && !isEditing && (
               <div className="flex items-center gap-1">
+                {isPinned && (
+                  <Pin className="text-muted h-3 w-3 shrink-0" aria-label="Pinned" role="img" />
+                )}
                 {shouldShowInlineArchivingStatus ? (
                   <div
                     className="text-muted flex shrink-0 items-center gap-1 text-xs whitespace-nowrap"
@@ -1143,6 +1275,11 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
                 <WorkflowActivityIndicator
                   workspaceId={workspaceId}
                   activeWorkflowRunCount={activeWorkflowRunCount}
+                />
+              ) : shouldShowBashMonitorStatus ? (
+                <SidebarActivityIndicator
+                  text={formatBashMonitorCount(activeBashMonitorCount)}
+                  testId={`workspace-bash-monitor-activity-${workspaceId}`}
                 />
               ) : (
                 <WorkspaceStatusIndicator

@@ -63,6 +63,9 @@ export const WorkspaceConfigSchema = z.object({
   path: z.string().meta({
     description: "Absolute path to workspace directory - REQUIRED for backward compatibility",
   }),
+  kind: z.literal("scratch").optional().meta({
+    description: "Marks an app-owned project-less scratch chat workspace.",
+  }),
   id: z.string().optional().meta({
     description: "Stable workspace ID (10 hex chars for new workspaces) - optional for legacy",
   }),
@@ -212,6 +215,10 @@ export const WorkspaceConfigSchema = z.object({
   unarchivedAt: z.string().optional().meta({
     description:
       "ISO 8601 timestamp when workspace was last unarchived. Used for recency calculation to bump restored workspaces to top.",
+  }),
+  pinnedAt: z.string().optional().meta({
+    description:
+      "ISO 8601 pin ordering key (not a reliable 'when pinned' record: reorderPinned re-deals existing values). Pinned workspaces sort to the top of their project in pinnedAt order (ascending). Cleared on archive.",
   }),
   worktreeArchiveSnapshot: WorktreeArchiveSnapshotSchema.optional().meta({
     description:

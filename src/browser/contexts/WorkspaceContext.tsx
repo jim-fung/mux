@@ -13,7 +13,7 @@ import {
 import { useLocation } from "react-router-dom";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { ArchivePreflightResult, ArchiveWorkspaceResult } from "@/common/orpc/schemas/api";
-import type { ThinkingLevel } from "@/common/types/thinking";
+import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
 import type { WorkspaceSelection } from "@/browser/components/ProjectSidebar/ProjectSidebar";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import type { MuxDeepLinkPayload } from "@/common/types/deepLink";
@@ -27,6 +27,7 @@ import {
   getPendingScopeId,
   getRightSidebarLayoutKey,
   getTerminalTitlesKey,
+  getReasoningModeKey,
   getThinkingLevelKey,
   getWorkspaceAISettingsByAgentKey,
   getWorkspaceNameStateKey,
@@ -43,6 +44,7 @@ import {
   WORKSPACE_DRAFTS_BY_PROJECT_KEY,
   type LaunchBehavior,
 } from "@/common/constants/storage";
+import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { useAPI } from "@/browser/contexts/API";
 import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
@@ -62,6 +64,7 @@ import {
 } from "@/browser/utils/rightSidebarLayout";
 import { normalizeAgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { isWorkspaceArchived } from "@/common/utils/archive";
+import { reassignPinnedTimestamps } from "@/common/utils/pin";
 import { shouldApplyWorkspaceAiSettingsFromBackend } from "@/browser/utils/workspaceAiSettingsSync";
 import { isAbortError } from "@/browser/utils/isAbortError";
 import { findAdjacentWorkspaceId } from "@/browser/utils/ui/workspaceDomNav";
@@ -172,7 +175,10 @@ function shouldSeedWorkspaceAgentIdFromBackend(metadata: FrontendWorkspaceMetada
 function seedWorkspaceLocalStorageFromBackend(metadata: FrontendWorkspaceMetadata): void {
   // Cache keyed by agentId (string) - includes exec, plan, and custom agents
   type WorkspaceAISettingsByAgentCache = Partial<
-    Record<string, { model: string; thinkingLevel: ThinkingLevel }>
+    Record<
+      string,
+      { model: string; thinkingLevel: ThinkingLevel; reasoningMode?: OpenAIReasoningMode }
+    >
   >;
 
   const workspaceId = metadata.id;
@@ -214,6 +220,7 @@ function seedWorkspaceLocalStorageFromBackend(metadata: FrontendWorkspaceMetadat
       !shouldApplyWorkspaceAiSettingsFromBackend(workspaceId, agentKey, {
         model: entry.model,
         thinkingLevel: entry.thinkingLevel,
+        reasoningMode: entry.reasoningMode,
       })
     ) {
       continue;
@@ -222,6 +229,7 @@ function seedWorkspaceLocalStorageFromBackend(metadata: FrontendWorkspaceMetadat
     nextByAgent[agentKey] = {
       model: entry.model,
       thinkingLevel: entry.thinkingLevel,
+      ...(entry.reasoningMode != null ? { reasoningMode: entry.reasoningMode } : {}),
     };
   }
 
@@ -249,6 +257,21 @@ function seedWorkspaceLocalStorageFromBackend(metadata: FrontendWorkspaceMetadat
   const existingThinking = readPersistedState<ThinkingLevel | undefined>(thinkingKey, undefined);
   if (existingThinking !== active.thinkingLevel) {
     updatePersistedState(thinkingKey, active.thinkingLevel);
+  }
+
+  // Absent reasoningMode means "standard": seed it explicitly so switching to
+  // an agent whose settings never carried the field cannot inherit another
+  // agent's "pro" from the shared workspace-scoped key. Newer local choices
+  // are already protected by the pending-settings guard above
+  // (shouldApplyWorkspaceAiSettingsFromBackend).
+  const reasoningKey = getReasoningModeKey(workspaceId);
+  const nextReasoning = active.reasoningMode ?? "standard";
+  const existingReasoning = readPersistedState<OpenAIReasoningMode | undefined>(
+    reasoningKey,
+    undefined
+  );
+  if (existingReasoning !== nextReasoning) {
+    updatePersistedState(reasoningKey, nextReasoning);
   }
 }
 
@@ -447,6 +470,13 @@ export interface WorkspaceContext extends WorkspaceMetadataContextValue {
     workspaceId: string,
     newTitle: string
   ) => Promise<{ success: boolean; error?: string }>;
+  setWorkspacePinned: (
+    workspaceId: string,
+    pinned: boolean
+  ) => Promise<{ success: boolean; error?: string }>;
+  reorderPinnedWorkspaces: (
+    workspaceIds: string[]
+  ) => Promise<{ success: boolean; error?: string }>;
   preflightArchiveWorkspace: (
     workspaceId: string
   ) => Promise<{ success: boolean; error?: string; data?: ArchivePreflightResult }>;
@@ -533,6 +563,12 @@ function shouldBlockStartupAutoNavigation(options: {
   );
 }
 
+function getWorkspaceProjectRoutePath(
+  metadata: Pick<FrontendWorkspaceMetadata, "kind" | "projectPath">
+): string {
+  return metadata.kind === "scratch" ? SCRATCH_PROJECT_CONFIG_KEY : metadata.projectPath;
+}
+
 function getMostRecentVisibleWorkspaceScope(
   workspaceMetadata: Map<string, FrontendWorkspaceMetadata>,
   workspaceRecency: Record<string, number>,
@@ -540,6 +576,9 @@ function getMostRecentVisibleWorkspaceScope(
 ): WorkspaceCreationScope | null {
   const recentWorkspace = [...workspaceMetadata.values()]
     .filter((workspace) => {
+      if (workspace.kind === "scratch") {
+        return true;
+      }
       const projectConfig = getProjectConfig(workspace.projectPath);
       if (!projectConfig) {
         return false;
@@ -566,7 +605,7 @@ function getMostRecentVisibleWorkspaceScope(
 
   return recentWorkspace
     ? {
-        projectPath: recentWorkspace.projectPath,
+        projectPath: getWorkspaceProjectRoutePath(recentWorkspace),
         subProjectPath: recentWorkspace.subProjectPath ?? null,
       }
     : null;
@@ -1148,7 +1187,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
   // in metadata (e.g., deleted since last session), clear the stale route and
   // persisted selection so the user isn't stuck in a restore loop.
   useEffect(() => {
-    if (loading) return;
+    if (loading || !loaded || loadError) return;
     if (hasCheckedStaleRouteRef.current) return;
     hasCheckedStaleRouteRef.current = true;
 
@@ -1156,12 +1195,12 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     if (workspaceMetadata.has(currentWorkspaceId)) return;
 
     // If metadata is empty, a transient backend failure may have caused
-    // workspace.list to return nothing — don't clear a potentially valid route.
+    // workspace.list to return nothing (it swallows getAllWorkspaceMetadata
+    // errors and resolves []), so don't clear a potentially valid route.
     if (workspaceMetadata.size === 0) return;
 
-    // Workspace ID from initial route doesn't exist — clear stale state.
     setSelectedWorkspace(null);
-  }, [loading, currentWorkspaceId, workspaceMetadata, setSelectedWorkspace]);
+  }, [loading, loaded, loadError, currentWorkspaceId, workspaceMetadata, setSelectedWorkspace]);
 
   // Subscribe to metadata updates (for create/rename/delete operations)
   useEffect(() => {
@@ -1197,16 +1236,18 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
             const currentSelection = selectedWorkspaceRef.current;
             if (currentSelection?.workspaceId === event.workspaceId) {
               const nextId = findAdjacentWorkspaceId(event.workspaceId, {
-                preferredProjectPath: meta.projectPath,
-                getProjectPath: (workspaceId) =>
-                  workspaceMetadataRef.current.get(workspaceId)?.projectPath,
+                preferredProjectPath: getWorkspaceProjectRoutePath(meta),
+                getProjectPath: (workspaceId) => {
+                  const workspace = workspaceMetadataRef.current.get(workspaceId);
+                  return workspace ? getWorkspaceProjectRoutePath(workspace) : undefined;
+                },
               });
               const nextMeta = nextId ? workspaceMetadataRef.current.get(nextId) : null;
 
               if (nextMeta) {
                 setSelectedWorkspace(toWorkspaceSelection(nextMeta));
               } else {
-                clearSelectionToProject(meta.projectPath);
+                clearSelectionToProject(getWorkspaceProjectRoutePath(meta));
               }
             }
           }
@@ -1279,11 +1320,13 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
             }
 
             // Try sibling workspace in same project
-            const projectPath = deletedMeta?.projectPath;
+            const projectPath = deletedMeta ? getWorkspaceProjectRoutePath(deletedMeta) : undefined;
             const fallbackMeta =
               (projectPath
                 ? Array.from(workspaceMetadataRef.current.values()).find(
-                    (meta) => meta.projectPath === projectPath && meta.id !== event.workspaceId
+                    (meta) =>
+                      getWorkspaceProjectRoutePath(meta) === projectPath &&
+                      meta.id !== event.workspaceId
                   )
                 : null) ??
               Array.from(workspaceMetadataRef.current.values()).find(
@@ -1367,7 +1410,10 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       // We check currentWorkspaceId (from URL) rather than selectedWorkspace
       // because it's the source of truth for what's actually selected.
       const wasSelected = currentWorkspaceId === workspaceId;
-      const projectPath = selectedWorkspace?.projectPath;
+      const metadata = workspaceMetadata.get(workspaceId);
+      const projectPath = metadata
+        ? getWorkspaceProjectRoutePath(metadata)
+        : selectedWorkspace?.projectPath;
 
       try {
         const result = await api.workspace.remove({ workspaceId, options });
@@ -1412,6 +1458,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       navigateToProject,
       refreshProjects,
       selectedWorkspace,
+      workspaceMetadata,
       api,
       setWorkspaceMetadata,
     ]
@@ -1450,6 +1497,144 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       }
     },
     [api]
+  );
+
+  /**
+   * Pin or unpin a chat. Applies an optimistic pinnedAt locally so the row
+   * moves on click, even over slow connections; the workspace metadata
+   * subscription round-trip then reconciles all clients with the server's
+   * authoritative monotonic timestamp (and reverts on failure).
+   */
+  const setWorkspacePinned = useCallback(
+    async (workspaceId: string, pinned: boolean): Promise<{ success: boolean; error?: string }> => {
+      if (!api) return { success: false, error: "API not connected" };
+
+      let previousPinnedAt: string | undefined;
+      let applied = false;
+      setWorkspaceMetadata((prev) => {
+        const meta = prev.get(workspaceId);
+        if (!meta || Boolean(meta.pinnedAt) === pinned) return prev;
+        previousPinnedAt = meta.pinnedAt;
+        applied = true;
+        // Mirror the server's append-only ordering: strictly greater than every
+        // existing pin in the same project so rapid pins stay in click order.
+        let optimisticPinnedAt: string | undefined;
+        if (pinned) {
+          let pinnedAtMs = Date.now();
+          for (const other of prev.values()) {
+            if (other.projectPath !== meta.projectPath || !other.pinnedAt) continue;
+            const otherMs = new Date(other.pinnedAt).getTime();
+            if (Number.isFinite(otherMs) && otherMs >= pinnedAtMs) pinnedAtMs = otherMs + 1;
+          }
+          optimisticPinnedAt = new Date(pinnedAtMs).toISOString();
+        }
+        const next = new Map(prev);
+        next.set(workspaceId, { ...meta, pinnedAt: optimisticPinnedAt });
+        return next;
+      });
+      const revert = () => {
+        if (!applied) return;
+        setWorkspaceMetadata((prev) => {
+          const meta = prev.get(workspaceId);
+          if (!meta) return prev;
+          const next = new Map(prev);
+          next.set(workspaceId, { ...meta, pinnedAt: previousPinnedAt });
+          return next;
+        });
+      };
+
+      try {
+        const result = await api.workspace.setPinned({ workspaceId, pinned });
+        if (result.success) {
+          return { success: true };
+        }
+        revert();
+        console.error("Failed to update workspace pin state:", result.error);
+        return { success: false, error: result.error };
+      } catch (error) {
+        revert();
+        const errorMessage = getErrorMessage(error);
+        console.error("Failed to update workspace pin state:", errorMessage);
+        return { success: false, error: errorMessage };
+      }
+    },
+    [api, setWorkspaceMetadata]
+  );
+
+  /**
+   * Reorder pinned chats within one project bucket. `workspaceIds` is the full
+   * desired pinned order for that bucket. Optimistically re-deals the existing
+   * pinnedAt pool locally (same algorithm as the server) so rows move on drop;
+   * the metadata subscription round-trip then reconciles all clients with the
+   * server's authoritative values (and we revert on failure).
+   */
+  const reorderPinnedWorkspaces = useCallback(
+    async (workspaceIds: string[]): Promise<{ success: boolean; error?: string }> => {
+      if (!api) return { success: false, error: "API not connected" };
+
+      let previousPinnedAtById: Map<string, string> | undefined;
+      let optimisticPinnedAtById: Map<string, string> | undefined;
+      setWorkspaceMetadata((prev) => {
+        const currentPinnedAtById = new Map<string, string>();
+        for (const id of workspaceIds) {
+          const meta = prev.get(id);
+          if (meta?.pinnedAt) currentPinnedAtById.set(id, meta.pinnedAt);
+        }
+        const orderedIds = workspaceIds.filter((id) => currentPinnedAtById.has(id));
+        const changes = reassignPinnedTimestamps(orderedIds, currentPinnedAtById);
+        if (changes.size === 0) return prev;
+
+        const snapshot = new Map<string, string>();
+        const applied = new Map<string, string>();
+        const next = new Map(prev);
+        for (const [id, pinnedAt] of changes) {
+          const meta = prev.get(id);
+          const previousPinnedAt = currentPinnedAtById.get(id);
+          if (!meta || previousPinnedAt === undefined) continue;
+          snapshot.set(id, previousPinnedAt);
+          applied.set(id, pinnedAt);
+          next.set(id, { ...meta, pinnedAt });
+        }
+        previousPinnedAtById = snapshot;
+        optimisticPinnedAtById = applied;
+        return next;
+      });
+      const revert = () => {
+        const snapshot = previousPinnedAtById;
+        const applied = optimisticPinnedAtById;
+        if (!snapshot || !applied) return;
+        setWorkspaceMetadata((prev) => {
+          let changed = false;
+          const next = new Map(prev);
+          for (const [id, pinnedAt] of snapshot) {
+            const meta = prev.get(id);
+            // Unawaited reorders can interleave; only roll back entries this
+            // request still owns (current value == our optimistic value).
+            // Otherwise a stale failure would clobber a newer reorder's state.
+            if (!meta || meta.pinnedAt !== applied.get(id)) continue;
+            next.set(id, { ...meta, pinnedAt });
+            changed = true;
+          }
+          return changed ? next : prev;
+        });
+      };
+
+      try {
+        const result = await api.workspace.reorderPinned({ workspaceIds });
+        if (result.success) {
+          return { success: true };
+        }
+        revert();
+        console.error("Failed to reorder pinned chats:", result.error);
+        return { success: false, error: result.error };
+      } catch (error) {
+        revert();
+        const errorMessage = getErrorMessage(error);
+        console.error("Failed to reorder pinned chats:", errorMessage);
+        return { success: false, error: errorMessage };
+      }
+    },
+    [api, setWorkspaceMetadata]
   );
 
   const preflightArchiveWorkspace = useCallback(
@@ -1840,6 +2025,8 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       createWorkspace,
       removeWorkspace,
       updateWorkspaceTitle,
+      setWorkspacePinned,
+      reorderPinnedWorkspaces,
       preflightArchiveWorkspace,
       archiveWorkspace,
       unarchiveWorkspace,
@@ -1864,6 +2051,8 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       createWorkspace,
       removeWorkspace,
       updateWorkspaceTitle,
+      setWorkspacePinned,
+      reorderPinnedWorkspaces,
       preflightArchiveWorkspace,
       archiveWorkspace,
       unarchiveWorkspace,
@@ -1922,6 +2111,17 @@ export function useWorkspaceActions(): Omit<
     throw new Error("useWorkspaceActions must be used within WorkspaceProvider");
   }
   return context;
+}
+
+/**
+ * Like useWorkspaceActions, but returns undefined outside WorkspaceProvider.
+ * For components (e.g. AgentListItem) that are also rendered in Storybook or
+ * tests without the full provider tree.
+ */
+export function useWorkspaceActionsOptional():
+  | Omit<WorkspaceContext, "workspaceMetadata" | "loading" | "loaded" | "loadError">
+  | undefined {
+  return useContext(WorkspaceActionsContext) ?? undefined;
 }
 
 /**

@@ -17,10 +17,12 @@ import type { RecursivePartial } from "@/browser/testUtils";
 import {
   getModelKey,
   getProjectScopeId,
+  getReasoningModeKey,
   getThinkingLevelByModelKey,
   getThinkingLevelKey,
   getWorkspaceAISettingsByAgentKey,
 } from "@/common/constants/storage";
+import { useReasoningMode } from "@/browser/hooks/useReasoningMode";
 import { useSendMessageOptions } from "@/browser/hooks/useSendMessageOptions";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { enforceThinkingPolicy, getThinkingPolicyForModel } from "@/common/utils/thinking/policy";
@@ -88,6 +90,11 @@ const ThinkingSetterComponent: React.FC = () => {
 const SendOptionsComponent: React.FC<{ workspaceId: string }> = (props) => {
   const options = useSendMessageOptions(props.workspaceId);
   return <div data-testid="base-model">{options.baseModel}</div>;
+};
+
+const ReasoningModeComponent: React.FC = () => {
+  const [reasoningMode] = useReasoningMode();
+  return <div data-testid="reasoning-mode">{reasoningMode}</div>;
 };
 
 function renderWithAPI(children: React.ReactNode) {
@@ -164,6 +171,8 @@ function createWorkspaceContextValue(): WorkspaceContextValue {
       }),
     removeWorkspace: () => Promise.resolve({ success: true }),
     updateWorkspaceTitle: () => Promise.resolve({ success: true }),
+    setWorkspacePinned: () => Promise.resolve({ success: true }),
+    reorderPinnedWorkspaces: () => Promise.resolve({ success: true }),
     preflightArchiveWorkspace: () => Promise.resolve({ success: true }),
     archiveWorkspace: () => Promise.resolve({ success: true }),
     unarchiveWorkspace: () => Promise.resolve({ success: true }),
@@ -347,7 +356,13 @@ describe("ThinkingContext", () => {
       button.click();
     });
 
-    const expectedSettings = { model: "metadataModel:abc", thinkingLevel: "medium" as const };
+    // setThinkingLevel persists the full settings payload including the current
+    // reasoningMode (default "standard") so partial writes cannot clobber it.
+    const expectedSettings = {
+      model: "metadataModel:abc",
+      thinkingLevel: "medium" as const,
+      reasoningMode: "standard" as const,
+    };
     await waitFor(() => {
       expect(readWorkspaceAISettingsCache(workspaceId).exec).toEqual(expectedSettings);
     }, METADATA_WAIT_OPTIONS);
@@ -358,6 +373,43 @@ describe("ThinkingContext", () => {
         agentId: "exec",
         aiSettings: expectedSettings,
       });
+    }
+  });
+
+  test("self-heals corrupt persisted reasoningMode to standard but keeps valid pro", async () => {
+    // Corrupt persisted values (e.g. from a future downgrade) must coerce to
+    // "standard" instead of flowing into SendMessageOptionsSchema and bricking sends.
+    const cases = [
+      { workspaceId: "ws-reasoning-corrupt", persisted: "ultra", expected: "standard" },
+      { workspaceId: "ws-reasoning-valid", persisted: "pro", expected: "pro" },
+    ];
+
+    for (const testCase of cases) {
+      const metadata = createWorkspaceMetadata({ id: testCase.workspaceId });
+      setWorkspaceMetadata(metadata);
+      window.localStorage.setItem(
+        getReasoningModeKey(testCase.workspaceId),
+        JSON.stringify(testCase.persisted)
+      );
+
+      const view = renderWithWorkspaceMetadata({
+        workspaceId: testCase.workspaceId,
+        modelOverride: null,
+        children: (
+          <ProviderOptionsProvider>
+            <AgentProvider value={agentContextValue}>
+              <ThinkingProvider workspaceId={testCase.workspaceId}>
+                <ReasoningModeComponent />
+              </ThinkingProvider>
+            </AgentProvider>
+          </ProviderOptionsProvider>
+        ),
+      });
+
+      await waitFor(() => {
+        expect(view.getByTestId("reasoning-mode").textContent).toBe(testCase.expected);
+      }, METADATA_WAIT_OPTIONS);
+      cleanup();
     }
   });
 
@@ -520,7 +572,11 @@ describe("ThinkingContext", () => {
       );
     });
 
-    const expectedSettings = { model: metadataModel, thinkingLevel: expectedThinkingLevel };
+    const expectedSettings = {
+      model: metadataModel,
+      thinkingLevel: expectedThinkingLevel,
+      reasoningMode: "standard" as const,
+    };
     await waitFor(() => {
       expect(readWorkspaceAISettingsCache(workspaceId).exec).toEqual(expectedSettings);
     }, METADATA_WAIT_OPTIONS);
@@ -532,6 +588,81 @@ describe("ThinkingContext", () => {
         aiSettings: expectedSettings,
       });
     }
+  });
+
+  test("requests a mid-turn override for the active workspace turn on slider changes", async () => {
+    const workspaceId = "ws-set-thinking-mid-turn";
+    const setActiveTurnThinkingLevel = mock<
+      (args: {
+        workspaceId: string;
+        thinkingLevel: ThinkingLevel;
+      }) => Promise<{ success: true; data: { accepted: boolean } }>
+    >(() => Promise.resolve({ success: true as const, data: { accepted: true } }));
+    currentClientMock = {
+      workspace: {
+        updateAgentAISettings: mock(() =>
+          Promise.resolve({ success: true as const, data: undefined })
+        ),
+        setActiveTurnThinkingLevel,
+      },
+    };
+
+    setWorkspaceMetadata(createWorkspaceMetadata({ id: workspaceId }));
+
+    const view = renderWithWorkspaceMetadata({
+      workspaceId,
+      modelOverride: null,
+      children: (
+        <ThinkingProvider workspaceId={workspaceId}>
+          <ThinkingSetterComponent />
+        </ThinkingProvider>
+      ),
+    });
+
+    const button = await view.findByTestId("set-thinking-medium", undefined, METADATA_WAIT_OPTIONS);
+    act(() => {
+      button.click();
+    });
+
+    await waitFor(() => {
+      expect(setActiveTurnThinkingLevel).toHaveBeenCalledWith({
+        workspaceId,
+        thinkingLevel: "medium",
+      });
+    }, METADATA_WAIT_OPTIONS);
+  });
+
+  test("does not request a mid-turn override in project scope (no workspaceId)", async () => {
+    const projectPath = "/Users/dev/mid-turn-scope";
+    const setActiveTurnThinkingLevel = mock(() =>
+      Promise.resolve({ success: true as const, data: { accepted: false } })
+    );
+    currentClientMock = {
+      workspace: { setActiveTurnThinkingLevel },
+    };
+
+    const view = renderWithAPI(
+      <ThinkingProvider projectPath={projectPath}>
+        <ThinkingSetterComponent />
+      </ThinkingProvider>
+    );
+
+    const button = await view.findByTestId("set-thinking-medium", undefined, METADATA_WAIT_OPTIONS);
+    act(() => {
+      button.click();
+    });
+
+    // Project/global scopes have no active turn to override; the route must
+    // not fire (persisted settings alone drive the next turn).
+    await waitFor(() => {
+      expect(
+        readPersistedState<ThinkingLevel | null>(
+          getThinkingLevelKey(getProjectScopeId(projectPath)),
+          null
+        )
+      ).toBe("medium");
+    }, METADATA_WAIT_OPTIONS);
+    expect(setActiveTurnThinkingLevel).not.toHaveBeenCalled();
   });
 
   test("cycles thinking level via keybind in project-scoped (creation) flow", async () => {

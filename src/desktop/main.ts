@@ -60,6 +60,19 @@ import {
   shell,
 } from "electron";
 
+// Pin the Linux app name so the window groups under mux.desktop instead of a
+// generic "Electron" entry. Launch modes that don't expose our package.json
+// (e.g. the Nix package's `electron dist/cli/index.js`) otherwise fall back to
+// the "Electron" default. setName sets WM_CLASS (XWayland matches
+// StartupWMClass=mux); CHROME_DESKTOP sets the native-Wayland app_id (same var
+// Electron sets from package.json desktopName when it can read it). Must run
+// before the ready event. sanitizeMuxChildEnv strips CHROME_DESKTOP from child
+// processes so apps launched from mux terminals don't inherit our identity.
+if (process.platform === "linux") {
+  app.setName("mux");
+  process.env.CHROME_DESKTOP = "mux.desktop";
+}
+
 // Enable local crash dump collection so renderer SIGSEGV produces a minidump
 // at ~/.config/mux/Crashpad/completed/*.dmp — no data leaves the machine.
 // Must be called as early as possible, before app.whenReady().
@@ -705,7 +718,7 @@ async function loadServices(): Promise<void> {
   // the main ORPC connection injects the header at the MessagePort boundary.
   const authTokenFile = path.join(config.rootDir, "auth-token.enc");
 
-  electronIpcMain.handle("authToken:get", async () => {
+  electronIpcMain.handle("authToken:get", () => {
     try {
       if (!fs.existsSync(authTokenFile)) return null;
       const encryptedB64 = fs.readFileSync(authTokenFile, "utf-8").trim();

@@ -4,13 +4,22 @@ import type { APIClient } from "@/browser/contexts/API";
 import type { ConfirmDialogOptions } from "@/browser/contexts/ConfirmDialogContext";
 import { getContextResetSuccessMessage } from "@/browser/utils/contextResetFeedback";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
-import { THINKING_LEVELS, type ThinkingLevel } from "@/common/types/thinking";
+import type { PinnedMoveDirection } from "@/browser/utils/ui/pinnedReorder";
+import {
+  THINKING_LEVELS,
+  type OpenAIReasoningMode,
+  type ThinkingLevel,
+} from "@/common/types/thinking";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
+import { normalizeToCanonical } from "@/common/utils/ai/models";
+import { openaiProModeAvailable } from "@/common/utils/ai/proMode";
 import {
   enforceThinkingPolicy,
   getAvailableThinkingLevels,
   resolveMinimumThinkingLevel,
 } from "@/common/utils/thinking/policy";
 import assert from "@/common/utils/assert";
+import { isWorkspacePinnable, isWorkspacePinned } from "@/common/utils/pin";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { RIGHT_SIDEBAR_COLLAPSED_KEY } from "@/common/constants/storage";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
@@ -49,6 +58,7 @@ import type { WorkspaceState } from "@/browser/stores/WorkspaceStore";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { isGoalPendingPersistence, type GoalSetError, type GoalStatus } from "@/common/types/goal";
 import { GOAL_OBJECTIVE_PLACEHOLDER } from "@/constants/goals";
+import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
 import { getErrorMessage } from "@/common/utils/errors";
 import { parseGoalBudgetCents } from "@/browser/utils/slashCommands/registry";
 import { setGoalWithConflictRetry } from "@/browser/utils/goals/setGoalWithConflictRetry";
@@ -79,12 +89,19 @@ export interface BuildSourcesParams {
   // UI actions
   getThinkingLevel: (workspaceId: string) => ThinkingLevel;
   onSetThinkingLevel: (workspaceId: string, level: ThinkingLevel) => void;
+  getReasoningMode: (workspaceId: string) => OpenAIReasoningMode;
+  onToggleReasoningMode: (workspaceId: string) => void;
+  /** Providers config for pro-mode availability (wire format + Codex OAuth detection). */
+  providersConfig?: ProvidersConfigMap | null;
+  /** Settings-resolved route for a canonical model ("direct" = no gateway). */
+  getRouteForModel?: (canonicalModel: string) => string;
   /**
    * Explicit per-model minimum thinking override (undefined → built-in default floor).
    * Used to hide off/low from the "Set Thinking Effort" picker, matching the slider.
    */
   getMinThinkingOverride?: (modelString: string) => ThinkingLevel | null | undefined;
 
+  onStartScratchCreation: () => void;
   onStartWorkspaceCreation: (projectPath: string) => void;
   onStartMultiProjectWorkspaceCreation: () => void;
   multiProjectWorkspacesEnabled: boolean;
@@ -105,6 +122,7 @@ export interface BuildSourcesParams {
   onRemoveProject: (path: string) => void;
   onToggleSidebar: () => void;
   onNavigateWorkspace: (dir: "next" | "prev") => void;
+  onMovePinnedChat: (direction: PinnedMoveDirection) => void;
   onOpenWorkspaceInTerminal: (workspaceId: string, runtimeConfig?: RuntimeConfig) => void;
   onToggleTheme: () => void;
   onSetTheme: (theme: ThemePreference) => void;
@@ -347,8 +365,20 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
   actions.push(() => {
     const list: CommandAction[] = [];
 
+    list.push({
+      id: CommandIds.workspaceNewScratch(),
+      title: "New Scratch Chat",
+      subtitle: "Start a chat without selecting a project",
+      section: section.workspaces,
+      shortcutHint: formatKeybind(KEYBINDS.NEW_SCRATCH_CHAT),
+      run: p.onStartScratchCreation,
+    });
+
     const selected = p.selectedWorkspace;
-    if (selected) {
+    // For scratch chats, selected.projectPath is the app-managed workdir (not
+    // a configured project), so the generic action would create a workspace in
+    // an unrelated project; New Scratch Chat above already covers creation.
+    if (selected && p.workspaceMetadata.get(selected.workspaceId)?.kind !== "scratch") {
       list.push(createWorkspaceForSelectedProjectAction(selected));
     }
 
@@ -458,6 +488,44 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           );
         },
       });
+      // Only live root chats are pinnable (sub-agents follow their pinned parent).
+      if (selectedMeta && isWorkspacePinnable(selectedMeta)) {
+        const pinned = isWorkspacePinned(selectedMeta);
+        list.push({
+          id: CommandIds.workspaceTogglePinned(),
+          title: pinned ? "Unpin Current Chat" : "Pin Current Chat",
+          subtitle: workspaceDisplayName,
+          shortcutHint: formatKeybind(KEYBINDS.PIN_WORKSPACE),
+          section: section.workspaces,
+          run: async () => {
+            if (!p.api) return;
+            await p.api.workspace.setPinned({
+              workspaceId: selected.workspaceId,
+              pinned: !pinned,
+            });
+          },
+        });
+        if (pinned) {
+          // Edge positions are handled inside the move handler (no-op), so the
+          // commands stay listed whenever the chat is pinned.
+          list.push({
+            id: CommandIds.workspaceMovePinnedUp(),
+            title: "Move Pinned Chat Up",
+            subtitle: workspaceDisplayName,
+            shortcutHint: formatKeybind(KEYBINDS.MOVE_PINNED_UP),
+            section: section.workspaces,
+            run: () => p.onMovePinnedChat("up"),
+          });
+          list.push({
+            id: CommandIds.workspaceMovePinnedDown(),
+            title: "Move Pinned Chat Down",
+            subtitle: workspaceDisplayName,
+            shortcutHint: formatKeybind(KEYBINDS.MOVE_PINNED_DOWN),
+            section: section.workspaces,
+            run: () => p.onMovePinnedChat("down"),
+          });
+        }
+      }
     }
 
     if (p.workspaceMetadata.size > 0) {
@@ -629,6 +697,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
     // Right sidebar layout commands require a selected workspace (layout is per-workspace)
     const wsId = p.selectedWorkspace?.workspaceId;
     if (wsId) {
+      const canReviewDiffs = hasWorkspaceRepository(p.workspaceMetadata.get(wsId));
       list.push(
         // Generic per-tab "Hide/Show <Name>" commands are only for optional tabs.
         // Default-layout tabs (Stats/Review/Instructions) are auto-restored by
@@ -697,7 +766,11 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                 // Terminal is appended manually because it lives outside the static registry.
                 getOptions: () => [
                   ...getOrderedBaseTabIds()
-                    .filter((tabId) => getTabConfig(tabId).featureFlag == null)
+                    .filter(
+                      (tabId) =>
+                        getTabConfig(tabId).featureFlag == null &&
+                        (canReviewDiffs || tabId !== "review")
+                    )
                     .map((tabId) => {
                       const config = getTabConfig(tabId);
                       return {
@@ -713,6 +786,8 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
             onSubmit: (vals) => {
               const tool = vals.tool;
               if (!isTabType(tool)) return;
+
+              if (tool === "review" && !canReviewDiffs) return;
 
               // "terminal" is now an alias for "focus an existing terminal session tab".
               // Creating new terminal sessions is handled in the main UI ("+" button).
@@ -1160,14 +1235,18 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       // medium floor reads as "medium").
       const currentModelString = p.selectedWorkspaceState?.currentModel;
       const rawCurrentLevel = p.getThinkingLevel(workspaceId);
+      // Pass providersConfig so mapped aliases (mappedToModel -> e.g. GPT-5.6)
+      // resolve to the target's ladder, matching the slider and send path.
       const currentLevel = currentModelString
         ? enforceThinkingPolicy(
             currentModelString,
             rawCurrentLevel,
             resolveMinimumThinkingLevel(
               currentModelString,
-              p.getMinThinkingOverride?.(currentModelString)
-            )
+              p.getMinThinkingOverride?.(currentModelString),
+              p.providersConfig
+            ),
+            p.providersConfig
           )
         : rawCurrentLevel;
 
@@ -1197,8 +1276,10 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                       modelString,
                       resolveMinimumThinkingLevel(
                         modelString,
-                        p.getMinThinkingOverride?.(modelString)
-                      )
+                        p.getMinThinkingOverride?.(modelString),
+                        p.providersConfig
+                      ),
+                      p.providersConfig
                     )
                   : THINKING_LEVELS;
                 return allowedLevels.map((level) => ({
@@ -1223,6 +1304,41 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           },
         },
       });
+
+      // Pro reasoning mode is only meaningful for models that support it
+      // (GPT-5.6 family) on routes that deliver the native provider option
+      // (direct OpenAI) with the Responses wire format; hide the action
+      // elsewhere to avoid inert toggles. Gate on the chat input's persisted selection —
+      // that is the model the NEXT send will use — and only fall back to the
+      // activity snapshot's currentModel (last streamed model, stale after a
+      // model switch) when no selection exists. The mobile layout hides the
+      // PRO chip and relies on this palette action being reachable before the
+      // first send with the newly selected model.
+      const persistedSelectionModel =
+        typeof window === "undefined"
+          ? undefined
+          : getSendOptionsFromStorage(workspaceId).model || undefined;
+      const proGateModelString = persistedSelectionModel ?? currentModelString;
+      const currentModelRoute = proGateModelString
+        ? p.getRouteForModel?.(normalizeToCanonical(proGateModelString))
+        : undefined;
+      if (
+        openaiProModeAvailable(proGateModelString ?? "", {
+          providersConfig: p.providersConfig,
+          resolvedRouteProvider: currentModelRoute,
+        })
+      ) {
+        const proActive = p.getReasoningMode(workspaceId) === "pro";
+        list.push({
+          id: CommandIds.toggleProReasoning(),
+          title: "Toggle Pro Reasoning Mode",
+          subtitle: `Current: ${proActive ? "Pro — slower, more thorough" : "Standard"}`,
+          section: section.mode,
+          run: () => {
+            p.onToggleReasoningMode(workspaceId);
+          },
+        });
+      }
     }
 
     return list;

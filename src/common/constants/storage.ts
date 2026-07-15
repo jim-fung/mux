@@ -179,6 +179,14 @@ export function getThinkingLevelKey(scopeId: string): string {
 }
 
 /**
+ * Get the localStorage key for the OpenAI pro reasoning-mode toggle per scope
+ * (workspace/project). Format: "reasoningMode:{scopeId}"
+ */
+export function getReasoningModeKey(scopeId: string): string {
+  return `reasoningMode:${scopeId}`;
+}
+
+/**
  * Get the localStorage key for per-agent workspace AI overrides cache.
  * Format: "workspaceAiSettingsByAgent:{workspaceId}"
  */
@@ -632,6 +640,14 @@ export function getWorkspaceLastReadKey(workspaceId: string): string {
  * Format: "sidebarCollapsed"
  */
 export const LEFT_SIDEBAR_COLLAPSED_KEY = "sidebarCollapsed";
+
+/**
+ * Whether the sidebar groups older workspaces under collapsible
+ * "Older than X days" age tiers (boolean, default true).
+ * When false, all workspaces render as one flat recency-sorted list.
+ * Format: "sidebarAgeGrouping"
+ */
+export const SIDEBAR_AGE_GROUPING_KEY = "sidebarAgeGrouping";
 
 /**
  * Left sidebar width

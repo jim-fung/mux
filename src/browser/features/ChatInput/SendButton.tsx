@@ -1,11 +1,7 @@
 import React, { useEffect, useRef } from "react";
 import { SendHorizontal } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from "@/browser/components/Tooltip/Tooltip";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
 import { KEYBINDS, formatKeybind } from "@/browser/utils/ui/keybinds";
 import { useContextMenuPosition } from "@/browser/hooks/useContextMenuPosition";
 import { SEND_DISPATCH_MODES } from "./sendDispatchModes";
@@ -28,8 +24,14 @@ export interface SendButtonProps {
  * effects so the parent only needs to provide `onSend`.
  */
 export const SendButton: React.FC<SendButtonProps> = (props) => {
-  const { canSend, canChooseDispatchMode, onSend, variant, editingMessageForUi, runningGoalActive } =
-    props;
+  const {
+    canSend,
+    canChooseDispatchMode,
+    onSend,
+    variant,
+    editingMessageForUi,
+    runningGoalActive,
+  } = props;
 
   const sendModeMenuContainerRef = useRef<HTMLDivElement>(null);
   const sendModeMenu = useContextMenuPosition({
@@ -149,9 +151,7 @@ export const SendButton: React.FC<SendButtonProps> = (props) => {
               className="hover:bg-hover focus-visible:bg-hover text-foreground flex w-full items-center justify-between gap-2 rounded-sm px-2.5 py-1 text-left text-xs"
               onClick={() => {
                 closeSendModeMenu();
-                onSend(
-                  entry.mode === "tool-end" ? undefined : { queueDispatchMode: entry.mode }
-                );
+                onSend(entry.mode === "tool-end" ? undefined : { queueDispatchMode: entry.mode });
               }}
             >
               <span className="whitespace-nowrap">{entry.label}</span>

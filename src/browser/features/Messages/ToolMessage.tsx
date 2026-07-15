@@ -63,8 +63,14 @@ export const ToolMessage: React.FC<ToolMessageProps> = ({
           toolCallId={toolCallId}
           // Workflow-specific
           workflowRunHint={message.workflowRun}
-          // Bash-specific
-          startedAt={message.timestamp}
+          // Elapsed timers (bash/advisor/task_await): start when execute() actually
+          // began running, not when the model emitted the call — parallel tool calls
+          // run sequentially, so queued calls must not accumulate elapsed time.
+          startedAt={message.executionStartedAt}
+          // Freshness lower bound (task/workflow discovery): when the model emitted the
+          // call. Unlike executionStartedAt this survives history replay of parts that
+          // predate execution-start tracking.
+          toolCallTimestamp={message.timestamp}
           // FileEdit-specific
           onReviewNote={onReviewNote}
           // ProposePlan-specific

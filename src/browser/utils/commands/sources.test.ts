@@ -45,7 +45,10 @@ const mk = (over: Partial<Parameters<typeof buildCoreSources>[0]> = {}) => {
     streamingModels: new Map<string, string>(),
     getThinkingLevel: () => "off",
     onSetThinkingLevel: () => undefined,
+    getReasoningMode: () => "standard",
+    onToggleReasoningMode: () => undefined,
     onStartWorkspaceCreation: () => undefined,
+    onStartScratchCreation: () => undefined,
     onStartMultiProjectWorkspaceCreation: () => undefined,
     multiProjectWorkspacesEnabled: true,
     onArchiveMergedWorkspacesInProject: () => Promise.resolve(),
@@ -56,6 +59,7 @@ const mk = (over: Partial<Parameters<typeof buildCoreSources>[0]> = {}) => {
     onRemoveProject: () => undefined,
     onToggleSidebar: () => undefined,
     onNavigateWorkspace: () => undefined,
+    onMovePinnedChat: () => undefined,
     onOpenWorkspaceInTerminal: () => undefined,
     onToggleTheme: () => undefined,
     onSetTheme: () => undefined,
@@ -366,6 +370,37 @@ test("selected-workspace create action targets the workspace sub-project", async
   expect(onStartWorkspaceCreation).toHaveBeenCalledWith("/repo/a/packages/api");
 });
 
+test("selected scratch workspace omits the generic create-workspace action", () => {
+  // A scratch chat's projectPath is its app-managed workdir, not a configured
+  // project, so the generic action would target the wrong project.
+  const workspaceMetadata = new Map<string, FrontendWorkspaceMetadata>([
+    [
+      "ws-scratch",
+      {
+        id: "ws-scratch",
+        kind: "scratch",
+        name: "scratch-1",
+        projectName: "Scratch",
+        projectPath: "/home/user/.mux/scratch/ws-scratch",
+        namedWorkspacePath: "/home/user/.mux/scratch/ws-scratch",
+        runtimeConfig: { type: "local" },
+      },
+    ],
+  ]);
+  const actions = getActions({
+    workspaceMetadata,
+    selectedWorkspace: {
+      projectPath: "/home/user/.mux/scratch/ws-scratch",
+      projectName: "Scratch",
+      namedWorkspacePath: "/home/user/.mux/scratch/ws-scratch",
+      workspaceId: "ws-scratch",
+    },
+  });
+
+  expect(actions.find((action) => action.id === "ws:new")).toBeUndefined();
+  expect(actions.find((action) => action.id === "ws:new-scratch")).toBeDefined();
+});
+
 test("buildCoreSources includes archive merged workspaces in project action", () => {
   const actions = getActions();
   const archiveAction = actions.find((a) => a.id === "ws:archive-merged-in-project");
@@ -537,6 +572,7 @@ function makeWorkspaceState(goal: WorkspaceState["goal"]): WorkspaceState {
     skillLoadErrors: [],
     agentStatus: undefined,
     activeWorkflowRunCount: 0,
+    activeBashMonitorCount: 0,
     lastAbortReason: null,
     pendingStreamStartTime: null,
     pendingStreamModel: null,

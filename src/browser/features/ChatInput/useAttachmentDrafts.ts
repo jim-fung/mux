@@ -32,7 +32,9 @@ export interface AttachmentDraftsConfig {
 
 export interface AttachmentDraftsReturn {
   attachments: ChatAttachment[];
-  setAttachments: (value: ChatAttachment[] | ((prev: ChatAttachment[]) => ChatAttachment[])) => void;
+  setAttachments: (
+    value: ChatAttachment[] | ((prev: ChatAttachment[]) => ChatAttachment[])
+  ) => void;
   processingAttachmentCount: number;
   draftReviews: ReviewNoteDataForDisplay[] | null;
   setDraftReviews: React.Dispatch<React.SetStateAction<ReviewNoteDataForDisplay[] | null>>;

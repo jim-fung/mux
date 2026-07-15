@@ -203,5 +203,4 @@ export interface ProjectsConfig {
 
   /** Optional 1Password account name used for desktop SDK account selection. */
   onePasswordAccountName?: string;
-
 }

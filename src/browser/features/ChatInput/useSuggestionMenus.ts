@@ -15,9 +15,7 @@ import {
   shouldRefreshInlineSkillSuggestions,
 } from "@/browser/utils/agentSkills/inlineSkillSuggestions";
 import { getCommandGhostHint } from "@/browser/utils/slashCommands/registry";
-import {
-  getSlashCommandSuggestions,
-} from "@/browser/utils/slashCommands/suggestions";
+import { getSlashCommandSuggestions } from "@/browser/utils/slashCommands/suggestions";
 import { resolveSlashCommandExperimentValue } from "@/browser/utils/slashCommands/experimentVisibility";
 
 // Reuse empty-array stable references so suggestion effects do not schedule

@@ -1,4 +1,5 @@
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
+import { useReasoningMode } from "./useReasoningMode";
 import { useThinkingLevel } from "./useThinkingLevel";
 import { useAgent } from "@/browser/contexts/AgentContext";
 import { usePersistedState } from "./usePersistedState";
@@ -29,6 +30,7 @@ export interface SendMessageOptionsWithBase extends SendMessageOptions {
  */
 export function useSendMessageOptions(workspaceId: string): SendMessageOptionsWithBase {
   const [thinkingLevel] = useThinkingLevel();
+  const [reasoningMode] = useReasoningMode();
   const { agentId, disableWorkspaceAgents } = useAgent();
   const workspaceMetadata = useWorkspaceMetadataEntry(workspaceId);
   const { options: providerOptions } = useProviderOptions();
@@ -64,6 +66,7 @@ export function useSendMessageOptions(workspaceId: string): SendMessageOptionsWi
   const dynamicWorkflows = useExperimentOverrideValue(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS);
   const memory = useExperimentOverrideValue(EXPERIMENT_IDS.MEMORY);
   const astGrepOutline = useExperimentOverrideValue(EXPERIMENT_IDS.AST_GREP_OUTLINE);
+  const toolSearch = useExperimentOverrideValue(EXPERIMENT_IDS.TOOL_SEARCH);
 
   // Prefer metadata over the global default until workspace localStorage seeding catches up.
   const metadataSettings = getWorkspaceAiSettingsFromMetadata(
@@ -78,6 +81,7 @@ export function useSendMessageOptions(workspaceId: string): SendMessageOptionsWi
   const options = buildSendMessageOptions({
     agentId,
     thinkingLevel,
+    reasoningMode,
     model: baseModel,
     providerOptions,
     experiments: {
@@ -88,6 +92,7 @@ export function useSendMessageOptions(workspaceId: string): SendMessageOptionsWi
       dynamicWorkflows,
       memory,
       astGrepOutline,
+      toolSearch,
     },
     disableWorkspaceAgents,
   });

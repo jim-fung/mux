@@ -52,6 +52,7 @@ export interface CompactionFollowUpInput extends UserMessageContent {
 type PreservedSendOptions = Pick<
   SendMessageOptions,
   | "thinkingLevel"
+  | "reasoningMode"
   | "additionalSystemInstructions"
   | "providerOptions"
   | "experiments"
@@ -67,6 +68,7 @@ type PreservedSendOptions = Pick<
 export function pickPreservedSendOptions(options: SendMessageOptions): PreservedSendOptions {
   return {
     thinkingLevel: options.thinkingLevel,
+    reasoningMode: options.reasoningMode,
     additionalSystemInstructions: options.additionalSystemInstructions,
     providerOptions: options.providerOptions,
     experiments: options.experiments,
@@ -81,6 +83,7 @@ export type StartupRetrySendOptions = Pick<
   | "model"
   | "agentId"
   | "thinkingLevel"
+  | "reasoningMode"
   | "toolPolicy"
   | "additionalSystemInstructions"
   | "maxOutputTokens"
@@ -108,6 +111,7 @@ export function pickStartupRetrySendOptions(
     model: options.model,
     agentId: options.agentId,
     thinkingLevel: options.thinkingLevel,
+    reasoningMode: options.reasoningMode,
     toolPolicy: options.toolPolicy,
     additionalSystemInstructions: options.additionalSystemInstructions,
     maxOutputTokens: options.maxOutputTokens,
@@ -323,6 +327,18 @@ export interface DisplayStatus {
   message: string;
 }
 
+/**
+ * Compact per-record summary attached to bash monitor wake turns so the
+ * transcript can render a small card (process + filter) while keeping the full
+ * prompt (matched lines, task_await guidance) collapsed by default.
+ */
+export interface BashMonitorWakeDisplayRecord {
+  kind: "match" | "monitor-lost";
+  displayName: string;
+  filter: string;
+  filterExclude: boolean;
+}
+
 export type MuxMessageMetadata = MuxMessageMetadataBase &
   (
     | {
@@ -363,6 +379,14 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
         type: "goal-cleared-summary";
       }
     | {
+        // Synthetic wake-up appended when background bash monitors match output or
+        // are lost to a Mux restart. The full prompt stays in the message text for
+        // the model; this metadata lets the transcript render the compact card.
+        type: "bash-monitor-wake";
+        /** One entry per wake record in the prompt, in prompt order. */
+        records: BashMonitorWakeDisplayRecord[];
+      }
+    | {
         type: "goal-pause-boundary";
       }
     | {
@@ -371,6 +395,14 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
         source?: "heartbeat";
         /** Transient status to display while the heartbeat is running. */
         displayStatus?: DisplayStatus;
+        /**
+         * When the schedule slot fired (epoch ms). Queue-mode busy deliveries write the
+         * history row only after the running turn finishes, so the message timestamp can
+         * be minutes late; fixed-interval restart anchoring must use this instead
+         * (HeartbeatService.deriveInitialIntervalNextEligibleAt), matching the live
+         * advanceAnchoredDeadline anchor.
+         */
+        firedAt?: number;
       }
     | {
         type: "normal"; // Regular messages
@@ -733,6 +765,10 @@ export type DisplayedMessage =
       sideQuestionBranch?: SideQuestionDisplayBranch;
       /** True when this user message is a /btw side question. */
       isSideQuestion?: boolean;
+      /** Present when this synthetic turn is a background bash monitor wake-up. */
+      bashMonitorWake?: {
+        records: BashMonitorWakeDisplayRecord[];
+      };
     }
   | {
       type: "assistant";
@@ -781,6 +817,12 @@ export type DisplayedMessage =
       streamSequence?: number; // Local ordering within this assistant message
       isLastPartOfMessage?: boolean; // True if this is the last part of a multi-part message
       timestamp?: number;
+      /**
+       * When the tool's execute() actually began running. Parallel tool calls are
+       * serialized, so this can be much later than `timestamp`; elapsed timers must
+       * start here (and stay hidden while the call is still queued).
+       */
+      executionStartedAt?: number;
       /** Durable workflow run attachment recovered from partial history. */
       workflowRun?: MuxToolPart["workflowRun"];
       // Nested tool calls for code_execution (from PTC streaming or reconstructed from result)

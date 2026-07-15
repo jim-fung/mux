@@ -7,13 +7,20 @@ import {
 import type { WorkflowRunRecord } from "@/common/types/workflow";
 
 function createRun(overrides: Partial<WorkflowRunRecord> = {}): WorkflowRunRecord {
-  return {
+  const base: WorkflowRunRecord = {
     id: "run-1",
+    workspaceId: "ws-1",
+    workflow: { name: "test", description: "Test workflow", scope: "project", executable: true },
+    source: "test",
+    sourceHash: "test",
+    args: {},
     status: "running",
+    createdAt: new Date().toISOString(),
     events: [],
+    steps: [],
     updatedAt: new Date().toISOString(),
-    ...overrides,
-  } as WorkflowRunRecord;
+  };
+  return Object.assign(base, overrides);
 }
 
 describe("workflowRunCache", () => {
@@ -27,7 +34,9 @@ describe("workflowRunCache", () => {
 
   test("two subscribers to the same run share a single getRun RPC", async () => {
     const getRunMock = mock(() => Promise.resolve(createRun()));
-    const api = { workflows: { getRun: getRunMock } } as never;
+    const api: Parameters<typeof subscribeWorkflowRun>[2]["api"] = {
+      workflows: { getRun: getRunMock },
+    } as unknown as Parameters<typeof subscribeWorkflowRun>[2]["api"];
 
     const listener1 = mock();
     const listener2 = mock();
@@ -56,14 +65,11 @@ describe("workflowRunCache", () => {
 
   test("cleans up cache entry when the last subscriber unsubscribes", () => {
     const getRunMock = mock(() => Promise.resolve(createRun()));
-    const api = { workflows: { getRun: getRunMock } } as never;
+    const api: Parameters<typeof subscribeWorkflowRun>[2]["api"] = {
+      workflows: { getRun: getRunMock },
+    } as unknown as Parameters<typeof subscribeWorkflowRun>[2]["api"];
 
-    const unsub = subscribeWorkflowRun(
-      "ws-2",
-      "run-2",
-      { api, pollWhileActive: true },
-      mock()
-    );
+    const unsub = subscribeWorkflowRun("ws-2", "run-2", { api, pollWhileActive: true }, mock());
     unsub();
 
     // After unsubscribe, snapshot should fall back to idle.

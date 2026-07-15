@@ -317,7 +317,8 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   const isPreStreamAgentTask =
     Boolean(workspaceMetadata?.parentWorkspaceId) &&
     isBlockedPreStreamTaskStatus(workspaceMetadata?.taskStatus);
-  const preStreamAgentTaskLabel = workspaceMetadata?.taskStatus === "starting" ? "Starting" : "Queued";
+  const preStreamAgentTaskLabel =
+    workspaceMetadata?.taskStatus === "starting" ? "Starting" : "Queued";
   const queuedAgentTaskPrompt =
     isPreStreamAgentTask &&
     typeof workspaceMetadata?.taskPrompt === "string" &&

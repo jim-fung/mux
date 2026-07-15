@@ -1299,13 +1299,11 @@ describe("WorkspaceStore", () => {
       const readyPromise = store.waitForActiveOnChatWorkspace("workspace-1", 1000);
       store.setActiveWorkspaceId("workspace-1");
 
-      await expect(readyPromise).resolves.toBe(true);
+      expect(await readyPromise).toBe(true);
     });
 
     it("times out when a workspace never becomes the active onChat target", async () => {
-      await expect(store.waitForActiveOnChatWorkspace("workspace-never-active", 1)).resolves.toBe(
-        false
-      );
+      expect(await store.waitForActiveOnChatWorkspace("workspace-never-active", 1)).toBe(false);
     });
 
     it("clears replay buffers before aborting the previous active workspace subscription", async () => {
@@ -1705,6 +1703,19 @@ describe("WorkspaceStore", () => {
       expect(onChatInput.workspaceId).toBe(workspaceId);
       expect("legacyAutoRetryEnabled" in onChatInput).toBe(false);
       expect(global.window.localStorage.getItem(autoRetryKey)).toBeNull();
+    });
+
+    it("refreshes metadata for existing workspaces", () => {
+      const metadata = makeWorkspaceMetadata("workspace-1");
+      store.syncWorkspaces(new Map([[metadata.id, metadata]]));
+      expect(store.getWorkspaceMetadata("workspace-1")?.pinnedAt).toBeUndefined();
+
+      // Same workspace id, updated field (e.g. pinned after initial load).
+      // Imperative readers like the pin keybind must see the fresh value.
+      const pinned = { ...metadata, pinnedAt: "2026-01-01T00:00:00.000Z" };
+      store.syncWorkspaces(new Map([[pinned.id, pinned]]));
+
+      expect(store.getWorkspaceMetadata("workspace-1")?.pinnedAt).toBe("2026-01-01T00:00:00.000Z");
     });
 
     it("should remove deleted workspaces", () => {
@@ -4454,6 +4465,42 @@ describe("WorkspaceStore", () => {
       expect(state2).toBeDefined();
       expect(state2.loading).toBe(true); // Fresh workspace, not caught up
     });
+  });
+
+  it("queued message identity changes when a partial FIFO drain changes visible content", async () => {
+    const workspaceId = "queued-message-identity";
+    mockChatStreamFor(workspaceId, async function* () {
+      yield {
+        type: "queued-message-changed",
+        workspaceId,
+        hasQueuedMessages: true,
+        queuedMessages: ["first", "second"],
+        displayText: "first\nsecond",
+      };
+      yield { type: "caught-up", hasOlderHistory: false };
+      await tick(25);
+      yield {
+        type: "queued-message-changed",
+        workspaceId,
+        hasQueuedMessages: true,
+        queuedMessages: ["second"],
+        displayText: "second",
+      };
+    });
+
+    createAndAddWorkspace(store, workspaceId);
+    expect(await waitUntil(() => store.getWorkspaceState(workspaceId).queuedMessage != null)).toBe(
+      true
+    );
+    const firstId = store.getWorkspaceState(workspaceId).queuedMessage?.id;
+
+    expect(
+      await waitUntil(
+        () =>
+          store.getWorkspaceState(workspaceId).queuedMessage?.content === "second" &&
+          store.getWorkspaceState(workspaceId).queuedMessage?.id !== firstId
+      )
+    ).toBe(true);
   });
 
   describe("bash-output events", () => {

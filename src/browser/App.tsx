@@ -19,6 +19,10 @@ import { useResizableSidebar } from "./hooks/useResizableSidebar";
 import { matchesKeybind, KEYBINDS } from "./utils/ui/keybinds";
 import { handleLayoutSlotHotkeys } from "./utils/ui/layoutSlotHotkeys";
 import { buildSortedWorkspacesByProject } from "./utils/ui/workspaceFiltering";
+import {
+  computePinnedMoveOrderForWorkspace,
+  type PinnedMoveDirection,
+} from "./utils/ui/pinnedReorder";
 import { getVisibleWorkspaceIds } from "./utils/ui/workspaceDomNav";
 import { useUnreadTracking } from "./hooks/useUnreadTracking";
 import { useWorkspaceStoreRaw, useWorkspaceRecency } from "./stores/WorkspaceStore";
@@ -44,7 +48,12 @@ import {
 import { buildCoreSources, type BuildSourcesParams } from "./utils/commands/sources";
 
 import { getTopLevelProjectEntries } from "@/common/utils/subProjects";
-import { THINKING_LEVELS, type ThinkingLevel } from "@/common/types/thinking";
+import {
+  THINKING_LEVELS,
+  coerceOpenAIReasoningMode,
+  type OpenAIReasoningMode,
+  type ThinkingLevel,
+} from "@/common/types/thinking";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
 import { isWorkspaceForkSwitchEvent } from "./utils/workspaceEvents";
 import {
@@ -53,6 +62,7 @@ import {
   getModelKey,
   getNotifyOnResponseKey,
   getThinkingLevelByModelKey,
+  getReasoningModeKey,
   getThinkingLevelKey,
   getWorkspaceAISettingsByAgentKey,
   getWorkspaceLastReadKey,
@@ -67,12 +77,17 @@ import { useTelemetry } from "./hooks/useTelemetry";
 import { getRuntimeTypeForTelemetry } from "@/common/telemetry";
 import { useStartWorkspaceCreation } from "./hooks/useStartWorkspaceCreation";
 import { useAPI } from "@/browser/contexts/API";
+import { requestActiveTurnThinkingLevel } from "@/browser/utils/activeTurnThinking";
 import {
   clearPendingWorkspaceAiSettings,
   markPendingWorkspaceAiSettings,
 } from "@/browser/utils/workspaceAiSettingsSync";
 import { AuthTokenModal } from "@/browser/components/AuthTokenModal/AuthTokenModal";
 
+import { ScratchPage } from "@/browser/components/ScratchPage/ScratchPage";
+import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import type { WorkspaceCreatedOptions } from "@/browser/features/ChatInput/types";
+import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { ProjectPage } from "@/browser/components/ProjectPage/ProjectPage";
 
 import { SettingsProvider, useSettings } from "./contexts/SettingsContext";
@@ -95,6 +110,8 @@ import { WindowsToolchainBanner } from "./components/WindowsToolchainBanner/Wind
 import { RosettaBanner } from "./components/RosettaBanner/RosettaBanner";
 
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
+import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
+import { useRouting } from "@/browser/hooks/useRouting";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { getErrorMessage } from "@/common/utils/errors";
 import assert from "@/common/utils/assert";
@@ -141,11 +158,13 @@ function AppInner() {
     setWorkspaceMetadata,
     removeWorkspace,
     updateWorkspaceTitle,
+    reorderPinnedWorkspaces,
     selectedWorkspace,
     setSelectedWorkspace,
     pendingNewWorkspaceProject,
     pendingNewWorkspaceSubProjectPath,
     pendingNewWorkspaceDraftId,
+    createWorkspaceDraft,
     beginWorkspaceCreation,
   } = useWorkspaceContext();
   const {
@@ -249,6 +268,29 @@ function AppInner() {
 
   // Get workspace store for command palette
   const workspaceStore = useWorkspaceStoreRaw();
+
+  const handleWorkspaceCreated = (
+    metadata: FrontendWorkspaceMetadata,
+    options?: WorkspaceCreatedOptions
+  ) => {
+    workspaceStore.addWorkspace(metadata);
+    setWorkspaceMetadata((prev) => new Map(prev).set(metadata.id, metadata));
+
+    if (options?.autoNavigate !== false) {
+      let createdSelection: WorkspaceSelection | null = null;
+      setSelectedWorkspace((current) => {
+        if (current !== null) return current;
+        createdSelection = toWorkspaceSelection(metadata);
+        return createdSelection;
+      });
+
+      if (createdSelection && options?.markPendingInitialSend !== false) {
+        workspaceStore.markPendingInitialSend(metadata.id, options?.pendingStreamModel ?? null);
+      }
+    }
+
+    telemetry.workspaceCreated(metadata.id, getRuntimeTypeForTelemetry(metadata.runtimeConfig));
+  };
 
   // Track telemetry when workspace selection changes
   const prevWorkspaceRef = useRef<WorkspaceSelection | null>(null);
@@ -406,14 +448,14 @@ function AppInner() {
         return THINKING_LEVELS.includes(scoped) ? scoped : "off";
       }
 
-      // Migration: fall back to legacy per-model thinking and seed the workspace-scoped key.
+      // Keep this render-time palette lookup pure. ThinkingProvider owns migration to the
+      // workspace-scoped key, while the palette can read legacy values as a fallback.
       const model = getModelForWorkspace(workspaceId);
       const legacy = readPersistedState<ThinkingLevel | undefined>(
         getThinkingLevelByModelKey(model),
         undefined
       );
       if (legacy !== undefined && THINKING_LEVELS.includes(legacy)) {
-        updatePersistedState(scopedKey, legacy);
         return legacy;
       }
 
@@ -425,7 +467,6 @@ function AppInner() {
           undefined
         );
         if (canonicalLegacy !== undefined && THINKING_LEVELS.includes(canonicalLegacy)) {
-          updatePersistedState(scopedKey, canonicalLegacy);
           return canonicalLegacy;
         }
       }
@@ -434,6 +475,27 @@ function AppInner() {
     },
     [getModelForWorkspace]
   );
+
+  // Pro mode is Responses-only; the palette command hides under chatCompletions
+  // and on non-passthrough routes (mirroring the send path's header gating).
+  const { config: providersConfig } = useProvidersConfig();
+  const routing = useRouting();
+  const getRouteForModel = useCallback(
+    (canonicalModel: string) => routing.resolveRoute(canonicalModel).route,
+    [routing]
+  );
+
+  const getReasoningModeForWorkspace = useCallback((workspaceId: string): OpenAIReasoningMode => {
+    if (!workspaceId) {
+      return "standard";
+    }
+    const stored = readPersistedState<OpenAIReasoningMode | null>(
+      getReasoningModeKey(workspaceId),
+      null
+    );
+    // Coerce untrusted persisted values so corrupt entries self-heal to "standard".
+    return coerceOpenAIReasoningMode(stored) ?? "standard";
+  }, []);
 
   const setThinkingLevelFromPalette = useCallback(
     (workspaceId: string, level: ThinkingLevel) => {
@@ -444,13 +506,19 @@ function AppInner() {
       const normalized = THINKING_LEVELS.includes(level) ? level : "off";
       const model = getModelForWorkspace(workspaceId);
       const key = getThinkingLevelKey(workspaceId);
+      // Carry the current pro-mode choice: the backend replaces the agent's
+      // settings wholesale, so omitting reasoningMode would wipe it.
+      const reasoningMode = getReasoningModeForWorkspace(workspaceId);
 
       // Use the utility function which handles localStorage and event dispatch
       // ThinkingProvider will pick this up via its listener
       updatePersistedState(key, normalized);
 
       type WorkspaceAISettingsByAgentCache = Partial<
-        Record<string, { model: string; thinkingLevel: ThinkingLevel }>
+        Record<
+          string,
+          { model: string; thinkingLevel: ThinkingLevel; reasoningMode?: OpenAIReasoningMode }
+        >
       >;
 
       const normalizedAgentId =
@@ -465,7 +533,7 @@ function AppInner() {
             prev && typeof prev === "object" ? prev : {};
           return {
             ...record,
-            [normalizedAgentId]: { model, thinkingLevel: normalized },
+            [normalizedAgentId]: { model, thinkingLevel: normalized, reasoningMode },
           };
         },
         {}
@@ -476,13 +544,14 @@ function AppInner() {
         markPendingWorkspaceAiSettings(workspaceId, normalizedAgentId, {
           model,
           thinkingLevel: normalized,
+          reasoningMode,
         });
 
         api.workspace
           .updateAgentAISettings({
             workspaceId,
             agentId: normalizedAgentId,
-            aiSettings: { model, thinkingLevel: normalized },
+            aiSettings: { model, thinkingLevel: normalized, reasoningMode },
           })
           .then((result) => {
             if (!result.success) {
@@ -493,6 +562,10 @@ function AppInner() {
             clearPendingWorkspaceAiSettings(workspaceId, normalizedAgentId);
             // Best-effort only.
           });
+
+        // Mid-turn change: also apply to the active turn's next model step so
+        // the palette/keybind path behaves like the slider (ThinkingProvider).
+        requestActiveTurnThinkingLevel(api, workspaceId, normalized);
       }
 
       // Dispatch toast notification event for UI feedback
@@ -504,10 +577,82 @@ function AppInner() {
         );
       }
     },
-    [api, getModelForWorkspace]
+    [api, getModelForWorkspace, getReasoningModeForWorkspace]
+  );
+
+  // Palette toggle for the OpenAI pro reasoning mode. Persists like the
+  // thinking-level palette action: localStorage first (ThinkingProvider listens),
+  // then best-effort backend sync with the full settings payload.
+  const toggleReasoningModeFromPalette = useCallback(
+    (workspaceId: string) => {
+      if (!workspaceId) {
+        return;
+      }
+
+      const next: OpenAIReasoningMode =
+        getReasoningModeForWorkspace(workspaceId) === "pro" ? "standard" : "pro";
+      const model = getModelForWorkspace(workspaceId);
+      const thinkingLevel = getThinkingLevelForWorkspace(workspaceId);
+
+      updatePersistedState(getReasoningModeKey(workspaceId), next);
+
+      type WorkspaceAISettingsByAgentCache = Partial<
+        Record<
+          string,
+          { model: string; thinkingLevel: ThinkingLevel; reasoningMode?: OpenAIReasoningMode }
+        >
+      >;
+
+      const normalizedAgentId =
+        readPersistedState<string>(getAgentIdKey(workspaceId), WORKSPACE_DEFAULTS.agentId)
+          .trim()
+          .toLowerCase() || WORKSPACE_DEFAULTS.agentId;
+
+      updatePersistedState<WorkspaceAISettingsByAgentCache>(
+        getWorkspaceAISettingsByAgentKey(workspaceId),
+        (prev) => {
+          const record: WorkspaceAISettingsByAgentCache =
+            prev && typeof prev === "object" ? prev : {};
+          return {
+            ...record,
+            [normalizedAgentId]: { model, thinkingLevel, reasoningMode: next },
+          };
+        },
+        {}
+      );
+
+      if (api) {
+        markPendingWorkspaceAiSettings(workspaceId, normalizedAgentId, {
+          model,
+          thinkingLevel,
+          reasoningMode: next,
+        });
+
+        api.workspace
+          .updateAgentAISettings({
+            workspaceId,
+            agentId: normalizedAgentId,
+            aiSettings: { model, thinkingLevel, reasoningMode: next },
+          })
+          .then((result) => {
+            if (!result.success) {
+              clearPendingWorkspaceAiSettings(workspaceId, normalizedAgentId);
+            }
+          })
+          .catch(() => {
+            clearPendingWorkspaceAiSettings(workspaceId, normalizedAgentId);
+            // Best-effort only.
+          });
+      }
+    },
+    [api, getModelForWorkspace, getReasoningModeForWorkspace, getThinkingLevelForWorkspace]
   );
 
   const registerParamsRef = useRef<BuildSourcesParams | null>(null);
+
+  const openNewScratchFromPalette = useCallback(() => {
+    createWorkspaceDraft(SCRATCH_PROJECT_CONFIG_KEY);
+  }, [createWorkspaceDraft]);
 
   const openNewWorkspaceFromPalette = useCallback(
     (projectPath: string) => {
@@ -708,6 +853,31 @@ function AppInner() {
     [handleNavigateWorkspace]
   );
 
+  // Move the selected pinned chat within its visual pinned block. Shares the
+  // move-order helper with the sidebar keybind handler so palette and keyboard
+  // behavior can't drift apart.
+  const movePinnedChatFromPalette = useCallback(
+    (direction: PinnedMoveDirection) => {
+      if (!selectedWorkspace) return;
+      const meta = workspaceMetadata.get(selectedWorkspace.workspaceId);
+      if (!meta) return;
+      const order = computePinnedMoveOrderForWorkspace(
+        meta,
+        direction,
+        sortedWorkspacesByProject,
+        userProjects
+      );
+      if (order) void reorderPinnedWorkspaces(order);
+    },
+    [
+      selectedWorkspace,
+      workspaceMetadata,
+      sortedWorkspacesByProject,
+      userProjects,
+      reorderPinnedWorkspaces,
+    ]
+  );
+
   registerParamsRef.current = {
     userProjects,
     workspaceMetadata,
@@ -715,7 +885,12 @@ function AppInner() {
     themePreference,
     getThinkingLevel: getThinkingLevelForWorkspace,
     onSetThinkingLevel: setThinkingLevelFromPalette,
+    getReasoningMode: getReasoningModeForWorkspace,
+    onToggleReasoningMode: toggleReasoningModeFromPalette,
+    providersConfig,
+    getRouteForModel,
     getMinThinkingOverride,
+    onStartScratchCreation: openNewScratchFromPalette,
     onStartWorkspaceCreation: openNewWorkspaceFromPalette,
     onStartMultiProjectWorkspaceCreation: openNewMultiProjectWorkspaceFromPalette,
     multiProjectWorkspacesEnabled,
@@ -728,6 +903,7 @@ function AppInner() {
     onRemoveProject: removeProjectFromPalette,
     onToggleSidebar: toggleSidebarFromPalette,
     onNavigateWorkspace: navigateWorkspaceFromPalette,
+    onMovePinnedChat: movePinnedChatFromPalette,
     onOpenWorkspaceInTerminal: (workspaceId, runtimeConfig) => {
       // Best-effort only. Palette actions should never throw.
       void openWorkspaceInTerminal(workspaceId, runtimeConfig).catch(() => {
@@ -793,7 +969,10 @@ function AppInner() {
         return;
       }
 
-      if (matchesKeybind(e, KEYBINDS.NEXT_WORKSPACE)) {
+      if (matchesKeybind(e, KEYBINDS.NEW_SCRATCH_CHAT)) {
+        e.preventDefault();
+        openNewScratchFromPalette();
+      } else if (matchesKeybind(e, KEYBINDS.NEXT_WORKSPACE)) {
         e.preventDefault();
         handleNavigateWorkspace("next");
       } else if (matchesKeybind(e, KEYBINDS.PREV_WORKSPACE)) {
@@ -839,6 +1018,7 @@ function AppInner() {
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [
+    openNewScratchFromPalette,
     handleNavigateWorkspace,
     setSidebarCollapsed,
     isCommandPaletteOpen,
@@ -1149,67 +1329,27 @@ function AppInner() {
                   onToggleLeftSidebarCollapsed={handleToggleSidebar}
                 />
               )
+            ) : creationProjectPath === SCRATCH_PROJECT_CONFIG_KEY ? (
+              <ScratchPage
+                leftSidebarCollapsed={sidebarCollapsed}
+                onToggleLeftSidebarCollapsed={handleToggleSidebar}
+                pendingDraftId={pendingNewWorkspaceDraftId}
+                onWorkspaceCreated={handleWorkspaceCreated}
+              />
             ) : creationProjectPath ? (
-              (() => {
-                const projectPath = creationProjectPath;
-                const projectName =
-                  projectPath.split("/").pop() ?? projectPath.split("\\").pop() ?? "Project";
-                return (
-                  <ProjectPage
-                    projectPath={projectPath}
-                    projectName={projectName}
-                    leftSidebarCollapsed={sidebarCollapsed}
-                    onToggleLeftSidebarCollapsed={handleToggleSidebar}
-                    pendingSubProjectPath={pendingNewWorkspaceSubProjectPath}
-                    pendingDraftId={pendingNewWorkspaceDraftId}
-                    onWorkspaceCreated={(metadata, options) => {
-                      // IMPORTANT: Add workspace to store FIRST (synchronous) to ensure
-                      // the store knows about it before React processes the state updates.
-                      // This prevents race conditions where the UI tries to access the
-                      // workspace before the store has created its aggregator.
-                      workspaceStore.addWorkspace(metadata);
-
-                      // Add to workspace metadata map (triggers React state update)
-                      setWorkspaceMetadata((prev) => new Map(prev).set(metadata.id, metadata));
-
-                      if (options?.autoNavigate !== false) {
-                        let createdSelection: WorkspaceSelection | null = null;
-                        setSelectedWorkspace((current) => {
-                          if (current !== null) {
-                            // If the user picked another workspace before create/send resolved,
-                            // keep their explicit selection and skip the optimistic starting barrier.
-                            return current;
-                          }
-
-                          createdSelection = toWorkspaceSelection(metadata);
-                          return createdSelection;
-                        });
-
-                        // WorkspaceContext resolves functional selection updates synchronously
-                        // against its latest ref, so by the time setSelectedWorkspace() returns we
-                        // know whether this creation actually won and can safely mark the
-                        // optimistic starting barrier outside the updater callback.
-                        if (createdSelection && options?.markPendingInitialSend !== false) {
-                          workspaceStore.markPendingInitialSend(
-                            metadata.id,
-                            options?.pendingStreamModel ?? null
-                          );
-                        }
-                      }
-
-                      // Track telemetry
-                      telemetry.workspaceCreated(
-                        metadata.id,
-                        getRuntimeTypeForTelemetry(metadata.runtimeConfig)
-                      );
-
-                      // Note: No need to call clearPendingWorkspaceCreation() here.
-                      // Navigating to the workspace URL automatically clears the pending
-                      // state since pendingNewWorkspaceProject is derived from the URL.
-                    }}
-                  />
-                );
-              })()
+              <ProjectPage
+                projectPath={creationProjectPath}
+                projectName={
+                  creationProjectPath.split("/").pop() ??
+                  creationProjectPath.split("\\").pop() ??
+                  "Project"
+                }
+                leftSidebarCollapsed={sidebarCollapsed}
+                onToggleLeftSidebarCollapsed={handleToggleSidebar}
+                pendingSubProjectPath={pendingNewWorkspaceSubProjectPath}
+                pendingDraftId={pendingNewWorkspaceDraftId}
+                onWorkspaceCreated={handleWorkspaceCreated}
+              />
             ) : (
               // The dedicated Mux home page was removed. Keep `/` as a minimal shell so
               // WorkspaceContext can redirect it to a concrete project route when possible,

@@ -84,9 +84,7 @@ void mock.module("@/browser/components/AuthTokenModal/AuthTokenModal", () => ({
   getStoredAuthToken: () => Promise.resolve(null),
   getStoredAuthTokenSync: () => null,
   migrateAuthTokenFromLocalStorage: () => Promise.resolve(),
-  // eslint-disable-next-line @typescript-eslint/no-empty-function
   setStoredAuthToken: () => Promise.resolve(),
-  // eslint-disable-next-line @typescript-eslint/no-empty-function
   clearStoredAuthToken: () => Promise.resolve(),
 }));
 

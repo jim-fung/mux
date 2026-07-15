@@ -124,6 +124,7 @@ export interface WorkspaceState {
   skillLoadErrors: SkillLoadError[];
   agentStatus: { emoji: string; message: string; url?: string } | undefined;
   activeWorkflowRunCount: number;
+  activeBashMonitorCount: number;
   lastAbortReason: StreamAbortReasonSnapshot | null;
   pendingStreamStartTime: number | null;
   // Model used for the pending send (used during "starting" phase)
@@ -183,6 +184,7 @@ export interface WorkspaceSidebarState {
   skillLoadErrors: SkillLoadError[];
   agentStatus: { emoji: string; message: string; url?: string } | undefined;
   activeWorkflowRunCount: number;
+  activeBashMonitorCount: number;
   terminalActiveCount: number;
   terminalSessionCount: number;
   goal?: GoalSnapshot | null;
@@ -903,6 +905,10 @@ export class WorkspaceStore {
       applyWorkspaceChatEventToAggregator(aggregator, data);
       this.states.bump(workspaceId);
     },
+    "tool-call-execution-start": (workspaceId, aggregator, data) => {
+      applyWorkspaceChatEventToAggregator(aggregator, data);
+      this.states.bump(workspaceId);
+    },
     "tool-call-delta": (workspaceId, aggregator, data) => {
       applyWorkspaceChatEventToAggregator(aggregator, data);
       this.scheduleStreamingStateBump(workspaceId);
@@ -1031,7 +1037,15 @@ export class WorkspaceStore {
         (data.reviews?.length ?? 0) > 0;
       const queuedMessage: QueuedMessage | null = hasContent
         ? {
-            id: `queued-${workspaceId}`,
+            // Change identity whenever the visible queue projection changes so
+            // per-card actions (notably Send now) reset after a partial FIFO drain.
+            id: `queued-${workspaceId}-${JSON.stringify([
+              data.displayText,
+              data.fileParts?.map((part) => [part.mediaType, part.filename, part.url.length]) ?? [],
+              data.reviews?.map((review) => [review.filePath, review.lineRange]) ?? [],
+              data.queueDispatchMode,
+              data.hasCompactionRequest,
+            ])}`,
             content: data.displayText,
             fileParts: data.fileParts,
             reviews: data.reviews,
@@ -1042,7 +1056,7 @@ export class WorkspaceStore {
 
       // Mirror the queue signal onto active streams so response notifications follow
       // user-visible terminal turns instead of every intermediate handoff.
-      aggregator.setActiveQueuedFollowUp(queuedMessage !== null);
+      aggregator.setActiveQueuedFollowUp(data.hasQueuedMessages ?? queuedMessage !== null);
       this.assertChatTransientState(workspaceId).queuedMessage = queuedMessage;
       this.states.bump(workspaceId);
     },
@@ -1056,6 +1070,9 @@ export class WorkspaceStore {
           mode: "replace",
           fileParts: data.fileParts,
           reviews: data.reviews,
+          // Restore events can arrive for a background workspace; never let them
+          // overwrite the composer currently mounted for another workspace.
+          workspaceId: data.workspaceId,
         })
       );
     },
@@ -2044,6 +2061,7 @@ export class WorkspaceStore {
       const agentStatus =
         displayStatus ?? liveTodoStatus ?? fallbackAgentStatus ?? persistedTodoStatus;
       const activeWorkflowRunCount = activity?.activeWorkflowRunCount ?? 0;
+      const activeBashMonitorCount = activity?.activeBashMonitorCount ?? 0;
       const goal = activity?.goal ?? null;
 
       return {
@@ -2069,6 +2087,7 @@ export class WorkspaceStore {
         lastAbortReason: aggregator.getLastAbortReason(),
         agentStatus,
         activeWorkflowRunCount,
+        activeBashMonitorCount,
         pendingStreamStartTime,
         pendingStreamModel: aggregator.getPendingStreamModel(),
         autoRetryStatus: transient.autoRetryStatus,
@@ -2180,6 +2199,7 @@ export class WorkspaceStore {
       cached.skillLoadErrors === fullState.skillLoadErrors &&
       cached.agentStatus === fullState.agentStatus &&
       cached.activeWorkflowRunCount === fullState.activeWorkflowRunCount &&
+      cached.activeBashMonitorCount === fullState.activeBashMonitorCount &&
       cached.terminalActiveCount === terminalActiveCount &&
       cached.terminalSessionCount === terminalSessionCount &&
       cached.goal === fullState.goal
@@ -2203,6 +2223,7 @@ export class WorkspaceStore {
       skillLoadErrors: fullState.skillLoadErrors,
       agentStatus: fullState.agentStatus,
       activeWorkflowRunCount: fullState.activeWorkflowRunCount,
+      activeBashMonitorCount: fullState.activeBashMonitorCount,
       terminalActiveCount,
       terminalSessionCount,
       goal: fullState.goal,
@@ -2865,6 +2886,7 @@ export class WorkspaceStore {
       previous?.recency !== snapshot?.recency ||
       previous?.hasTodos !== snapshot?.hasTodos ||
       (previous?.activeWorkflowRunCount ?? 0) !== (snapshot?.activeWorkflowRunCount ?? 0) ||
+      (previous?.activeBashMonitorCount ?? 0) !== (snapshot?.activeBashMonitorCount ?? 0) ||
       !areAgentStatusesEqual(previous?.displayStatus, snapshot?.displayStatus) ||
       !areAgentStatusesEqual(previous?.todoStatus, snapshot?.todoStatus) ||
       previous?.goal?.goalId !== snapshot?.goal?.goalId ||
@@ -3914,7 +3936,9 @@ export class WorkspaceStore {
     const metadataIds = new Set(Array.from(workspaceMetadata.values()).map((m) => m.id));
     const currentIds = new Set(this.workspaceMetadata.keys());
 
-    // Add new workspaces
+    // Add new workspaces; refresh the metadata snapshot for existing ones so
+    // imperative readers (getWorkspaceMetadata) don't act on stale fields
+    // (e.g. the pin keybind toggling off a pinnedAt set after initial load).
     for (const metadata of workspaceMetadata.values()) {
       if (!currentIds.has(metadata.id)) {
         this.addWorkspace(metadata);
