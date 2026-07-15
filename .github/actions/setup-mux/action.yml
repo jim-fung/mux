@@ -45,7 +45,7 @@ runs:
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: node_modules
-        key: ${{ runner.os }}-${{ runner.arch }}-bun-${{ steps.bun-version.outputs.version }}-node-${{ steps.node-version.outputs.version }}-node-modules-${{ hashFiles('**/bun.lock') }}
+        key: ${{ runner.os }}-${{ runner.arch }}-bun-${{ steps.bun-version.outputs.version }}-node-${{ steps.node-version.outputs.version }}-node-modules-${{ hashFiles('bun.lock') }}
         restore-keys: |
           ${{ runner.os }}-${{ runner.arch }}-bun-${{ steps.bun-version.outputs.version }}-node-${{ steps.node-version.outputs.version }}-node-modules-
 
@@ -67,7 +67,7 @@ runs:
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: ~/.bun/install/cache
-        key: ${{ runner.os }}-bun-cache-${{ hashFiles('**/bun.lock') }}
+        key: ${{ runner.os }}-bun-cache-${{ hashFiles('bun.lock') }}
         restore-keys: |
           ${{ runner.os }}-bun-cache-
 
@@ -76,11 +76,18 @@ runs:
     # Delete node_modules first to ensure a clean install - bun install --frozen-lockfile
     # only verifies packages are present, it doesn't update stale packages from a restore-key match.
     - name: Install dependencies
+      id: install-dependencies
       if: steps.cache-node-modules.outputs.cache-hit != 'true'
       shell: bash
       run: |
         rm -rf node_modules
         bun install --frozen-lockfile
+
+    # Make targets use this sentinel to avoid repeating a verified setup install.
+    - name: Mark dependencies ready
+      if: steps.cache-node-modules.outputs.cache-hit == 'true' || steps.install-dependencies.outcome == 'success'
+      shell: bash
+      run: touch node_modules/.installed
 
     # Cache Electron binaries and electron-builder resources (NSIS, etc.)
     # These are downloaded during electron-builder and can be 200MB+ total.
@@ -93,7 +100,7 @@ runs:
           ~/.cache/electron
           ~/Library/Caches/electron
           ~/AppData/Local/electron/Cache
-        key: ${{ runner.os }}-${{ runner.arch }}-electron-${{ hashFiles('**/bun.lock') }}
+        key: ${{ runner.os }}-${{ runner.arch }}-electron-${{ hashFiles('bun.lock') }}
         restore-keys: |
           ${{ runner.os }}-${{ runner.arch }}-electron-
 
@@ -105,6 +112,6 @@ runs:
           ~/.cache/electron-builder
           ~/Library/Caches/electron-builder
           ~/AppData/Local/electron-builder/Cache
-        key: ${{ runner.os }}-${{ runner.arch }}-electron-builder-${{ hashFiles('**/bun.lock') }}
+        key: ${{ runner.os }}-${{ runner.arch }}-electron-builder-${{ hashFiles('bun.lock') }}
         restore-keys: |
           ${{ runner.os }}-${{ runner.arch }}-electron-builder-

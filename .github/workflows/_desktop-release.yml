@@ -44,9 +44,6 @@ jobs:
           # Keep this in a script so nightly/release workflows can share behavior.
           node ./scripts/set-package-version.js "$VERSION_OVERRIDE"
 
-      - name: Build application
-        run: bun run build
-
       - name: Setup code signing
         run: ./scripts/setup-macos-signing.sh
         env:
@@ -104,11 +101,8 @@ jobs:
           # Keep this in a script so nightly/release workflows can share behavior.
           node ./scripts/set-package-version.js "$VERSION_OVERRIDE"
 
-      - name: Build application
-        run: bun run build
-
       - name: Package and publish for Linux
-        run: bun x electron-builder --linux --publish always
+        run: make dist-linux-release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -153,11 +147,8 @@ jobs:
           # Keep this in a script so nightly/release workflows can share behavior.
           node ./scripts/set-package-version.js "$VERSION_OVERRIDE"
 
-      - name: Build application
-        run: bun run build
-
       - name: Package for Linux arm64
-        run: bun x electron-builder --linux --arm64 --publish never
+        run: make dist-linux-arm64
 
       - name: Upload arm64 AppImage to release
         env:
@@ -208,9 +199,6 @@ jobs:
           # Keep this in a script so nightly/release workflows can share behavior.
           node ./scripts/set-package-version.js "$VERSION_OVERRIDE"
 
-      - name: Build application
-        run: bun run build
-
       - name: Setup code signing
         id: signing
         uses: ./.github/actions/setup-windows-signing
@@ -220,7 +208,7 @@ jobs:
           gcp_service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
 
       - name: Package and publish for Windows (.exe)
-        run: bun x electron-builder --win --publish always
+        run: make dist-win-release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # EV signing environment variables (used by custom sign script if configured)
